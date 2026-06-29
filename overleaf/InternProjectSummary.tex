@@ -1,0 +1,166 @@
+\documentclass[10pt]{article}
+
+\usepackage[margin=0.72in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{cite}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.42em}
+
+\begin{document}
+
+\begin{center}
+{\Large \textbf{Tensor-Parallel SOAP for Transformer Training}}\
+\vspace{0.25em}
+% Ritvik Prabhu
+\end{center}
+\begin{center}
+{ Ritvik Prabhu, Aditya Kashi \& Sajal Dash}\
+% Ritvik Prabhu
+\end{center}
+
+\section*{Motivation}
+
+AdamW is the default optimizer for large Transformer training because it is reliable, inexpensive, and already integrated into modern distributed training stacks \cite{kingma2014adam,loshchilov2019decoupled}. Its limitation is that the optimizer state is maintained separately for each parameter. For a large weight matrix, AdamW tracks the recent behavior of each entry, but it does not directly model how rows, columns, or dominant directions of the matrix behave together.
+
+Higher-order optimization is interesting because it uses more information about how parameters interact during training. In principle, second-order methods can account for how groups of parameters move together, but the full version is not practical. For a layer with $d$ parameters, a full second-order preconditioner would require $O(d^2)$ storage and matrix operations that are far more expensive than AdamW. The Shampoo optimizer provides a compromise. For a matrix gradient $G \in \mathbb{R}^{m \times n}$, instead of forming one enormous preconditioner over all $mn$ parameters (which would require $O(m^2n^2)$ preconditioner storage), it maintains smaller preconditioners along tensor dimensions, reducing the main matrix statistics to size $m \times m$ and $n \times n$ (only requiring $O(m^2+n^2)$ preconditioner storage)\cite{gupta2018shampoo,anil2020scalable}. SOAP builds on this by using the Shampoo eigenbasis while applying Adam-style updates in the rotated space \cite{vyas2024soap}. For a matrix gradient $G$, the basic row-side and column-side statistics are:
+
+$$
+L = GG^T
+$$
+
+$$
+R = G^TG
+$$
+
+The SOAP optimizer improves upon the Shampoo optimizer by running Adam in the eigenbasis of the Shampoo preconditioner. Doing this keeps the stability of Adam-style updates while using richer matrix information \cite{vyas2024soap}. In language-model pretraining experiments on 360M and 660M parameter models, SOAP reports more than 40\% fewer iterations and more than 35\% lower wall-clock time than AdamW in the large-batch regime, with about 20\% improvement over Shampoo \cite{vyas2024soap}. 
+
+
+\section*{Project Gap}
+
+The current gap is tensor parallelism (TP). Large Transformers are often trained by splitting individual layer matrices across GPUs, as in Megatron-style tensor parallelism \cite{shoeybi2019megatron,narayanan2021efficient}. The benefit of TP is that it allows a single layer matrix to exceed the memory and compute capacity of one GPU, so any SOAP variant that works naturally with TP could carry SOAP's reported optimization benefits to much larger Transformer models.
+
+
+SOAP assumes access to statistics of the full gradient matrix. Under tensor parallelism, those statistics are no longer available on a single GPU because each rank only owns one shard. The naive choice is to gather the full gradient before applying SOAP, which increases communication and memory cost, or apply SOAP independently on each shard, which is cheaper but no longer matches the original optimizer. Existing Distributed Shampoo work addresses scalable optimizer state for distributed data-parallel training \cite{shi2023distributed}. Canzona is closer to this project because it supports matrix-based optimizers under tensor parallelism, but its TP path reconstructs the required matrix update work on selected ranks before scattering the result back \cite{wang2026canzona}. 
+
+The research question is therefore:
+
+$$
+\textbf{Can SOAP be implemented directly on tensor-parallel gradient shards without rebuilding the full matrix?}
+$$
+
+\section*{Tensor-Parallel Algorithm}
+
+The algorithm depends on how the Transformer matrix is split. A column-parallel layer and a row-parallel layer expose different local gradient shards, so the SOAP statistics are not computed with the same communication pattern. I am currently working on the column-parallel case first, which I will outline below. This is an initial version and will likely be refined as the project develops.
+
+At every training step, the optimizer applies an update of the form:
+
+$$
+W_{t+1} = W_t - \eta \Delta W_t
+$$
+
+For AdamW, $\Delta W_t$ is computed mostly from per-parameter running statistics. For SOAP, $\Delta W_t$ is computed by first rotating the gradient into the Shampoo eigenbasis, applying Adam-style updates in that rotated space, and rotating the result back.
+
+Let the full gradient matrix be:
+
+$$
+G \in \mathbb{R}^{m \times n}
+$$
+
+In column-parallel TP, the columns of $G$ are split across $p$ ranks:
+
+$$
+G = [G_0 \; G_1 \; \cdots \; G_{p-1}]
+$$
+
+where rank $i$ owns the local gradient shard:
+
+$$
+G_i \in \mathbb{R}^{m \times n_i}
+$$
+
+SOAP first builds the row-side statistic:
+
+$$
+L = GG^T
+$$
+
+Using the column split, this becomes:
+
+$$
+L = GG^T = \sum_{i=0}^{p-1} G_iG_i^T
+$$
+
+Each rank computes its local contribution $G_iG_i^T$. Instead of storing the full $L$ on every rank, the sum can be organized as a reduce-scatter so that $L$ remains sharded. I will use the notation $L_i$ to mean the row shard of $L$ stored on rank $i$.
+
+SOAP also needs the column-side statistic:
+
+$$
+R = G^TG
+$$
+
+For column-parallel TP, $R$ contains cross-rank blocks:
+
+$$
+R_{ij} = G_i^TG_j
+$$
+
+These blocks can be computed with circular communication. Each rank keeps its own $G_i$ fixed and receives other gradient shards $G_j$ around the ring. As each shard arrives, rank $i$ computes $G_i^TG_j$. At the end, rank $i$ owns the row block of $R$ corresponding to its local columns:
+
+$$
+R_i = G_i^TG
+$$
+
+So both SOAP statistics are stored as distributed matrices: rank $i$ owns $L_i$ and $R_i$, not the full $L$ and $R$.
+
+The next step is to compute the SOAP bases. This can be done with a distributed eigendecomposition of the sharded $L$ and $R$, or with a QR/power-iteration update between full eigendecompositions. There are several algorithms that exist for these, but the one we are considering is the CholeskyQR3 algorithm. The resulting bases are also kept sharded. I will write these local basis shards as:
+
+$$
+Q_{L,i}
+$$
+
+and
+
+$$
+Q_{R,i}
+$$
+
+SOAP then projects the gradient as:
+
+$$
+\widehat{G} = Q_L^T G Q_R
+$$
+
+The implementation tries to avoid materializing a full intermediate such as $Q_L^TG$ on every rank. Instead, the projection can be computed as a tiled triple matrix product, similar in spirit to FlashAttention but without the softmax: stream tiles of $Q_L$, $G$, and $Q_R$, multiply compatible tiles, and accumulate only the output shard needed by each rank.
+
+AdamW-style momentum and variance updates are applied to the local shard of $\widehat{G}$. Finally, the update is rotated back:
+
+$$
+\Delta W = Q_L \widehat{\Delta W} Q_R^T
+$$
+
+using the same tiled communication pattern, so that rank $i$ ends with only:
+
+$$
+\Delta W_i
+$$
+
+the update for its local weight shard.
+
+The design goal is that $G$, $L$, $R$, $Q_L$, $Q_R$, $\widehat{G}$, and $\Delta W$ are all treated as distributed objects. The algorithm should communicate only the tiles needed for the current product or factor update, rather than reconstructing the full SOAP state on a single rank.
+
+
+
+
+
+
+
+
+
+
+
+\bibliographystyle{plain}
+\bibliography{reference}
+
+\end{document}
