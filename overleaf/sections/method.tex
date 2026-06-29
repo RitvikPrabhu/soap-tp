@@ -1,0 +1,18 @@
+\section{Method}
+
+Let $G \in \mathbb{R}^{m \times n}$ be a gradient matrix. SOAP forms left and right curvature factors
+\begin{equation}
+L = GG^T, \qquad R = G^TG.
+\end{equation}
+
+For row-wise tensor parallelism, each rank owns $G_r \in \mathbb{R}^{m_r \times n}$, so
+\begin{equation}
+R = \sum_r G_r^T G_r.
+\end{equation}
+
+For column-wise tensor parallelism, each rank owns $G_r \in \mathbb{R}^{m \times n_r}$, so
+\begin{equation}
+L = \sum_r G_r G_r^T.
+\end{equation}
+
+The key design question is which factors can be computed with reductions and which require block communication.

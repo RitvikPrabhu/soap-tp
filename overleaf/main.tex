@@ -1,0 +1,30 @@
+\documentclass[10pt,conference]{IEEEtran}
+
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\title{Tensor-Parallel SOAP: Communication-Aware Second-Order Optimization for Distributed Transformer Training}
+
+\author{Ritvik Prabhu}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We study how SOAP-style curvature-aware optimization can be made compatible with tensor-parallel training while preserving numerical correctness and exposing communication costs explicitly.
+\end{abstract}
+
+\input{sections/introduction}
+\input{sections/background}
+\input{sections/method}
+\input{sections/experiments}
+\input{sections/results}
+\input{sections/limitations}
+\input{sections/conclusion}
+
+\bibliographystyle{IEEEtran}
+\bibliography{refs}
+
+\end{document}
