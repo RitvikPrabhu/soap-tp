@@ -12,16 +12,16 @@ from soap_tp.ops.preconditioners import (
 )
 
 
-WORLD_SIZE = 2
+WORLD_SIZE = 4
 
 
 def _gradient(device="cpu"):
     return torch.tensor(
         [
-            [1.0, 2.0, -1.0, 0.5],
-            [0.5, -3.0, 4.0, 1.0],
-            [2.0, 0.0, 1.5, -2.0],
-            [-1.0, 1.0, 0.25, 3.0],
+            [1.0, 2.0, -1.0, 0.5, 3.0, -2.0, 1.5, 0.0],
+            [0.5, -3.0, 4.0, 1.0, -1.0, 2.5, 0.25, -0.5],
+            [2.0, 0.0, 1.5, -2.0, 0.75, -1.5, 3.0, 1.0],
+            [-1.0, 1.0, 0.25, 3.0, 2.0, 0.5, -2.5, 4.0],
         ],
         dtype=torch.float64,
         device=device,
@@ -91,10 +91,10 @@ def _right_worker(rank, world_size, port):
 
 
 class TestPreconditionerDistributedCorrectness(unittest.TestCase):
-    def test_update_left_preconditioner_matches_full_gram_on_two_ranks(self):
+    def test_update_left_preconditioner_matches_full_gram_on_four_ranks(self):
         mp.spawn(_left_worker, args=(WORLD_SIZE, _free_port()), nprocs=WORLD_SIZE, join=True)
 
-    def test_update_right_preconditioner_matches_full_gram_on_two_ranks(self):
+    def test_update_right_preconditioner_matches_full_gram_on_four_ranks(self):
         mp.spawn(_right_worker, args=(WORLD_SIZE, _free_port()), nprocs=WORLD_SIZE, join=True)
 
 
