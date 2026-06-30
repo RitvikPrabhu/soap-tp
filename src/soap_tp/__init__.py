@@ -1,3 +1,1 @@
-"""SOAP-TP blueprint package."""
-
-__all__ = ["distributed", "ops", "reference", "steps", "utils"]
+__all__ = ["ops", "reference", "steps", "utils"]
