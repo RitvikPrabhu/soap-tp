@@ -20,7 +20,7 @@
 % Ritvik Prabhu
 \end{center}
 
-\section*{Motivation}
+\section{Motivation}
 
 AdamW is the default optimizer for large Transformer training because it is reliable, inexpensive, and already integrated into modern distributed training stacks \cite{kingma2014adam,loshchilov2019decoupled}. Its limitation is that the optimizer state is maintained separately for each parameter. For a large weight matrix, AdamW tracks the recent behavior of each entry, but it does not directly model how rows, columns, or dominant directions of the matrix behave together.
 
@@ -37,20 +37,38 @@ $$
 The SOAP optimizer improves upon the Shampoo optimizer by running Adam in the eigenbasis of the Shampoo preconditioner. Doing this keeps the stability of Adam-style updates while using richer matrix information \cite{vyas2024soap}. In language-model pretraining experiments on 360M and 660M parameter models, SOAP reports more than 40\% fewer iterations and more than 35\% lower wall-clock time than AdamW in the large-batch regime, with about 20\% improvement over Shampoo \cite{vyas2024soap}. 
 
 
-\section*{Project Gap}
+\section{Research Gap}
 
 The current gap is tensor parallelism (TP). Large Transformers are often trained by splitting individual layer matrices across GPUs, as in Megatron-style tensor parallelism \cite{shoeybi2019megatron,narayanan2021efficient}. The benefit of TP is that it allows a single layer matrix to exceed the memory and compute capacity of one GPU, so any SOAP variant that works naturally with TP could carry SOAP's reported optimization benefits to much larger Transformer models.
 
 
-SOAP assumes access to statistics of the full gradient matrix. Under tensor parallelism, those statistics are no longer available on a single GPU because each rank only owns one shard. The naive choice is to gather the full gradient before applying SOAP, which increases communication and memory cost, or apply SOAP independently on each shard, which is cheaper but no longer matches the original optimizer. Existing Distributed Shampoo work addresses scalable optimizer state for distributed data-parallel training \cite{shi2023distributed}. Canzona is closer to this project because it supports matrix-based optimizers under tensor parallelism, but its TP path reconstructs the required matrix update work on selected ranks before scattering the result back \cite{wang2026canzona}. 
+SOAP assumes access to statistics of the full gradient matrix. Under tensor parallelism, those statistics are no longer available on a single GPU because each rank only owns one shard. The naive choice is to gather the full gradient before applying SOAP, which increases communication and memory cost, or apply SOAP independently on each shard, which is cheaper but no longer matches the original optimizer. Existing Distributed Shampoo work addresses scalable optimizer state for distributed data-parallel training \cite{shi2023distributed}. Canzona is closer to this project because it supports matrix-based optimizers under tensor parallelism, but its TP path gathers the required matrix update work on selected ranks before scattering the result back \cite{wang2026canzona}. This reconstruction step makes TP support possible, but it can also limit scalability because selected ranks become responsible for work that was originally distributed across the TP group.
+
+% Canzona is closer to this project because it supports matrix-based optimizers under tensor parallelism, but its TP path gathers the required matrix update work on selected ranks before scattering the result back \cite{wang2026canzona}. 
 
 The research question is therefore:
 
 $$
-\textbf{Can SOAP be implemented directly on tensor-parallel gradient shards without rebuilding the full matrix?}
+\textbf{Can SOAP be implemented directly on tensor-parallel gradient shards without gathering the full matrix?}
 $$
 
-\section*{Tensor-Parallel Algorithm}
+\section{Roadmap}
+
+
+The project has three stages. The first stage is to construct the SOAP math in a distributed form and verify that it is numerically correct. This means building the row-side and column-side statistics from tensor-parallel shards, keeping the resulting matrices distributed, computing the SOAP bases in a distributed fashion, and checking the final update against a single-process SOAP reference on small test cases. At this stage, the goal is to prove that the distributed algorithm computes the intended update. Unlike a TP approach used in Canzona~\cite{wang2026canzona}, through this project, we are hoping to keep the SOAP/Shampoo state sharded and keep the associated computation parallelized across the TP group. This (in theory) should make the SOAP optimizer design better suited for larger models.
+
+The second stage is to optimize the code from the first stage. Once the distributed math is correct, I will attempt different systems optimizations like communication/computation overlap, and kernel fusion where useful (among other possible optimizations). At each point, the optimized tensor-parallel SOAP optimizer step will be compared against AdamW and the single-process SOAP implementation.
+
+The third stage is to study whether SOAP can be overlapped with the normal backward pass. Tensor-parallel training already communicates gradient information during backpropagation. The question is whether some of the communication needed for SOAP statistics can be hidden behind the existing backward-pass communication. 
+
+
+\bibliographystyle{plain}
+\bibliography{reference}
+
+\newpage
+
+\section*{Appendix}
+\subsection*{Tensor-Parallel Algorithm}
 
 The algorithm depends on how the Transformer matrix is split. A column-parallel layer and a row-parallel layer expose different local gradient shards, so the SOAP statistics are not computed with the same communication pattern. I am currently working on the column-parallel case first, which I will outline below. This is an initial version and will likely be refined as the project develops.
 
@@ -149,18 +167,5 @@ $$
 the update for its local weight shard.
 
 The design goal is that $G$, $L$, $R$, $Q_L$, $Q_R$, $\widehat{G}$, and $\Delta W$ are all treated as distributed objects. The algorithm should communicate only the tiles needed for the current product or factor update, rather than reconstructing the full SOAP state on a single rank.
-
-
-
-
-
-
-
-
-
-
-
-\bibliographystyle{plain}
-\bibliography{reference}
 
 \end{document}
