@@ -7,21 +7,17 @@ import torch.distributed as dist
 from torch import Tensor
 from torch.distributed.distributed_c10d import ProcessGroup
 
+from ._utils import block_bounds, block_cyclic_owner_rank, num_blocks
+
 
 def update_left_preconditioner_from_col_shards(
-    G_local: Tensor, #shape is [m, n_local]
+    G_local: Tensor,  # shape is [m, n_local]
     L_prev: Optional[Tensor],
     beta: float,
     *,
-    TP_group: Optional[ProcessGroup] = None #Process group for tensor parallelism
+    TP_group: Optional[ProcessGroup] = None,  # Process group for tensor parallelism
 ) -> Tensor:
-    
-    if not 0.0 <= beta <= 1.0:
-        raise ValueError(f"beta must be in [0, 1], got {beta}")
-    
-    if G_local.ndim != 2:
-        raise ValueError(f"G_local must be 2D, got shape {tuple(G_local.shape)}")
-    
+
     if TP_group is None:
         TP_group = dist.group.WORLD
 
@@ -29,34 +25,19 @@ def update_left_preconditioner_from_col_shards(
 
     local_contribution = G_local @ G_local.T
 
-    
     world_size = dist.get_world_size(group=TP_group)
 
-    if m % world_size != 0:
-        raise ValueError(
-            f"reduce_scatter=True requires m to be divisible by TP world size. "
-            f"Got m={m}, world_size={world_size}."
-        )
-    
     rows_per_rank = m // world_size
     expected_shape = (rows_per_rank, m)
 
     if L_prev is None:
         L_prev = torch.zeros(expected_shape, device=G_local.device, dtype=G_local.dtype)
 
-    if tuple(L_prev.shape) != expected_shape:
-        raise ValueError(
-            f"For reduce_scatter=True, L_prev must have shape {expected_shape}, "
-            f"got {tuple(L_prev.shape)}."
-        )
-
     output = torch.zeros_like(L_prev)
 
-    input_chunks = list(local_contribution.chunk(world_size, dim=0))
-
-    dist.reduce_scatter(
+    dist.reduce_scatter_tensor(
         output,
-        input_chunks,
+        local_contribution,
         op=dist.ReduceOp.SUM,
         group=TP_group,
     )
@@ -66,18 +47,13 @@ def update_left_preconditioner_from_col_shards(
 
 
 def update_right_preconditioner_from_col_shards(
-    G_local: Tensor, #shape is [m, n_local]
+    G_local: Tensor,
     R_prev: Optional[Tensor],
     beta: float,
     *,
-    TP_group: Optional[ProcessGroup] = None #Process group for tensor parallelism
+    TP_group: Optional[ProcessGroup] = None,
 ) -> Tensor:
-    if not 0.0 <= beta <= 1.0:
-        raise ValueError(f"beta must be in [0, 1], got {beta}")
-    
-    if G_local.ndim != 2:
-        raise ValueError(f"G_local must be 2D, got shape {tuple(G_local.shape)}")
-    
+
     if TP_group is None:
         TP_group = dist.group.WORLD
 
@@ -96,58 +72,138 @@ def update_right_preconditioner_from_col_shards(
             dtype=G_local.dtype,
         )
 
-    if tuple(R_prev.shape) != expected_shape:
-        raise ValueError(
-            f"R_prev must have shape {expected_shape}, got {tuple(R_prev.shape)}."
-        )
-
     R_current = torch.zeros_like(R_prev)
-    # Ring direction:
-    #
-    # Rank r starts with G_r.
-    # Then it receives G_{r+1}, G_{r+2}, ..., wrapping around.
-    # To get that order, rank r receives from r+1 and sends to r-1.
 
     send_to = (tp_rank - 1) % world_size
     recv_from = (tp_rank + 1) % world_size
 
-    current_G = G_local.contiguous()
+    recv_buffers = (torch.empty_like(G_local), torch.empty_like(G_local))
+
+    current_G = G_local
     current_owner = tp_rank
 
     for step in range(world_size):
-        block = G_local.T @ current_G  # [n_local, n_local]
+        if step < world_size - 1:
+            next_G = recv_buffers[step % 2]
+            reqs = dist.batch_isend_irecv(
+                [
+                    dist.P2POp(
+                        dist.irecv, next_G, group=TP_group, group_peer=recv_from
+                    ),
+                    dist.P2POp(
+                        dist.isend, current_G, group=TP_group, group_peer=send_to
+                    ),
+                ]
+            )
 
+        block = G_local.T @ current_G
         col_start = current_owner * n_local
-        col_end = col_start + n_local
-        R_current[:, col_start:col_end] = block
+        R_current[:, col_start : col_start + n_local] = block
 
-        if step == world_size - 1:
-            break
-
-        recv_G = torch.empty_like(G_local)
-
-        recv_op = dist.P2POp(
-            dist.irecv,
-            recv_G,
-            group=TP_group,
-            group_peer=recv_from,
-        )
-
-        send_op = dist.P2POp(
-            dist.isend,
-            current_G,
-            group=TP_group,
-            group_peer=send_to,
-        )
-
-        reqs = dist.batch_isend_irecv([recv_op, send_op])
-
-        for req in reqs:
-            req.wait()
-
-        current_G = recv_G
-        current_owner = (current_owner + 1) % world_size
+        if step < world_size - 1:
+            for req in reqs:
+                req.wait()
+            current_G = next_G
+            current_owner = (current_owner + 1) % world_size
 
     R_prev.lerp_(R_current, 1.0 - beta)
     return R_prev
 
+
+def update_left_preconditioner_from_col_shards_2DblockCyclic_lower(
+    A_col_shard: torch.Tensor,
+    left_preconditioner: dict[tuple[int, int], torch.Tensor],
+    block_size: int,
+    process_grid_shape: tuple[int, int],
+) -> dict[tuple[int, int], torch.Tensor]:
+
+    if not dist.is_initialized():
+        raise RuntimeError("torch.distributed must be initialized first.")
+
+    if A_col_shard.ndim != 2:
+        raise ValueError(f"A_col_shard must be 2D, got {A_col_shard.ndim}D.")
+
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}.")
+
+    Pr, Pc = process_grid_shape
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    if Pr * Pc != world_size:
+        raise ValueError(
+            f"process_grid_shape={process_grid_shape} does not match "
+            f"world_size={world_size}."
+        )
+
+    m, local_n = A_col_shard.shape
+    device = A_col_shard.device
+    dtype = A_col_shard.dtype
+
+    nblocks = num_blocks(m, block_size)
+
+    tmp_flat = torch.empty(
+        block_size * block_size,
+        device=device,
+        dtype=dtype,
+    )
+
+    for bi in range(nblocks):
+        i0, i1 = block_bounds(bi, block_size, m)
+        Ai = A_col_shard[i0:i1, :]
+        tile_rows = i1 - i0
+
+        for bj in range(bi + 1):
+            j0, j1 = block_bounds(bj, block_size, m)
+            Aj = A_col_shard[j0:j1, :]
+            tile_cols = j1 - j0
+
+            dst = block_cyclic_owner_rank(
+                block_row=bi,
+                block_col=bj,
+                process_grid_shape=process_grid_shape,
+            )
+
+            if dst == rank:
+                key = (bi, bj)
+
+                if key not in left_preconditioner:
+                    left_preconditioner[key] = torch.empty(
+                        tile_rows,
+                        tile_cols,
+                        device=device,
+                        dtype=dtype,
+                    )
+
+                out = left_preconditioner[key]
+
+                expected_shape = (tile_rows, tile_cols)
+                if tuple(out.shape) != expected_shape:
+                    raise ValueError(
+                        f"left_preconditioner[{key}] has shape "
+                        f"{tuple(out.shape)}, expected {expected_shape}."
+                    )
+
+                if out.device != device:
+                    raise ValueError(
+                        f"left_preconditioner[{key}] is on {out.device}, "
+                        f"expected {device}."
+                    )
+
+                if out.dtype != dtype:
+                    raise ValueError(
+                        f"left_preconditioner[{key}] has dtype {out.dtype}, "
+                        f"expected {dtype}."
+                    )
+
+            else:
+                out = tmp_flat[: tile_rows * tile_cols].view(tile_rows, tile_cols)
+
+            if local_n == 0:
+                out.zero_()
+            else:
+                torch.mm(Ai, Aj.T, out=out)
+
+            dist.reduce(out, dst=dst, op=dist.ReduceOp.SUM)
+
+    return left_preconditioner
