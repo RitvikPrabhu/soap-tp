@@ -11,6 +11,7 @@ from soap_tp.ops.preconditioners import (
     update_left_preconditioner_from_col_shards,
     update_right_preconditioner_from_col_shards,
     update_left_preconditioner_from_col_shards_2DblockCyclic_lower,
+    update_right_preconditioner_from_col_shards_2DBlockCyclic_lower,
 )
 
 
@@ -121,7 +122,7 @@ def _run_update_right_preconditioner_test(rank, world_size, port):
         dist.destroy_process_group()
 
 
-def _run_2d_block_cyclic_lower_test(rank, world_size, port):
+def _run_update_left_preconditioner_2d_block_cyclic_lower_test(rank, world_size, port):
     device = _device_for_rank(rank, world_size)
     if device.type == "cuda":
         torch.cuda.set_device(device)
@@ -184,6 +185,69 @@ def _run_2d_block_cyclic_lower_test(rank, world_size, port):
         dist.destroy_process_group()
 
 
+def _run_update_right_preconditioner_2d_block_cyclic_lower_test(rank, world_size, port):
+    device = _device_for_rank(rank, world_size)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+
+    _init_process_group(rank, world_size, port, _backend_for_device(device))
+
+    try:
+        block_size = 2
+        process_grid_shape = _process_grid_shape(world_size)
+        G = _gradient(world_size, device=device)
+        G_local = G.chunk(world_size, dim=1)[rank].contiguous()
+
+        local_tiles = update_right_preconditioner_from_col_shards_2DBlockCyclic_lower(
+            G_local,
+            {},
+            block_size,
+            process_grid_shape,
+        )
+
+        payload = {
+            "rank": rank,
+            "keys": sorted(local_tiles),
+            "device_ok": all(
+                tile.device == G_local.device for tile in local_tiles.values()
+            ),
+            "tiles": {key: tile.cpu() for key, tile in local_tiles.items()},
+        }
+
+        gathered = [None for _ in range(world_size)] if rank == 0 else None
+        dist.gather_object(payload, gathered, dst=0)
+
+        if rank == 0:
+            expected = (G.T @ G).cpu()
+            combined = torch.full_like(expected, float("nan"))
+            nblocks = (expected.size(0) + block_size - 1) // block_size
+
+            for rank_payload in gathered:
+                payload_rank = rank_payload["rank"]
+                expected_keys = [
+                    (bi, bj)
+                    for bi in range(nblocks)
+                    for bj in range(bi + 1)
+                    if _block_cyclic_owner(bi, bj, process_grid_shape) == payload_rank
+                ]
+
+                assert rank_payload["keys"] == expected_keys
+                assert rank_payload["device_ok"]
+
+                for (bi, bj), tile in rank_payload["tiles"].items():
+                    i0, i1 = _block_bounds(bi, block_size, expected.size(0))
+                    j0, j1 = _block_bounds(bj, block_size, expected.size(1))
+                    expected_tile = expected[i0:i1, j0:j1]
+
+                    torch.testing.assert_close(tile, expected_tile)
+                    combined[i0:i1, j0:j1] = tile
+
+            lower_mask = torch.tril(torch.ones_like(expected, dtype=torch.bool))
+            torch.testing.assert_close(combined[lower_mask], expected[lower_mask])
+    finally:
+        dist.destroy_process_group()
+
+
 class TestPreconditionerDistributedCorrectness(unittest.TestCase):
     def test_update_left_preconditioner_from_col_shards(self):
         mp.spawn(
@@ -195,7 +259,7 @@ class TestPreconditionerDistributedCorrectness(unittest.TestCase):
 
     def test_update_left_preconditioner_from_col_shards_2d_block_cyclic_lower(self):
         mp.spawn(
-            _run_2d_block_cyclic_lower_test,
+            _run_update_left_preconditioner_2d_block_cyclic_lower_test,
             args=(WORLD_SIZE, _free_port()),
             nprocs=WORLD_SIZE,
             join=True,
@@ -204,6 +268,14 @@ class TestPreconditionerDistributedCorrectness(unittest.TestCase):
     def test_update_right_preconditioner_from_col_shards(self):
         mp.spawn(
             _run_update_right_preconditioner_test,
+            args=(WORLD_SIZE, _free_port()),
+            nprocs=WORLD_SIZE,
+            join=True,
+        )
+
+    def test_update_right_preconditioner_from_col_shards_2d_block_cyclic_lower(self):
+        mp.spawn(
+            _run_update_right_preconditioner_2d_block_cyclic_lower_test,
             args=(WORLD_SIZE, _free_port()),
             nprocs=WORLD_SIZE,
             join=True,
