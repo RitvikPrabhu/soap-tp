@@ -123,7 +123,12 @@ def _run_update_right_preconditioner_test(rank, world_size, port):
         dist.destroy_process_group()
 
 
-def _run_update_left_preconditioner_2d_block_cyclic_lower_test(rank, world_size, port):
+def _run_update_left_preconditioner_2d_block_cyclic_lower_test(
+    rank,
+    world_size,
+    port,
+    process_grid_shape,
+):
     device = _device_for_rank(rank, world_size)
     if device.type == "cuda":
         torch.cuda.set_device(device)
@@ -132,7 +137,6 @@ def _run_update_left_preconditioner_2d_block_cyclic_lower_test(rank, world_size,
 
     try:
         block_size = 2
-        process_grid_shape = _process_grid_shape(world_size)
         G = _gradient(world_size, device=device)
         G_local = G.chunk(world_size, dim=1)[rank].contiguous()
 
@@ -470,8 +474,8 @@ class TestPreconditionerDistributedCorrectness(unittest.TestCase):
     def test_update_left_preconditioner_from_col_shards_2d_block_cyclic_lower(self):
         mp.spawn(
             _run_update_left_preconditioner_2d_block_cyclic_lower_test,
-            args=(WORLD_SIZE, _free_port()),
-            nprocs=WORLD_SIZE,
+            args=(world_size, _free_port(), process_grid_shape),
+            nprocs=world_size,
             join=True,
         )
 

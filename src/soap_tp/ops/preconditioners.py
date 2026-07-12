@@ -403,6 +403,13 @@ def update_left_preconditioner_from_col_shards_2DblockCyclic_lower(
     dtype = A_col_shard.dtype
 
     nblocks = num_blocks(m, block_size)
+    owned_blocks = set(
+        iter_lower_2d_block_cyclic_blocks_owned_by_rank(
+            nblocks,
+            process_grid_shape,
+            rank,
+        )
+    )
 
     tmp_flat = torch.empty(
         block_size * block_size,
@@ -425,10 +432,9 @@ def update_left_preconditioner_from_col_shards_2DblockCyclic_lower(
                 block_col=bj,
                 process_grid_shape=process_grid_shape,
             )
+            key = (bi, bj)
 
-            if dst == rank:
-                key = (bi, bj)
-
+            if key in owned_blocks:
                 if key not in left_preconditioner:
                     left_preconditioner[key] = torch.empty(
                         tile_rows,
