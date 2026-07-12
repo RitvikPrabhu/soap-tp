@@ -474,8 +474,12 @@ class TestPreconditionerDistributedCorrectness(unittest.TestCase):
     def test_update_left_preconditioner_from_col_shards_2d_block_cyclic_lower(self):
         mp.spawn(
             _run_update_left_preconditioner_2d_block_cyclic_lower_test,
-            args=(world_size, _free_port(), process_grid_shape),
-            nprocs=world_size,
+            args=(
+                WORLD_SIZE,
+                _free_port(),
+                _process_grid_shape(WORLD_SIZE),
+            ),
+            nprocs=WORLD_SIZE,
             join=True,
         )
 
