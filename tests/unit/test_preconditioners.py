@@ -128,6 +128,8 @@ def _run_update_left_preconditioner_2d_block_cyclic_lower_test(
     world_size,
     port,
     process_grid_shape,
+    mode=None,
+    block_size=2,
 ):
     device = _device_for_rank(rank, world_size)
     if device.type == "cuda":
@@ -136,16 +138,30 @@ def _run_update_left_preconditioner_2d_block_cyclic_lower_test(
     _init_process_group(rank, world_size, port, _backend_for_device(device))
 
     try:
-        block_size = 2
         G = _gradient(world_size, device=device)
         G_local = G.chunk(world_size, dim=1)[rank].contiguous()
 
-        local_tiles = update_left_preconditioner_from_col_shards_2DblockCyclic_lower(
-            G_local,
-            {},
-            block_size,
-            process_grid_shape,
-        )
+        if mode is None:
+            effective_mode = "lower"
+            local_tiles = (
+                update_left_preconditioner_from_col_shards_2DblockCyclic_lower(
+                    G_local,
+                    {},
+                    block_size,
+                    process_grid_shape,
+                )
+            )
+        else:
+            effective_mode = mode
+            local_tiles = (
+                update_left_preconditioner_from_col_shards_2DblockCyclic_lower(
+                    G_local,
+                    {},
+                    block_size,
+                    process_grid_shape,
+                    mode=mode,
+                )
+            )
 
         payload = {
             "rank": rank,
@@ -169,7 +185,11 @@ def _run_update_left_preconditioner_2d_block_cyclic_lower_test(
                 expected_keys = [
                     (bi, bj)
                     for bi in range(nblocks)
-                    for bj in range(bi + 1)
+                    for bj in (
+                        range(bi + 1)
+                        if effective_mode == "lower"
+                        else range(nblocks)
+                    )
                     if _block_cyclic_owner(bi, bj, process_grid_shape) == payload_rank
                 ]
 
@@ -184,13 +204,23 @@ def _run_update_left_preconditioner_2d_block_cyclic_lower_test(
                     torch.testing.assert_close(tile, expected_tile)
                     combined[i0:i1, j0:j1] = tile
 
-            lower_mask = torch.tril(torch.ones_like(expected, dtype=torch.bool))
-            torch.testing.assert_close(combined[lower_mask], expected[lower_mask])
+            if effective_mode == "lower":
+                lower_mask = torch.tril(torch.ones_like(expected, dtype=torch.bool))
+                torch.testing.assert_close(combined[lower_mask], expected[lower_mask])
+            else:
+                torch.testing.assert_close(combined, expected)
     finally:
         dist.destroy_process_group()
 
 
-def _run_update_right_preconditioner_2d_block_cyclic_lower_test(rank, world_size, port):
+def _run_update_right_preconditioner_2d_block_cyclic_lower_test(
+    rank,
+    world_size,
+    port,
+    mode=None,
+    block_size=2,
+    matrix_rows=None,
+):
     device = _device_for_rank(rank, world_size)
     if device.type == "cuda":
         torch.cuda.set_device(device)
@@ -198,17 +228,32 @@ def _run_update_right_preconditioner_2d_block_cyclic_lower_test(rank, world_size
     _init_process_group(rank, world_size, port, _backend_for_device(device))
 
     try:
-        block_size = 2
+        effective_mode = "lower" if mode is None else mode
         process_grid_shape = _process_grid_shape(world_size)
         G = _gradient(world_size, device=device)
+        if matrix_rows is not None:
+            G = G[:matrix_rows]
         G_local = G.chunk(world_size, dim=1)[rank].contiguous()
 
-        local_tiles = update_right_preconditioner_from_col_shards_2DBlockCyclic_lower(
-            G_local,
-            {},
-            block_size,
-            process_grid_shape,
-        )
+        if mode is None:
+            local_tiles = (
+                update_right_preconditioner_from_col_shards_2DBlockCyclic_lower(
+                    G_local,
+                    {},
+                    block_size,
+                    process_grid_shape,
+                )
+            )
+        else:
+            local_tiles = (
+                update_right_preconditioner_from_col_shards_2DBlockCyclic_lower(
+                    G_local,
+                    {},
+                    block_size,
+                    process_grid_shape,
+                    mode=mode,
+                )
+            )
 
         payload = {
             "rank": rank,
@@ -232,7 +277,11 @@ def _run_update_right_preconditioner_2d_block_cyclic_lower_test(rank, world_size
                 expected_keys = [
                     (bi, bj)
                     for bi in range(nblocks)
-                    for bj in range(bi + 1)
+                    for bj in (
+                        range(bi + 1)
+                        if effective_mode == "lower"
+                        else range(nblocks)
+                    )
                     if _block_cyclic_owner(bi, bj, process_grid_shape) == payload_rank
                 ]
 
@@ -247,8 +296,11 @@ def _run_update_right_preconditioner_2d_block_cyclic_lower_test(rank, world_size
                     torch.testing.assert_close(tile, expected_tile)
                     combined[i0:i1, j0:j1] = tile
 
-            lower_mask = torch.tril(torch.ones_like(expected, dtype=torch.bool))
-            torch.testing.assert_close(combined[lower_mask], expected[lower_mask])
+            if effective_mode == "lower":
+                lower_mask = torch.tril(torch.ones_like(expected, dtype=torch.bool))
+                torch.testing.assert_close(combined[lower_mask], expected[lower_mask])
+            else:
+                torch.testing.assert_close(combined, expected)
     finally:
         dist.destroy_process_group()
 
@@ -368,6 +420,23 @@ def _run_block_cyclic_validation_test(rank, world_size, port):
             with unittest.TestCase().assertRaises(ValueError):
                 function(torch.ones(2, 2, device=device), {}, 2, (1, world_size + 1))
 
+        with unittest.TestCase().assertRaises(ValueError):
+            update_left_preconditioner_from_col_shards_2DblockCyclic_lower(
+                torch.ones(2, 2, device=device),
+                {},
+                2,
+                (1, world_size),
+                mode="invalid",
+            )
+        with unittest.TestCase().assertRaises(ValueError):
+            update_right_preconditioner_from_col_shards_2DBlockCyclic_lower(
+                torch.ones(2, 2, device=device),
+                {},
+                2,
+                (1, world_size),
+                mode="invalid",
+            )
+
         inconsistent_rows = 2 + (rank == world_size - 1)
         with unittest.TestCase().assertRaises(ValueError):
             update_right_preconditioner_from_col_shards_2DBlockCyclic_lower(
@@ -483,6 +552,24 @@ class TestPreconditionerDistributedCorrectness(unittest.TestCase):
             join=True,
         )
 
+    # Tests: full distributed left Gram construction by mirroring completed
+    # lower tiles, including same-owner, cross-owner, and partial-edge cases.
+    # Expected: every rank owns its normal full-matrix block-cyclic keys and
+    # gathering all tiles reconstructs G @ G.T.
+    def test_update_left_preconditioner_from_col_shards_2d_block_cyclic_full(self):
+        mp.spawn(
+            _run_update_left_preconditioner_2d_block_cyclic_lower_test,
+            args=(
+                WORLD_SIZE,
+                _free_port(),
+                _process_grid_shape(WORLD_SIZE),
+                "full",
+                3,
+            ),
+            nprocs=WORLD_SIZE,
+            join=True,
+        )
+
     # Tests: standard distributed right Gram computation from equal-width shards.
     # Expected: concatenating local results equals G.T @ G on the input device.
     def test_update_right_preconditioner_from_col_shards(self):
@@ -500,6 +587,18 @@ class TestPreconditionerDistributedCorrectness(unittest.TestCase):
         mp.spawn(
             _run_update_right_preconditioner_2d_block_cyclic_lower_test,
             args=(WORLD_SIZE, _free_port()),
+            nprocs=WORLD_SIZE,
+            join=True,
+        )
+
+    # Tests: full distributed right Gram construction by mirroring completed
+    # lower tiles, including same-owner, cross-owner, and partial-edge cases.
+    # Expected: each rank has exactly its full-matrix 2D block-cyclic tile set,
+    # and gathering those tiles reconstructs G.T @ G.
+    def test_update_right_preconditioner_from_col_shards_2d_block_cyclic_full(self):
+        mp.spawn(
+            _run_update_right_preconditioner_2d_block_cyclic_lower_test,
+            args=(WORLD_SIZE, _free_port(), "full", 3, 2),
             nprocs=WORLD_SIZE,
             join=True,
         )

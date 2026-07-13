@@ -12,6 +12,7 @@ from ._utils import (
     block_cyclic_owner_rank,
     column_shard_offsets,
     get_column_panel_from_col_shards,
+    iter_2d_block_cyclic_blocks_owned_by_rank,
     iter_lower_2d_block_cyclic_blocks_owned_by_rank,
     num_blocks,
 )
@@ -312,14 +313,17 @@ def update_left_preconditioner_from_col_shards_2DblockCyclic_lower(
     left_preconditioner: dict[tuple[int, int], torch.Tensor],
     block_size: int,
     process_grid_shape: tuple[int, int],
+    mode: str = "lower",  # "lower" or "full"
 ) -> dict[tuple[int, int], torch.Tensor]:
-    """Compute owned lower-triangular blocks of the left Gram matrix.
+    """Compute owned blocks of the left Gram matrix.
 
     The global matrix ``A`` has shape ``[m, n]`` and is column-sharded across
     the default distributed world. This function sums each rank's local
-    ``A_col_shard @ A_col_shard.T`` contribution and stores only blocks
-    ``(bi, bj)`` with ``bi >= bj``. For a process grid ``(Pr, Pc)``, block
-    ``(bi, bj)`` is owned by row-major rank
+    ``A_col_shard @ A_col_shard.T`` contribution. In ``"lower"`` mode it
+    stores only blocks ``(bi, bj)`` with ``bi >= bj``. In ``"full"`` mode it
+    also sends each completed off-diagonal block's transpose to the owner of
+    ``(bj, bi)``. For a process grid ``(Pr, Pc)``, block ``(bi, bj)`` is owned
+    by row-major rank
     ``(bi % Pr) * Pc + (bj % Pc)``.
 
     Args:
@@ -333,19 +337,23 @@ def update_left_preconditioner_from_col_shards_2DblockCyclic_lower(
             may be smaller, so ``m`` need not be divisible by ``block_size``.
         process_grid_shape: Positive ``(Pr, Pc)`` grid interpreted in row-major
             rank order. Its product must equal the default world size.
+        mode: ``"lower"`` stores only lower-triangular tiles. ``"full"`` also
+            stores the corresponding upper-triangular tiles on their normal
+            2D block-cyclic owners.
 
     Returns:
-        The same ``left_preconditioner`` dictionary. For every lower-triangular
-        block owned by this rank, tile ``(bi, bj)`` equals the corresponding
-        block of ``A @ A.T`` and has the input dtype and device. A rank that
-        owns no blocks receives no newly allocated tiles.
+        The same ``left_preconditioner`` dictionary. Each tile selected by
+        ``mode`` and owned by this rank equals the corresponding block of
+        ``A @ A.T`` and has the input dtype and device. A rank that owns no
+        selected blocks receives no newly allocated tiles.
 
     Raises:
         RuntimeError: If ``torch.distributed`` is not initialized, or if a
             collective or tensor operation fails.
         ValueError: If ``A_col_shard`` is not two-dimensional, ``block_size``
-            is not positive, ``Pr * Pc`` differs from the world size, or an
-            existing owned tile has the wrong shape, dtype, or device.
+            is not positive, ``mode`` is invalid, ``Pr * Pc`` differs from the
+            world size, or an existing owned tile has the wrong shape, dtype,
+            or device.
 
     Contract:
         Preconditions:
@@ -355,15 +363,18 @@ def update_left_preconditioner_from_col_shards_2DblockCyclic_lower(
               global matrix and are compatible with the distributed backend.
 
         Guarantees:
-            - Every lower-triangular block has exactly one owner under the
-              stated mapping.
+            - Every selected block has exactly one owner under the stated
+              mapping.
             - Owned tiles are allocated or overwritten; their tensor objects
               are reused when already present and valid.
+            - In ``"full"`` mode, an upper tile ``(bj, bi)`` is populated from
+              the transpose of the completed lower tile ``(bi, bj)`` without
+              another matrix multiplication or reduction.
             - Zero-width local shards contribute zero. Partial edge tiles are
               supported without padding.
 
         Invariants:
-            - The represented lower triangle agrees with the symmetric,
+            - The represented portion agrees with the symmetric,
               positive-semidefinite dense matrix ``A @ A.T``.
             - Scaling all shards by ``alpha`` scales every tile by
               ``alpha**2``; all-zero shards produce zero tiles.
@@ -388,6 +399,9 @@ def update_left_preconditioner_from_col_shards_2DblockCyclic_lower(
     if block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}.")
 
+    if mode not in {"lower", "full"}:
+        raise ValueError(f"mode must be 'lower' or 'full', got {mode!r}.")
+
     Pr, Pc = process_grid_shape
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -403,13 +417,55 @@ def update_left_preconditioner_from_col_shards_2DblockCyclic_lower(
     dtype = A_col_shard.dtype
 
     nblocks = num_blocks(m, block_size)
-    owned_blocks = set(
-        iter_lower_2d_block_cyclic_blocks_owned_by_rank(
+    if mode == "lower":
+        owned_block_iterator = iter_lower_2d_block_cyclic_blocks_owned_by_rank(
             nblocks,
             process_grid_shape,
             rank,
         )
-    )
+    else:
+        owned_block_iterator = iter_2d_block_cyclic_blocks_owned_by_rank(
+            nblocks,
+            nblocks,
+            process_grid_shape,
+            rank,
+        )
+
+    owned_blocks = tuple(owned_block_iterator)
+    owned_block_set = set(owned_blocks)
+
+    for owned_bi, owned_bj in owned_blocks:
+        owned_i0, owned_i1 = block_bounds(owned_bi, block_size, m)
+        owned_j0, owned_j1 = block_bounds(owned_bj, block_size, m)
+        owned_key = (owned_bi, owned_bj)
+        expected_shape = (owned_i1 - owned_i0, owned_j1 - owned_j0)
+
+        if owned_key not in left_preconditioner:
+            left_preconditioner[owned_key] = torch.empty(
+                expected_shape,
+                device=device,
+                dtype=dtype,
+            )
+
+        owned_tile = left_preconditioner[owned_key]
+
+        if tuple(owned_tile.shape) != expected_shape:
+            raise ValueError(
+                f"left_preconditioner[{owned_key}] has shape "
+                f"{tuple(owned_tile.shape)}, expected {expected_shape}."
+            )
+
+        if owned_tile.device != device:
+            raise ValueError(
+                f"left_preconditioner[{owned_key}] is on {owned_tile.device}, "
+                f"expected {device}."
+            )
+
+        if owned_tile.dtype != dtype:
+            raise ValueError(
+                f"left_preconditioner[{owned_key}] has dtype "
+                f"{owned_tile.dtype}, expected {dtype}."
+            )
 
     tmp_flat = torch.empty(
         block_size * block_size,
@@ -434,36 +490,8 @@ def update_left_preconditioner_from_col_shards_2DblockCyclic_lower(
             )
             key = (bi, bj)
 
-            if key in owned_blocks:
-                if key not in left_preconditioner:
-                    left_preconditioner[key] = torch.empty(
-                        tile_rows,
-                        tile_cols,
-                        device=device,
-                        dtype=dtype,
-                    )
-
+            if key in owned_block_set:
                 out = left_preconditioner[key]
-
-                expected_shape = (tile_rows, tile_cols)
-                if tuple(out.shape) != expected_shape:
-                    raise ValueError(
-                        f"left_preconditioner[{key}] has shape "
-                        f"{tuple(out.shape)}, expected {expected_shape}."
-                    )
-
-                if out.device != device:
-                    raise ValueError(
-                        f"left_preconditioner[{key}] is on {out.device}, "
-                        f"expected {device}."
-                    )
-
-                if out.dtype != dtype:
-                    raise ValueError(
-                        f"left_preconditioner[{key}] has dtype {out.dtype}, "
-                        f"expected {dtype}."
-                    )
-
             else:
                 out = tmp_flat[: tile_rows * tile_cols].view(tile_rows, tile_cols)
 
@@ -474,6 +502,36 @@ def update_left_preconditioner_from_col_shards_2DblockCyclic_lower(
 
             dist.reduce(out, dst=dst, op=dist.ReduceOp.SUM)
 
+            if mode == "lower" or bi == bj:
+                continue
+
+            upper_key = (bj, bi)
+            upper_dst = block_cyclic_owner_rank(
+                block_row=bj,
+                block_col=bi,
+                process_grid_shape=process_grid_shape,
+            )
+
+            if upper_dst == dst:
+                if rank == dst:
+                    left_preconditioner[upper_key].copy_(out.T)
+                continue
+
+            transfer = tmp_flat[: tile_rows * tile_cols].view(tile_rows, tile_cols)
+            request = None
+
+            if rank == dst:
+                send_tile = out.contiguous()
+                request = dist.isend(send_tile, dst=upper_dst)
+            elif rank == upper_dst:
+                request = dist.irecv(transfer, src=dst)
+
+            if request is not None:
+                request.wait()
+
+            if rank == upper_dst:
+                left_preconditioner[upper_key].copy_(transfer.T)
+
     return left_preconditioner
 
 
@@ -482,13 +540,16 @@ def update_right_preconditioner_from_col_shards_2DBlockCyclic_lower(
     right_preconditioner: dict[tuple[int, int], torch.Tensor],
     block_size: int,
     process_grid_shape: tuple[int, int],
+    mode: str = "lower",  # "lower" or "full"
 ) -> dict[tuple[int, int], torch.Tensor]:
-    """Compute owned lower-triangular blocks of the right Gram matrix.
+    """Compute owned blocks of the right Gram matrix.
 
     The global matrix ``A`` has shape ``[m, n]`` and is column-sharded across
     the default distributed world, with uneven and empty column shards
-    permitted. This function forms lower-triangular blocks of ``A.T @ A``.
-    For process grid ``(Pr, Pc)``, block ``(bi, bj)`` is owned by row-major rank
+    permitted. This function forms lower-triangular blocks of ``A.T @ A``. In
+    ``"full"`` mode, each completed off-diagonal lower block is sent to the
+    owner of its upper-triangular counterpart and transposed there. For process
+    grid ``(Pr, Pc)``, block ``(bi, bj)`` is owned by row-major rank
     ``(bi % Pr) * Pc + (bj % Pc)``.
 
     Args:
@@ -502,19 +563,23 @@ def update_right_preconditioner_from_col_shards_2DBlockCyclic_lower(
             column count need not be divisible by it.
         process_grid_shape: Positive ``(Pr, Pc)`` grid interpreted in row-major
             rank order. Its product must equal the default world size.
+        mode: ``"lower"`` stores only lower-triangular tiles. ``"full"`` also
+            stores the corresponding upper-triangular tiles on their normal
+            2D block-cyclic owners.
 
     Returns:
-        The same ``right_preconditioner`` dictionary. Each owned key ``(bi,
-        bj)`` with ``bi >= bj`` maps to the corresponding block of ``A.T @ A``
-        on the input device and with the input dtype. A rank may own no tiles.
+        The same ``right_preconditioner`` dictionary. Each tile selected by
+        ``mode`` and owned by this rank equals the corresponding block of
+        ``A.T @ A`` on the input device and with the input dtype. A rank may
+        own no selected tiles.
 
     Raises:
         RuntimeError: If ``torch.distributed`` is not initialized, or if a
             collective, point-to-point, or tensor operation fails.
         ValueError: If ``A_col_shard`` is not two-dimensional, ``block_size``
-            is not positive, ``Pr * Pc`` differs from the world size, ranks
-            report different row counts, or an existing owned tile has the
-            wrong shape, dtype, or device.
+            is not positive, ``mode`` is invalid, ``Pr * Pc`` differs from the
+            world size, ranks report different row counts, or an existing
+            owned tile has the wrong shape, dtype, or device.
 
     Contract:
         Preconditions:
@@ -528,13 +593,16 @@ def update_right_preconditioner_from_col_shards_2DBlockCyclic_lower(
         Guarantees:
             - Global shard widths are gathered, so uneven and zero-width column
               shards contribute according to their rank-ordered offsets.
-            - Every lower-triangular block has exactly one owner under the
-              stated mapping, and owned tile tensors are reused when valid.
+            - Every selected block has exactly one owner under the stated
+              mapping, and owned tile tensors are reused when valid.
+            - In ``"full"`` mode, an upper tile ``(bj, bi)`` is populated by
+              transposing the completed lower tile ``(bi, bj)`` on the upper
+              owner, without gathering its panels or multiplying them again.
             - Partial edge tiles are supported. If ``m == 0``, owned tiles are
               zero; if ``n == 0``, no new tiles are allocated.
 
         Invariants:
-            - The represented lower triangle agrees with the symmetric,
+            - The represented portion agrees with the symmetric,
               positive-semidefinite dense matrix ``A.T @ A``.
             - Scaling all shards by ``alpha`` scales every tile by
               ``alpha**2``; zero input produces zero tiles.
@@ -560,6 +628,9 @@ def update_right_preconditioner_from_col_shards_2DBlockCyclic_lower(
 
     if block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}.")
+
+    if mode not in {"lower", "full"}:
+        raise ValueError(f"mode must be 'lower' or 'full', got {mode!r}.")
 
     Pr, Pc = process_grid_shape
     rank = dist.get_rank()
@@ -587,11 +658,21 @@ def update_right_preconditioner_from_col_shards_2DBlockCyclic_lower(
     n = shard_offsets[-1]
     nblocks = num_blocks(n, block_size)
 
-    for bi, bj in iter_lower_2d_block_cyclic_blocks_owned_by_rank(
-        nblocks,
-        process_grid_shape,
-        rank,
-    ):
+    if mode == "lower":
+        owned_block_iterator = iter_lower_2d_block_cyclic_blocks_owned_by_rank(
+            nblocks,
+            process_grid_shape,
+            rank,
+        )
+    else:
+        owned_block_iterator = iter_2d_block_cyclic_blocks_owned_by_rank(
+            nblocks,
+            nblocks,
+            process_grid_shape,
+            rank,
+        )
+
+    for bi, bj in owned_block_iterator:
         i0, i1 = block_bounds(bi, block_size, n)
         j0, j1 = block_bounds(bj, block_size, n)
         key = (bi, bj)
@@ -630,10 +711,11 @@ def update_right_preconditioner_from_col_shards_2DBlockCyclic_lower(
     panel_rows = min(block_size, m)
     panel_cols = min(block_size, n)
     panel_capacity = panel_rows * panel_cols
+    transfer_capacity = max(panel_capacity, panel_cols * panel_cols)
 
     panel_i_flat = torch.empty(panel_capacity, device=device, dtype=dtype)
     panel_j_flat = torch.empty_like(panel_i_flat)
-    transfer_flat = torch.empty_like(panel_i_flat)
+    transfer_flat = torch.empty(transfer_capacity, device=device, dtype=dtype)
 
     for bi in range(nblocks):
         i0, i1 = block_bounds(bi, block_size, n)
@@ -681,5 +763,42 @@ def update_right_preconditioner_from_col_shards_2DBlockCyclic_lower(
 
                 if rank == destination:
                     right_preconditioner[(bi, bj)].addmm_(Ai.T, Aj)
+
+            if mode == "lower" or bi == bj:
+                continue
+
+            upper_key = (bj, bi)
+            upper_destination = block_cyclic_owner_rank(
+                block_row=bj,
+                block_col=bi,
+                process_grid_shape=process_grid_shape,
+            )
+
+            if upper_destination == destination:
+                if rank == destination:
+                    right_preconditioner[upper_key].copy_(
+                        right_preconditioner[(bi, bj)].T
+                    )
+                continue
+
+            tile_rows = i1 - i0
+            tile_cols = j1 - j0
+            transfer = transfer_flat[: tile_rows * tile_cols].view(
+                tile_rows,
+                tile_cols,
+            )
+            request = None
+
+            if rank == destination:
+                send_tile = right_preconditioner[(bi, bj)].contiguous()
+                request = dist.isend(send_tile, dst=upper_destination)
+            elif rank == upper_destination:
+                request = dist.irecv(transfer, src=destination)
+
+            if request is not None:
+                request.wait()
+
+            if rank == upper_destination:
+                right_preconditioner[upper_key].copy_(transfer.T)
 
     return right_preconditioner
