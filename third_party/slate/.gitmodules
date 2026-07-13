@@ -1,0 +1,9 @@
+[submodule "testsweeper"]
+	path = testsweeper
+	url = https://github.com/icl-utk-edu/testsweeper
+[submodule "blaspp"]
+	path = blaspp
+	url = https://github.com/icl-utk-edu/blaspp
+[submodule "lapackpp"]
+	path = lapackpp
+	url = https://github.com/icl-utk-edu/lapackpp
