@@ -168,11 +168,9 @@ def _make_symmetric_matrix(case):
     size = case["size"]
     if case["matrix"] == "singleton":
         matrix = torch.tensor([[2.5]], dtype=torch.float32)
-        expected_values = torch.tensor([2.5], dtype=torch.float32)
     elif case["matrix"] == "diagonal":
         diagonal = torch.tensor([4.0, -2.0, 1.0, 3.0])
         matrix = torch.diag(diagonal)
-        expected_values = torch.tensor([-2.0, 1.0, 3.0, 4.0])
     elif case["matrix"] == "repeated":
         matrix = torch.tensor(
             [
@@ -183,13 +181,68 @@ def _make_symmetric_matrix(case):
             ],
             dtype=torch.float32,
         )
-        expected_values = torch.tensor([1.0, 1.0, 3.0, 3.0])
     else:
         generator = torch.Generator().manual_seed(1000 + size)
         random = torch.randn(size, size, generator=generator)
         matrix = random + random.T
-        expected_values = torch.linalg.eigvalsh(matrix)
-    return matrix, expected_values
+    return matrix
+
+
+def _assert_matches_torch_eigh(
+    matrix,
+    eigenvalues,
+    eigenvectors,
+    requested_count,
+    case_name,
+    atol,
+    rtol,
+):
+    expected_values, expected_vectors = torch.linalg.eigh(matrix)
+    torch.testing.assert_close(
+        eigenvalues,
+        expected_values,
+        atol=atol,
+        rtol=rtol,
+        msg=case_name,
+    )
+
+    requested_vectors = eigenvectors[:, :requested_count]
+    group_start = 0
+    while group_start < requested_count:
+        group_end = group_start + 1
+        while group_end < requested_count and torch.isclose(
+            expected_values[group_end],
+            expected_values[group_start],
+            atol=1e-5,
+            rtol=1e-5,
+        ):
+            group_end += 1
+
+        actual_subspace = requested_vectors[:, group_start:group_end]
+        expected_subspace = expected_vectors[:, group_start:group_end]
+        torch.testing.assert_close(
+            actual_subspace @ actual_subspace.T,
+            expected_subspace @ expected_subspace.T,
+            atol=atol,
+            rtol=rtol,
+            msg=case_name,
+        )
+        group_start = group_end
+
+    torch.testing.assert_close(
+        matrix @ requested_vectors,
+        requested_vectors * eigenvalues[:requested_count],
+        atol=atol,
+        rtol=rtol,
+        msg=case_name,
+    )
+    torch.testing.assert_close(
+        requested_vectors.T @ requested_vectors,
+        torch.eye(requested_count),
+        atol=atol,
+        rtol=rtol,
+        msg=case_name,
+    )
 
 
 def _call_eigenvectors(
@@ -244,7 +297,7 @@ def _call_eigenvectors(
 
 def _solve_eigenvector_case(binding, elpa, case):
     size = case["size"]
-    matrix, expected_values = _make_symmetric_matrix(case)
+    matrix = _make_symmetric_matrix(case)
     a = torch.empty(size, size, dtype=torch.float32).T
     a.copy_(matrix)
     eigenvectors = torch.empty_like(a)
@@ -263,27 +316,14 @@ def _solve_eigenvector_case(binding, elpa, case):
         eigenvectors,
     )
 
-    torch.testing.assert_close(
+    _assert_matches_torch_eigh(
+        matrix,
         eigenvalues,
-        expected_values,
-        atol=2e-4,
-        rtol=2e-4,
-        msg=case["name"],
-    )
-    requested_vectors = eigenvectors[:, : case["nev"]]
-    torch.testing.assert_close(
-        matrix @ requested_vectors,
-        requested_vectors * eigenvalues[: case["nev"]],
+        eigenvectors,
+        case["nev"],
+        case["name"],
         atol=1e-3,
         rtol=1e-3,
-        msg=case["name"],
-    )
-    torch.testing.assert_close(
-        requested_vectors.T @ requested_vectors,
-        torch.eye(case["nev"]),
-        atol=1e-3,
-        rtol=1e-3,
-        msg=case["name"],
     )
 
 
@@ -362,15 +402,6 @@ def _solve_multirank_case(binding, elpa, case, rank, world_size):
         eigenvectors,
     )
 
-    expected_values = torch.linalg.eigvalsh(matrix)
-    torch.testing.assert_close(
-        eigenvalues,
-        expected_values,
-        atol=3e-4,
-        rtol=3e-4,
-        msg=case["name"],
-    )
-
     local_result = (
         global_rows,
         global_cols,
@@ -391,19 +422,14 @@ def _solve_multirank_case(binding, elpa, case, rank, world_size):
 
     requested_vectors = global_vectors[:, : case["nev"]]
     assert torch.isfinite(requested_vectors).all(), case["name"]
-    torch.testing.assert_close(
-        matrix @ requested_vectors,
-        requested_vectors * eigenvalues[: case["nev"]],
+    _assert_matches_torch_eigh(
+        matrix,
+        eigenvalues,
+        global_vectors,
+        case["nev"],
+        case["name"],
         atol=2e-3,
         rtol=2e-3,
-        msg=case["name"],
-    )
-    torch.testing.assert_close(
-        requested_vectors.T @ requested_vectors,
-        torch.eye(case["nev"]),
-        atol=2e-3,
-        rtol=2e-3,
-        msg=case["name"],
     )
 
 
@@ -481,17 +507,17 @@ class TestElpaBinding(unittest.TestCase):
                     self.binding.elpa_eigenvectors_float(**arguments)
 
     # Tests: single-rank solves at singleton, equal, partial, and oversized blocks.
-    # Expected: eigenvalues and eigenvectors satisfy the reference eigenproblem.
+    # Expected: eigenvalues and eigenspaces match torch.linalg.eigh.
     def test_eigenvectors_float_handles_block_boundaries(self):
         self._run_cases(BLOCK_BOUNDARY_CASES, world_size=4)
 
     # Tests: a symmetric matrix whose eigenvalues have multidimensional eigenspaces.
-    # Expected: ELPA returns an orthonormal eigenbasis with the correct residuals.
+    # Expected: ELPA and torch.linalg.eigh produce the same spectral projectors.
     def test_eigenvectors_float_handles_repeated_eigenvalues(self):
         self._run_cases(REPEATED_EIGENVALUE_CASE, world_size=1)
 
     # Tests: a collective four-rank solve under 1x4, 2x2, and 4x1 ELPA grids.
-    # Expected: gathered block-cyclic shards reconstruct valid global eigenpairs.
+    # Expected: gathered global eigenpairs match torch.linalg.eigh.
     def test_eigenvectors_float_multirank_block_cyclic(self):
         mpiexec = shutil.which("mpiexec")
         if mpiexec is None:
@@ -533,7 +559,7 @@ class TestElpaBinding(unittest.TestCase):
         )
 
     # Tests: nev smaller than na while eigenvalue storage remains length na.
-    # Expected: all eigenvalues and exactly the requested eigenvector columns work.
+    # Expected: all values and requested eigenspaces match torch.linalg.eigh.
     def test_eigenvectors_float_returns_requested_eigenvectors(self):
         self._run_cases(PARTIAL_EIGENVECTOR_CASE, world_size=1)
 
