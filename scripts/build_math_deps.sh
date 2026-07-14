@@ -6,8 +6,9 @@ set -eo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OPENBLAS="${ROOT}/third_party/openblas"
 SCALAPACK="${ROOT}/third_party/scalapack"
-BUILD="${ROOT}/build/math"
-PREFIX="${ROOT}/build/math-install"
+BUILD_ROOT="${SOAP_TP_BUILD_ROOT:-${ROOT}/build}"
+BUILD="${BUILD_ROOT}/math"
+PREFIX="${MATH_PREFIX:-${BUILD_ROOT}/math-install}"
 JOBS="${BUILD_JOBS:-8}"
 
 MPI_CC="${CC:-mpicc}"
@@ -24,7 +25,7 @@ cmake -S "${OPENBLAS}" -B "${BUILD}/openblas" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
     -DCMAKE_INSTALL_LIBDIR=lib \
-    -DCMAKE_C_COMPILER=cc \
+    -DCMAKE_C_COMPILER="${MPI_CC}" \
     -DCMAKE_Fortran_COMPILER="${MPI_FC}" \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DBUILD_STATIC_LIBS=ON \

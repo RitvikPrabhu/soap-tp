@@ -34,3 +34,5 @@ paper/*.synctex.gz
 paper/*.toc
 
 *rough*
+
+build/*

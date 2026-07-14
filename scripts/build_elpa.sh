@@ -5,12 +5,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROFILE="${1:-cpu}"
 SOURCE="${ROOT}/third_party/elpa"
-BUILD="${ROOT}/build/elpa/${PROFILE}"
-PREFIX="${ROOT}/build/elpa-install/${PROFILE}"
-MATH_PREFIX="${ROOT}/build/math-install"
+BUILD_ROOT="${SOAP_TP_BUILD_ROOT:-${ROOT}/build}"
+BUILD="${BUILD_ROOT}/elpa/${PROFILE}"
+PREFIX="${ELPA_PREFIX:-${BUILD_ROOT}/elpa-install/${PROFILE}}"
+MATH_PREFIX="${MATH_PREFIX:-${BUILD_ROOT}/math-install}"
 JOBS="${BUILD_JOBS:-8}"
 
-if command -v mpicc >/dev/null && command -v mpicxx >/dev/null && command -v mpifort >/dev/null; then
+if [[ -n "${CC:-}" && -n "${CXX:-}" && -n "${FC:-}" ]]; then
+    MPI_CC="${CC}"
+    MPI_CXX="${CXX}"
+    MPI_FC="${FC}"
+elif command -v mpicc >/dev/null && command -v mpicxx >/dev/null && command -v mpifort >/dev/null; then
     MPI_CC=mpicc
     MPI_CXX=mpicxx
     MPI_FC=mpifort
@@ -32,6 +37,14 @@ case "${PROFILE}" in
     *) echo "Usage: $0 [cpu|rocm|cuda]" >&2; exit 1 ;;
 esac
 
+if [[ -n "${ELPA_CONFIGURE_ARGS:-}" ]]; then
+    # This escape hatch is useful for cluster-specific settings such as CUDA
+    # compute capabilities and nonstandard toolkit prefixes. Arguments may not
+    # contain whitespace.
+    read -r -a EXTRA_CONFIGURE_ARGS <<<"${ELPA_CONFIGURE_ARGS}"
+    CONFIGURE_ARGS+=("${EXTRA_CONFIGURE_ARGS[@]}")
+fi
+
 if [[ "$(uname -m)" == "arm64" || "$(uname -m)" == "aarch64" ]]; then
     CONFIGURE_ARGS+=(--disable-sse-kernels --disable-sse-assembly-kernels)
     CONFIGURE_ARGS+=(--disable-avx-kernels --disable-avx2-kernels --disable-avx512-kernels)
@@ -41,7 +54,9 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     CONFIGURE_ARGS+=(--disable-affinity-checking)
 fi
 
-if [[ ! -f "${SOURCE}/configure.ac" ]]; then
+if [[ ! -f "${SOURCE}/configure.ac" || \
+      ! -f "${ROOT}/third_party/openblas/CMakeLists.txt" || \
+      ! -f "${ROOT}/third_party/scalapack/CMakeLists.txt" ]]; then
     git -C "${ROOT}" submodule update --init --recursive
 fi
 
@@ -55,15 +70,15 @@ fi
 
 # Use a loaded ScaLAPACK module when possible; otherwise build our pinned copy.
 if [[ -z "${SCALAPACK_LDFLAGS:-}" ]]; then
-    mkdir -p "${ROOT}/build"
-    cat >"${ROOT}/build/scalapack_probe.f90" <<'EOF'
+    mkdir -p "${BUILD_ROOT}"
+    cat >"${BUILD_ROOT}/scalapack_probe.f90" <<'EOF'
 program probe
   call blacs_pinfo(i, n)
 end program probe
 EOF
 
     for flags in -lscalapack -lscalapack-openmpi -lmpiscalapack; do
-        if "${MPI_FC}" "${ROOT}/build/scalapack_probe.f90" ${flags} -o "${ROOT}/build/scalapack_probe" >/dev/null 2>&1; then
+        if "${MPI_FC}" "${BUILD_ROOT}/scalapack_probe.f90" ${flags} -o "${BUILD_ROOT}/scalapack_probe" >/dev/null 2>&1; then
             SCALAPACK_LDFLAGS="${flags}"
             break
         fi
@@ -71,7 +86,8 @@ EOF
 fi
 
 if [[ -z "${SCALAPACK_LDFLAGS:-}" ]]; then
-    "${ROOT}/scripts/build_math_deps.sh"
+    SOAP_TP_BUILD_ROOT="${BUILD_ROOT}" MATH_PREFIX="${MATH_PREFIX}" \
+        "${ROOT}/scripts/build_math_deps.sh"
     SCALAPACK_LDFLAGS="-L${MATH_PREFIX}/lib -lscalapack -lopenblas"
 fi
 export SCALAPACK_LDFLAGS

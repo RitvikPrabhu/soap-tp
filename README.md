@@ -1,37 +1,33 @@
-# Building ELPA
+# soap-tp
 
-ELPA, OpenBLAS, and ScaLAPACK are pinned Git submodules. MPI and the compiler toolchain come from the machine or active cluster modules.
+## Getting started
 
-There are two build scripts:
-
-- `scripts/build_elpa.sh` is the normal entry point. It initializes missing submodules, finds the MPI wrappers, uses an available ScaLAPACK installation, builds the pinned OpenBLAS and ScaLAPACK fallback when necessary, and then builds ELPA.
-- `scripts/build_math_deps.sh` builds only the pinned OpenBLAS and ScaLAPACK fallback under `build/math-install`. `build_elpa.sh` calls it automatically, so it normally does not need to be run directly.
-
-Before running either script, load or install MPI, Autoconf, Automake, and Libtool. CMake 3.26 or newer is required when building the pinned math libraries. CUDA or ROCm libraries must be supplied for the corresponding GPU profile.
-
-A CPU build from a fresh checkout is:
+Clone the repository with its pinned ELPA, OpenBLAS, and ScaLAPACK submodules:
 
 ```bash
 git clone --recurse-submodules https://github.com/RitvikPrabhu/soap-tp.git
 cd soap-tp
-./scripts/build_elpa.sh cpu
 ```
 
-For a normal build, run only `build_elpa.sh`. It recognizes `mpicc`/`mpicxx`/`mpifort` and Cray `cc`/`CC`/`ftn`. If a loaded module provides ScaLAPACK, that installation is used. Otherwise the math build runs automatically before ELPA.
-
-Run the math script directly only to prepare or troubleshoot the fallback libraries separately:
+Load or install a C/C++/Fortran toolchain, MPI, Autoconf, Automake, and Libtool.
+On a GPU cluster, also load its CUDA or ROCm modules. Then create a Python
+environment and install the PyTorch build appropriate for that machine:
 
 ```bash
-./scripts/build_math_deps.sh
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+# Install the site's CPU, CUDA, or ROCm PyTorch build here.
 ```
 
-That command does not build ELPA. Run `./scripts/build_elpa.sh cpu` afterward to finish the CPU build.
-
-GPU builds use the same command with a different profile:
+Build ELPA, its native dependencies, and the Python extension with the matching
+profile:
 
 ```bash
-./scripts/build_elpa.sh rocm
-./scripts/build_elpa.sh cuda
+./scripts/install.sh cpu       # CPU
+./scripts/install.sh cuda      # NVIDIA GPU
+./scripts/install.sh rocm      # AMD GPU
 ```
 
-The scripts write build files under `build/`. Math libraries are installed under `build/math-install`, and ELPA is installed under `build/elpa-install/<profile>`. Re-running the same command reuses completed work.
+See [BUILD.md](BUILD.md) for system prerequisites, cluster modules, GPU
+architecture options, installation prefixes, and troubleshooting.
