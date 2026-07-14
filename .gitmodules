@@ -1,0 +1,9 @@
+[submodule "third_party/elpa"]
+	path = third_party/elpa
+	url = https://gitlab.mpcdf.mpg.de/elpa/elpa.git
+[submodule "third_party/openblas"]
+	path = third_party/openblas
+	url = https://github.com/OpenMathLib/OpenBLAS.git
+[submodule "third_party/scalapack"]
+	path = third_party/scalapack
+	url = https://github.com/Reference-ScaLAPACK/scalapack.git

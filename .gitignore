@@ -33,5 +33,4 @@ paper/*.pdf
 paper/*.synctex.gz
 paper/*.toc
 
-*README.md*
 *rough*
