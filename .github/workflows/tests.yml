@@ -19,7 +19,7 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -e .
       - name: Run unit tests
-        run: python -m unittest tests.unit.test_preconditioners
+        run: python -m unittest tests.unit.test_preconditioners -v --durations=0
 
   elpa-binding-smoke:
     runs-on: ubuntu-latest
@@ -53,4 +53,4 @@ jobs:
       - name: Compile and test the ELPA binding
         env:
           MAX_JOBS: "2"
-        run: python -m unittest tests.unit.test_elpa_bindings
+        run: python -m unittest tests.unit.test_elpa_bindings -v --durations=0
