@@ -69,16 +69,29 @@ if [[ ! -x "${SOURCE}/configure" ]]; then
 fi
 
 # Use a loaded ScaLAPACK module when possible; otherwise build our pinned copy.
+# Probe all three interfaces ELPA needs.  A ScaLAPACK shared library can link a
+# BLACS-only program through transitive dependencies even when the development
+# link names for BLAS and LAPACK are unavailable; accepting that partial link
+# line makes ELPA's later dgemm/dlarrv configure checks fail.
 if [[ -z "${SCALAPACK_LDFLAGS:-}" ]]; then
     mkdir -p "${BUILD_ROOT}"
     cat >"${BUILD_ROOT}/scalapack_probe.f90" <<'EOF'
 program probe
   call blacs_pinfo(i, n)
+  call dgemm
+  call dlarrv
 end program probe
 EOF
 
-    for flags in -lscalapack -lscalapack-openmpi -lmpiscalapack; do
-        if "${MPI_FC}" "${BUILD_ROOT}/scalapack_probe.f90" ${flags} -o "${BUILD_ROOT}/scalapack_probe" >/dev/null 2>&1; then
+    for flags in \
+        "-lscalapack -lopenblas" \
+        "-lscalapack-openmpi -lopenblas" \
+        "-lmpiscalapack -lopenblas" \
+        "-lscalapack -llapack -lblas" \
+        "-lscalapack-openmpi -llapack -lblas" \
+        "-lmpiscalapack -llapack -lblas"; do
+        read -r -a LINK_FLAGS <<<"${flags}"
+        if "${MPI_FC}" "${BUILD_ROOT}/scalapack_probe.f90" "${LINK_FLAGS[@]}" -o "${BUILD_ROOT}/scalapack_probe" >/dev/null 2>&1; then
             SCALAPACK_LDFLAGS="${flags}"
             break
         fi
