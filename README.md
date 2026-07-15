@@ -23,7 +23,7 @@ python -m pip install --upgrade pip setuptools wheel
 # Install the site's CPU, CUDA, or ROCm PyTorch build here.
 ```
 
-Build ELPA, SLATE, their native dependencies, and the Python extension with the
+Build ELPA, SLATE, their native dependencies, and the Python extensions with the
 matching profile:
 
 ```bash

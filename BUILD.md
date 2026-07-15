@@ -10,8 +10,8 @@ versions are machine-specific.
 After activating the desired Python environment and loading the cluster modules,
 run `scripts/install.sh`. It initializes the native sources if needed, finds the
 MPI wrappers, builds a ScaLAPACK/OpenBLAS fallback when the cluster does not
-provide ScaLAPACK, builds ELPA and SLATE, compiles the pybind11 extension,
-installs the Python package, and imports the extension as a final check.
+provide ScaLAPACK, builds ELPA and SLATE, compiles both pybind11 extensions,
+installs the Python package, and imports the extensions as a final check.
 
 A CPU installation from a fresh checkout is:
 
@@ -91,10 +91,10 @@ build/slate-install/cuda
 build/slate-install/rocm
 ```
 
-The Python extension records the selected ELPA library directory as its runtime
-search path. Therefore, do not delete that ELPA installation after installing
-the package. When the fallback math libraries are used, SLATE likewise records
-`MATH_PREFIX/lib` in its runtime search path. Keep both native prefixes
+The Python extensions record the selected ELPA and SLATE library directories as
+runtime search paths. Therefore, do not delete those native installations after
+installing the package. When the fallback math libraries are used, SLATE also
+records `MATH_PREFIX/lib` in its runtime search path. Keep all selected prefixes
 available. On a cluster with a persistent software directory, use explicit
 prefixes:
 
@@ -134,7 +134,7 @@ for site-specific settings, and `BLAS_LIBRARIES`/`LAPACK_LIBRARIES` can select
 explicit vendor math libraries. When the pinned OpenBLAS fallback already
 exists, SLATE reuses it automatically.
 
-## How the Python extension is built
+## How the Python extensions are built
 
 `scripts/install.sh` eventually runs:
 
@@ -150,6 +150,7 @@ Before invoking pip, the installer exports:
 
 ```text
 SOAP_TP_BUILD_ELPA_BINDINGS=1
+SOAP_TP_BUILD_SLATE_BINDINGS=1
 ELPA_PREFIX=/path/to/the/selected/elpa/installation
 ELPA_PROFILE=cpu, cuda, or rocm
 SLATE_PREFIX=/path/to/the/selected/slate/installation
@@ -159,19 +160,22 @@ CXX=<MPI C++ compiler wrapper>
 FC=<MPI Fortran compiler wrapper>
 ```
 
-`setup.py` uses `ELPA_PREFIX` to discover two different things:
+`setup.py` uses the two prefixes to discover the native headers and libraries:
 
 ```text
 ELPA headers:  $ELPA_PREFIX/include/elpa-*/elpa/elpa.h
 ELPA library:  $ELPA_PREFIX/lib/libelpa.* (or lib64/libelpa.*)
+SLATE headers: $SLATE_PREFIX/include/slate/slate.hh
+SLATE library: $SLATE_PREFIX/lib/libslate.* (or lib64/libslate.*)
 ```
 
-It gives the parent of `elpa/elpa.h` to the C++ compiler as an include
-directory, links the extension with `-lelpa`, and records the ELPA library
-directory as a runtime search path. It then builds the extension as:
+It supplies those include directories to the MPI C++ compiler, links the
+extensions to their native libraries, and records both library directories as
+runtime search paths. It builds:
 
 ```text
 soap_tp.elpa_bindings
+soap_tp.slate_bindings
 ```
 
 This is why the C++ source can contain:
@@ -189,19 +193,50 @@ cluster login nodes can reuse the active environment. `setup.py` uses a normal
 bundled with the already-installed PyTorch package.
 
 Running plain `pip install .` without the installer does not build ELPA or
-SLATE. If an ELPA installation already exists, the equivalent manual package
-command for the current ELPA extension is:
+SLATE. If both native installations already exist, the equivalent manual package
+command for both extensions is:
 
 ```bash
 SOAP_TP_BUILD_ELPA_BINDINGS=1 \
+SOAP_TP_BUILD_SLATE_BINDINGS=1 \
 ELPA_PREFIX=/absolute/path/to/elpa \
+SLATE_PREFIX=/absolute/path/to/slate \
+ELPA_PROFILE=cpu SLATE_PROFILE=cpu \
 CC=mpicc CXX=mpicxx FC=mpifort \
     python -m pip install --no-build-isolation .
 ```
 
-That command only builds and installs the Python package and extension. The
+That command only builds and installs the Python package and extensions. The
 recommended `scripts/install.sh` entry point performs both native solver builds
 first and passes these values automatically.
+
+## Running the SLATE binding
+
+`slate_power_iteration_qr_float` uses the selected SLATE build profile. A CPU
+installation wraps host memory and runs the host-task backend. CUDA and ROCm
+installations wrap device memory and run SLATE's device backend. The caller does
+not pass a runtime target.
+
+GPU execution uses one MPI rank per accelerator. For a node with eight GPUs,
+launch eight ranks and configure the scheduler or MPI launcher to expose one
+different GPU to each rank. For example, the equivalent Slurm allocation is
+typically requested with `--ntasks-per-node=8 --gpus-per-task=1` and the site's
+GPU-binding option. NVIDIA ranks use `CUDA_VISIBLE_DEVICES`; AMD ranks use
+`ROCR_VISIBLE_DEVICES`. Each rank must pass pointers belonging to its assigned
+accelerator.
+
+The operation is collective over `MPI_COMM_WORLD`; `process_rows * process_cols`
+must equal the world size. MPI must already be initialized, normally by importing
+`mpi4py.MPI`.
+
+The three buffers are raw integer addresses. Each must describe a distinct,
+column-major, rank-local ScaLAPACK-style `float32` allocation with the requested
+2D block-cyclic distribution. Individual row-major PyTorch tile tensors must be
+packed into that layout before calling the binding.
+
+On macOS, the SLATE build rewrites its OpenMP dependency to use the active
+PyTorch installation's `libomp.dylib`. This prevents Torch and SLATE from
+initializing two OpenMP runtimes in one Python process.
 
 ## Lower-level scripts
 

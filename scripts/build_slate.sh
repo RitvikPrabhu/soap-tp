@@ -137,4 +137,23 @@ if [[ "$(uname -s)" == "Darwin" && -n "${OPENBLAS_SHARED}" ]]; then
     done
 fi
 
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    # Make SLATE and PyTorch resolve the same OpenMP runtime.
+    if TORCH_LIB_DIR="$("${PYTHON:-python3}" -c \
+        'from pathlib import Path; import torch; print(Path(torch.__file__).parent / "lib")' \
+        2>/dev/null)" && [[ -f "${TORCH_LIB_DIR}/libomp.dylib" ]]; then
+        for library in "${PREFIX}/lib"/*.dylib; do
+            [[ -f "${library}" && ! -L "${library}" ]] || continue
+            dependency="$(otool -L "${library}" | awk '$1 ~ /libomp[.]dylib/ { print $1; exit }')"
+            [[ -n "${dependency}" ]] || continue
+            [[ "${dependency}" == "@rpath/libomp.dylib" ]] || \
+                install_name_tool -change \
+                    "${dependency}" "@rpath/libomp.dylib" "${library}"
+            install_name_tool -delete_rpath \
+                "${TORCH_LIB_DIR}" "${library}" 2>/dev/null || :
+            install_name_tool -add_rpath "${TORCH_LIB_DIR}" "${library}"
+        done
+    fi
+fi
+
 echo "SLATE installed in ${PREFIX}"

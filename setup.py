@@ -1,8 +1,8 @@
-"""Build the optional ELPA Python extension.
+"""Build the optional ELPA and SLATE Python extensions.
 
-The all-in-one installer sets SOAP_TP_BUILD_ELPA_BINDINGS and ELPA_PREFIX.
-Keeping discovery here makes regular PEP 517 builds work without embedding a
-path from any one workstation or cluster in the repository.
+The all-in-one installer sets the binding flags and native install prefixes.
+Keeping discovery here makes regular PEP 517 builds work without embedding
+paths from any one workstation or cluster in the repository.
 """
 
 from __future__ import annotations
@@ -89,9 +89,70 @@ def elpa_extension() -> Extension:
     )
 
 
-build_binding = enabled(
+def slate_extension() -> Extension:
+    prefix_value = os.environ.get("SLATE_PREFIX")
+    if not prefix_value:
+        raise RuntimeError(
+            "SLATE_PREFIX is required when building the SLATE binding. "
+            "Run ./scripts/install.sh <cpu|cuda|rocm> instead of invoking "
+            "the native build directly."
+        )
+
+    prefix = Path(prefix_value).expanduser().resolve()
+    include_dir = prefix / "include"
+    if not (include_dir / "slate/slate.hh").is_file():
+        raise RuntimeError(f"Could not find slate/slate.hh under {include_dir}")
+
+    library_candidates = [prefix / "lib", prefix / "lib64"]
+    library_dir = next(
+        (
+            path
+            for path in library_candidates
+            if path.is_dir() and any(path.glob("libslate.*"))
+        ),
+        None,
+    )
+    if library_dir is None:
+        raise RuntimeError(f"Could not find libslate under {prefix}")
+
+    profile = os.environ.get("SLATE_PROFILE", "cpu").lower()
+    if profile not in {"cpu", "cuda", "rocm"}:
+        raise RuntimeError("SLATE_PROFILE must be one of: cpu, cuda, rocm")
+
+    define_macros = []
+    if profile == "cuda":
+        define_macros.append(("SOAP_TP_SLATE_WITH_CUDA", "1"))
+    elif profile == "rocm":
+        define_macros.append(("SOAP_TP_SLATE_WITH_ROCM", "1"))
+
+    # Link SLATE's BLAS++ and LAPACK++ dependencies explicitly so the extension
+    # resolves the same native stack selected by SLATE_PREFIX.
+    return Extension(
+        "soap_tp.slate_bindings",
+        sources=["src/soap_tp/csrc/slate_bindings.cpp"],
+        include_dirs=[PYBIND11_INCLUDE, str(include_dir)],
+        library_dirs=[str(library_dir)],
+        libraries=["slate", "lapackpp", "blaspp"],
+        define_macros=define_macros,
+        language="c++",
+        extra_compile_args=["-std=c++17"],
+        extra_link_args=[f"-Wl,-rpath,{library_dir}"],
+    )
+
+
+build_elpa_binding = enabled(
     "SOAP_TP_BUILD_ELPA_BINDINGS",
     default="ELPA_PREFIX" in os.environ,
 )
+build_slate_binding = enabled(
+    "SOAP_TP_BUILD_SLATE_BINDINGS",
+    default="SLATE_PREFIX" in os.environ,
+)
 
-setup(ext_modules=[elpa_extension()] if build_binding else [])
+extensions = []
+if build_elpa_binding:
+    extensions.append(elpa_extension())
+if build_slate_binding:
+    extensions.append(slate_extension())
+
+setup(ext_modules=extensions)

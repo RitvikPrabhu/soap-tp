@@ -63,6 +63,7 @@ if ! command -v "${PYTHON}" >/dev/null 2>&1; then
     echo "Python executable not found: ${PYTHON}" >&2
     exit 1
 fi
+export PYTHON
 "${PYTHON}" -m pip --version >/dev/null
 if ! "${PYTHON}" -c "import torch" >/dev/null 2>&1; then
     echo "PyTorch is not installed in ${PYTHON}'s environment." >&2
@@ -167,6 +168,7 @@ else
 fi
 
 export SOAP_TP_BUILD_ELPA_BINDINGS=1
+export SOAP_TP_BUILD_SLATE_BINDINGS=1
 if [[ "${EDITABLE}" == "1" ]]; then
     "${PYTHON}" -m pip install --no-build-isolation --editable "${ROOT}" "${PIP_ARGS[@]}"
 else
@@ -182,16 +184,23 @@ export EXPECTED_BACKEND
 
 "${PYTHON}" -c '
 import os
-from soap_tp import elpa_bindings
+from soap_tp import elpa_bindings, slate_bindings
 
-actual = elpa_bindings.compiled_gpu_backend()
 expected = os.environ["EXPECTED_BACKEND"]
-if actual != expected:
-    raise SystemExit(
-        f"ELPA binding reports {actual!r}, expected {expected!r}"
-    )
-print(f"soap-tp installed successfully (ELPA backend: {actual})")
+backends = {
+    "ELPA": elpa_bindings.compiled_gpu_backend(),
+    "SLATE": slate_bindings.compiled_gpu_backend(),
+}
+for library, actual in backends.items():
+    if actual != expected:
+        raise SystemExit(
+            f"{library} binding reports {actual!r}, expected {expected!r}"
+        )
+print(
+    "soap-tp installed successfully "
+    f"(ELPA backend: {backends['ELPA']}, SLATE backend: {backends['SLATE']})"
+)
 '
 
 echo "Keep ${ELPA_PREFIX} available: the installed extension loads ELPA from there."
-echo "SLATE is installed in ${SLATE_PREFIX}."
+echo "Keep ${SLATE_PREFIX} available: the installed extension loads SLATE from there."
