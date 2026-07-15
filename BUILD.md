@@ -1,16 +1,17 @@
 # Building and installing soap-tp
 
-ELPA, OpenBLAS, and ScaLAPACK are pinned Git submodules. The cluster supplies
-MPI, compilers, and GPU toolkits because their module names and ABI versions are
-machine-specific.
+ELPA, SLATE, OpenBLAS, and ScaLAPACK are pinned Git submodules. SLATE recursively
+pins the BLAS++, LAPACK++, and TestSweeper revisions it uses. The cluster
+supplies MPI, compilers, and GPU toolkits because their module names and ABI
+versions are machine-specific.
 
 ## One-command installation
 
 After activating the desired Python environment and loading the cluster modules,
 run `scripts/install.sh`. It initializes the native sources if needed, finds the
 MPI wrappers, builds a ScaLAPACK/OpenBLAS fallback when the cluster does not
-provide ScaLAPACK, builds ELPA, compiles the pybind11 extension, installs the
-Python package, and imports the extension as a final check.
+provide ScaLAPACK, builds ELPA and SLATE, compiles the pybind11 extension,
+installs the Python package, and imports the extension as a final check.
 
 A CPU installation from a fresh checkout is:
 
@@ -33,11 +34,12 @@ installer must not silently replace a site-supported GPU build with a generic
 wheel. The installer can use the pybind11 headers bundled with PyTorch, so the
 native package build does not need network access.
 
-The normal native prerequisites are MPI, Autoconf, Automake, Libtool, and a
-Fortran compiler. CMake 3.26 or newer is needed only when the fallback math
-libraries must be built. The installer recognizes `mpicc`/`mpicxx`/`mpifort`
-and Cray `cc`/`CC`/`ftn`. A complete custom compiler triplet can be provided
-through `CC`, `CXX`, and `FC`.
+The normal native prerequisites are MPI, Autoconf, Automake, Libtool, a Fortran
+compiler, and a C++17 compiler with OpenMP support. CMake 3.18 or newer is
+required for SLATE; CMake 3.26 or newer is required when the pinned fallback
+math libraries must be built. The installer recognizes
+`mpicc`/`mpicxx`/`mpifort` and Cray `cc`/`CC`/`ftn`. A complete custom compiler
+triplet can be provided through `CC`, `CXX`, and `FC`.
 
 ## GPU clusters
 
@@ -60,17 +62,20 @@ The module commands are placeholders; use the names documented by each cluster.
 Those modules generally need to be loaded both when installing and when running
 the package so that MPI and GPU runtime libraries remain available.
 
-ELPA defaults to CUDA compute capability `sm_60`. Set the architectures needed
-by the target cluster when that default is unsuitable:
+ELPA and the pinned SLATE revision default to CUDA compute capability `sm_60`.
+Set the architectures needed by the target cluster when that default is
+unsuitable:
 
 ```bash
 ELPA_CONFIGURE_ARGS="--with-NVIDIA-GPU-compute-capability=sm_80,sm_90" \
+SLATE_CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=80;90" \
     ./scripts/install.sh cuda
 ```
 
-Other site-specific ELPA configure options can be passed the same way. For
-example, a nonstandard CUDA toolkit can be selected with
-`--with-cuda-path=/path/to/cuda`.
+Other site-specific ELPA configure options and SLATE CMake definitions can be
+passed through the same variables. For example, a nonstandard CUDA toolkit can
+be selected for ELPA with `--with-cuda-path=/path/to/cuda` and for SLATE with
+`-DCUDAToolkit_ROOT=/path/to/cuda`.
 
 ## Installation locations
 
@@ -81,15 +86,21 @@ build/math-install
 build/elpa-install/cpu
 build/elpa-install/cuda
 build/elpa-install/rocm
+build/slate-install/cpu
+build/slate-install/cuda
+build/slate-install/rocm
 ```
 
 The Python extension records the selected ELPA library directory as its runtime
 search path. Therefore, do not delete that ELPA installation after installing
-the package. On a cluster with a persistent software directory, use explicit
+the package. When the fallback math libraries are used, SLATE likewise records
+`MATH_PREFIX/lib` in its runtime search path. Keep both native prefixes
+available. On a cluster with a persistent software directory, use explicit
 prefixes:
 
 ```bash
 ELPA_PREFIX="$HOME/.local/soap-tp/elpa/cuda" \
+SLATE_PREFIX="$HOME/.local/soap-tp/slate/cuda" \
 MATH_PREFIX="$HOME/.local/soap-tp/math" \
     ./scripts/install.sh cuda
 ```
@@ -101,15 +112,27 @@ is reused. Pass `--editable` for a development Python installation:
 ./scripts/install.sh cpu --editable
 ```
 
-If ELPA succeeded but a later packaging step failed, rerun only the Python part
-without recompiling ELPA:
+If both native solvers succeeded but a later packaging step failed, reuse those
+installations without recompiling either solver:
 
 ```bash
-./scripts/install.sh cpu --skip-elpa
+./scripts/install.sh cpu --skip-elpa --skip-slate
 ```
+
+Each flag can also be used independently. A skipped solver must already exist
+at its selected prefix.
 
 Additional arguments are forwarded to `pip install`, so `--user` and similar
 site options remain available.
+
+## How SLATE is built
+
+SLATE is built as a native C++ library with its bundled BLAS++ and LAPACK++
+revisions. The profile selects `gpu_backend=none`, `cuda`, or `hip` for CPU,
+CUDA, and ROCm respectively. `SLATE_CMAKE_ARGS` is appended to the CMake command
+for site-specific settings, and `BLAS_LIBRARIES`/`LAPACK_LIBRARIES` can select
+explicit vendor math libraries. When the pinned OpenBLAS fallback already
+exists, SLATE reuses it automatically.
 
 ## How the Python extension is built
 
@@ -129,6 +152,8 @@ Before invoking pip, the installer exports:
 SOAP_TP_BUILD_ELPA_BINDINGS=1
 ELPA_PREFIX=/path/to/the/selected/elpa/installation
 ELPA_PROFILE=cpu, cuda, or rocm
+SLATE_PREFIX=/path/to/the/selected/slate/installation
+SLATE_PROFILE=cpu, cuda, or rocm
 CC=<MPI C compiler wrapper>
 CXX=<MPI C++ compiler wrapper>
 FC=<MPI Fortran compiler wrapper>
@@ -163,8 +188,9 @@ cluster login nodes can reuse the active environment. `setup.py` uses a normal
 `pybind11` installation when present; otherwise it uses the pybind11 headers
 bundled with the already-installed PyTorch package.
 
-Running plain `pip install .` without the installer does not build ELPA. If an
-ELPA installation already exists, the equivalent manual package command is:
+Running plain `pip install .` without the installer does not build ELPA or
+SLATE. If an ELPA installation already exists, the equivalent manual package
+command for the current ELPA extension is:
 
 ```bash
 SOAP_TP_BUILD_ELPA_BINDINGS=1 \
@@ -174,12 +200,14 @@ CC=mpicc CXX=mpicxx FC=mpifort \
 ```
 
 That command only builds and installs the Python package and extension. The
-recommended `scripts/install.sh` entry point performs the ELPA build first and
-passes these values automatically.
+recommended `scripts/install.sh` entry point performs both native solver builds
+first and passes these values automatically.
 
 ## Lower-level scripts
 
 `scripts/build_elpa.sh` builds ELPA without installing the Python package.
+`scripts/build_slate.sh` builds SLATE, BLAS++, and LAPACK++ without installing
+the Python package.
 `scripts/build_math_deps.sh` builds only the pinned OpenBLAS/ScaLAPACK fallback.
 They are primarily useful for troubleshooting; a normal installation should use
 `scripts/install.sh`.

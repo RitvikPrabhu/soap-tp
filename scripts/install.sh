@@ -17,6 +17,7 @@ Examples:
   ./scripts/install.sh cuda
   ./scripts/install.sh rocm --editable
   ./scripts/install.sh cpu --skip-elpa
+  ./scripts/install.sh cpu --skip-slate
   PYTHON=$HOME/venvs/soap/bin/python ./scripts/install.sh cuda
 
 Before running on a cluster, load its compiler, MPI, and (for GPU builds)
@@ -24,9 +25,11 @@ CUDA or ROCm modules. Useful overrides:
 
   BUILD_JOBS=16                 parallel native build jobs
   ELPA_PREFIX=/stable/path      where this script installs and finds ELPA
+  SLATE_PREFIX=/stable/path     where this script installs SLATE
   MATH_PREFIX=/stable/path      where fallback OpenBLAS/ScaLAPACK are installed
   SCALAPACK_LDFLAGS='...'       use a cluster-provided ScaLAPACK
   ELPA_CONFIGURE_ARGS='...'     extra ELPA configure flags
+  SLATE_CMAKE_ARGS='...'        extra SLATE CMake options
   CC=... CXX=... FC=...         explicit MPI-aware compiler wrappers
 EOF
 }
@@ -44,11 +47,13 @@ shift $(( $# > 0 ? 1 : 0 ))
 
 EDITABLE=0
 SKIP_ELPA=0
+SKIP_SLATE=0
 PIP_ARGS=()
 for argument in "$@"; do
     case "${argument}" in
         --editable) EDITABLE=1 ;;
         --skip-elpa) SKIP_ELPA=1 ;;
+        --skip-slate) SKIP_SLATE=1 ;;
         *) PIP_ARGS+=("${argument}") ;;
     esac
 done
@@ -127,14 +132,17 @@ fi
 
 export SOAP_TP_BUILD_ROOT="${SOAP_TP_BUILD_ROOT:-${ROOT}/build}"
 export ELPA_PREFIX="${ELPA_PREFIX:-${SOAP_TP_BUILD_ROOT}/elpa-install/${PROFILE}}"
+export SLATE_PREFIX="${SLATE_PREFIX:-${SOAP_TP_BUILD_ROOT}/slate-install/${PROFILE}}"
 export MATH_PREFIX="${MATH_PREFIX:-${SOAP_TP_BUILD_ROOT}/math-install}"
 export ELPA_PROFILE="${PROFILE}"
+export SLATE_PROFILE="${PROFILE}"
 
 echo "Building profile: ${PROFILE}"
 echo "MPI C compiler: ${CC}"
 echo "MPI C++ compiler: ${CXX}"
 echo "MPI Fortran compiler: ${FC}"
 echo "ELPA prefix: ${ELPA_PREFIX}"
+echo "SLATE prefix: ${SLATE_PREFIX}"
 
 if [[ "${SKIP_ELPA}" == "1" ]]; then
     if [[ ! -d "${ELPA_PREFIX}/include" ]]; then
@@ -144,6 +152,18 @@ if [[ "${SKIP_ELPA}" == "1" ]]; then
     echo "Using the existing ELPA installation."
 else
     "${ROOT}/scripts/build_elpa.sh" "${PROFILE}"
+fi
+
+if [[ "${SKIP_SLATE}" == "1" ]]; then
+    if [[ ! -f "${SLATE_PREFIX}/include/slate/slate.hh" ]] || \
+       { ! compgen -G "${SLATE_PREFIX}/lib/libslate.*" >/dev/null && \
+         ! compgen -G "${SLATE_PREFIX}/lib64/libslate.*" >/dev/null; }; then
+        echo "--skip-slate was requested, but ${SLATE_PREFIX} is not installed." >&2
+        exit 1
+    fi
+    echo "Using the existing SLATE installation."
+else
+    "${ROOT}/scripts/build_slate.sh" "${PROFILE}"
 fi
 
 export SOAP_TP_BUILD_ELPA_BINDINGS=1
@@ -174,3 +194,4 @@ print(f"soap-tp installed successfully (ELPA backend: {actual})")
 '
 
 echo "Keep ${ELPA_PREFIX} available: the installed extension loads ELPA from there."
+echo "SLATE is installed in ${SLATE_PREFIX}."

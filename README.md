@@ -2,16 +2,19 @@
 
 ## Getting started
 
-Clone the repository with its pinned ELPA, OpenBLAS, and ScaLAPACK submodules:
+Clone the repository with its pinned ELPA, SLATE, OpenBLAS, and ScaLAPACK
+submodules. SLATE's BLAS++, LAPACK++, and TestSweeper dependencies are pinned
+recursively:
 
 ```bash
 git clone --recurse-submodules https://github.com/RitvikPrabhu/soap-tp.git
 cd soap-tp
 ```
 
-Load or install a C/C++/Fortran toolchain, MPI, Autoconf, Automake, and Libtool.
-On a GPU cluster, also load its CUDA or ROCm modules. Then create a Python
-environment and install the PyTorch build appropriate for that machine:
+Load or install a C++17/OpenMP and Fortran toolchain, MPI, CMake, Autoconf,
+Automake, and Libtool. On a GPU cluster, also load its CUDA or ROCm modules.
+Then create a Python environment and install the PyTorch build appropriate for
+that machine:
 
 ```bash
 python3 -m venv .venv
@@ -20,8 +23,8 @@ python -m pip install --upgrade pip setuptools wheel
 # Install the site's CPU, CUDA, or ROCm PyTorch build here.
 ```
 
-Build ELPA, its native dependencies, and the Python extension with the matching
-profile:
+Build ELPA, SLATE, their native dependencies, and the Python extension with the
+matching profile:
 
 ```bash
 ./scripts/install.sh cpu       # CPU

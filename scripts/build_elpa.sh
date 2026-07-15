@@ -57,7 +57,8 @@ fi
 if [[ ! -f "${SOURCE}/configure.ac" || \
       ! -f "${ROOT}/third_party/openblas/CMakeLists.txt" || \
       ! -f "${ROOT}/third_party/scalapack/CMakeLists.txt" ]]; then
-    git -C "${ROOT}" submodule update --init --recursive
+    git -C "${ROOT}" submodule update --init \
+        third_party/elpa third_party/openblas third_party/scalapack
 fi
 
 if [[ ! -x "${SOURCE}/configure" ]]; then
@@ -101,7 +102,10 @@ fi
 if [[ -z "${SCALAPACK_LDFLAGS:-}" ]]; then
     SOAP_TP_BUILD_ROOT="${BUILD_ROOT}" MATH_PREFIX="${MATH_PREFIX}" \
         "${ROOT}/scripts/build_math_deps.sh"
-    SCALAPACK_LDFLAGS="-L${MATH_PREFIX}/lib -lscalapack -lopenblas"
+    # Keep ELPA's fallback self-contained with the static OpenBLAS archive.
+    # The shared fallback exists for C++ consumers such as SLATE, which need
+    # its recorded Fortran runtime dependencies.
+    SCALAPACK_LDFLAGS="-L${MATH_PREFIX}/lib -lscalapack ${MATH_PREFIX}/lib/libopenblas.a"
 fi
 export SCALAPACK_LDFLAGS
 

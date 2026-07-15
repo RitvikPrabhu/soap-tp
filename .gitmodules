@@ -7,3 +7,6 @@
 [submodule "third_party/scalapack"]
 	path = third_party/scalapack
 	url = https://github.com/Reference-ScaLAPACK/scalapack.git
+[submodule "third_party/slate"]
+	path = third_party/slate
+	url = https://github.com/icl-utk-edu/slate.git
