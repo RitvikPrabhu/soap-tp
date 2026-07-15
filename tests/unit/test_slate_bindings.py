@@ -146,7 +146,6 @@ def _assert_matches_torch(case_name, actual, expected):
 def _check_power_iteration_case(
     binding,
     rank,
-    world_size,
     process_grid,
     case,
     device,
@@ -191,33 +190,29 @@ def _check_power_iteration_case(
         process_cols,
     )
 
-    payload = {
-        "rows": rows,
-        "columns": columns,
-        "q": q[: len(rows), : len(columns)].cpu().contiguous(),
-        "a": a.cpu().contiguous(),
-        "a_before": a_before.cpu().contiguous(),
-    }
-    gathered = [None] * world_size
-    dist.all_gather_object(gathered, payload)
-
     case_name = (
         f"{name}: n={size}, block={block_size}, grid={process_grid}"
     )
-    actual = torch.full((size, size), torch.nan, dtype=torch.float32)
-    for shard in gathered:
-        torch.testing.assert_close(
-            shard["a"],
-            shard["a_before"],
-            equal_nan=True,
-            msg=f"{case_name}: A was modified",
-        )
-        if shard["rows"] and shard["columns"]:
-            row_index = torch.tensor(shard["rows"])
-            column_index = torch.tensor(shard["columns"])
-            actual[row_index[:, None], column_index] = shard["q"]
+    actual = torch.zeros((size, size), dtype=torch.float32, device=device)
+    owners = torch.zeros_like(actual)
+    if rows and columns:
+        row_index = torch.tensor(rows, device=device)
+        column_index = torch.tensor(columns, device=device)
+        actual[row_index[:, None], column_index] = q[
+            : len(rows), : len(columns)
+        ]
+        owners[row_index[:, None], column_index] = 1
 
-    _assert_matches_torch(case_name, actual, expected.cpu())
+    a_unchanged = torch.all(
+        (a == a_before) | (torch.isnan(a) & torch.isnan(a_before))
+    ).to(dtype=torch.float32)
+    dist.all_reduce(actual)
+    dist.all_reduce(owners)
+    dist.all_reduce(a_unchanged, op=dist.ReduceOp.MIN)
+
+    assert a_unchanged.item() == 1, f"{case_name}: A was modified"
+    torch.testing.assert_close(owners, torch.ones_like(owners), msg=case_name)
+    _assert_matches_torch(case_name, actual.cpu(), expected.cpu())
 
 
 def _single_rank_worker(rank, world_size, port, binding_path):
@@ -232,7 +227,7 @@ def _single_rank_worker(rank, world_size, port, binding_path):
         binding = _extension_from_path(binding_path)
         for case in SINGLE_RANK_CASES:
             _check_power_iteration_case(
-                binding, rank, world_size, (1, 1), case, device
+                binding, rank, (1, 1), case, device
             )
     finally:
         dist.destroy_process_group()
@@ -268,7 +263,6 @@ def _multirank_worker(binding_path, port):
                 _check_power_iteration_case(
                     binding,
                     rank,
-                    world_size,
                     process_grid,
                     case,
                     device,

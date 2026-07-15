@@ -84,7 +84,7 @@ jobs:
             libopenmpi-dev \
             openmpi-bin
           python -m pip install --upgrade pip
-          pip install mpi4py ninja pybind11
+          pip install mpi4py ninja numpy pybind11
           pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: Build and install SLATE
         run: BUILD_JOBS=2 ./scripts/build_slate.sh cpu
