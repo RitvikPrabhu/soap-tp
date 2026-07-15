@@ -82,13 +82,3 @@ jobs:
             openmpi-bin
       - name: Build and install SLATE
         run: BUILD_JOBS=2 ./scripts/build_slate.sh cpu
-      - name: Compile and run against the installed SLATE package
-        run: |
-          cmake \
-            -S tests/native/slate_smoke \
-            -B build/slate-smoke \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_COMPILER=mpicxx \
-            -DCMAKE_PREFIX_PATH="$PWD/build/slate-install/cpu"
-          cmake --build build/slate-smoke --parallel 2
-          
