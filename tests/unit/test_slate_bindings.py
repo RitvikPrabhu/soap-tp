@@ -151,6 +151,9 @@ def _check_power_iteration_case(
     device,
 ):
     name, size, block_size, lda_padding = case
+    case_name = (
+        f"{name}: n={size}, block={block_size}, grid={process_grid}"
+    )
     process_rows, process_cols = process_grid
     process_row = rank // process_cols
     process_col = rank % process_cols
@@ -179,6 +182,8 @@ def _check_power_iteration_case(
     work = torch.full_like(q, torch.nan, memory_format=torch.preserve_format)
     a_before = a.clone(memory_format=torch.preserve_format)
 
+    if rank == 0 and os.environ.get(MULTIRANK_WORKER) == "1":
+        print(f"SLATE start: {case_name}", flush=True)
     binding.slate_power_iteration_qr_float(
         a.data_ptr(),
         q.data_ptr(),
@@ -189,10 +194,8 @@ def _check_power_iteration_case(
         process_rows,
         process_cols,
     )
-
-    case_name = (
-        f"{name}: n={size}, block={block_size}, grid={process_grid}"
-    )
+    if rank == 0 and os.environ.get(MULTIRANK_WORKER) == "1":
+        print(f"SLATE done: {case_name}", flush=True)
     actual = torch.zeros((size, size), dtype=torch.float32, device=device)
     owners = torch.zeros_like(actual)
     if rows and columns:
@@ -209,6 +212,8 @@ def _check_power_iteration_case(
     dist.all_reduce(actual)
     dist.all_reduce(owners)
     dist.all_reduce(a_unchanged, op=dist.ReduceOp.MIN)
+    if rank == 0 and os.environ.get(MULTIRANK_WORKER) == "1":
+        print(f"Torch collectives done: {case_name}", flush=True)
 
     assert a_unchanged.item() == 1, f"{case_name}: A was modified"
     torch.testing.assert_close(owners, torch.ones_like(owners), msg=case_name)
@@ -240,7 +245,11 @@ def _multirank_worker(binding_path, port):
     device = _device_for_profile()
     if device.type == "cuda":
         torch.cuda.set_device(device)
+    if rank == 0:
+        print("Torch process-group start", flush=True)
     _init_process_group(rank, world_size, port, _backend_for_device(device))
+    if rank == 0:
+        print("Torch process-group ready", flush=True)
 
     cases = (
         # More ranks than tiles forces ranks with no local rows or columns.
@@ -268,7 +277,11 @@ def _multirank_worker(binding_path, port):
                     device,
                 )
     finally:
+        if rank == 0:
+            print("Torch process-group destroy start", flush=True)
         dist.destroy_process_group()
+        if rank == 0:
+            print("Torch process-group destroyed", flush=True)
 
 
 class TestSlateBinding(unittest.TestCase):
@@ -336,26 +349,38 @@ class TestSlateBinding(unittest.TestCase):
             {
                 MULTIRANK_WORKER: "1",
                 BINDING_PATH: self.binding.__file__,
+                "GLOO_SOCKET_IFNAME": "lo0" if sys.platform == "darwin" else "lo",
                 "MASTER_ADDR": "127.0.0.1",
                 "MASTER_PORT": str(_free_port()),
+                "MKL_NUM_THREADS": "1",
                 "OMP_NUM_THREADS": "1",
+                "OPENBLAS_NUM_THREADS": "1",
+                "PYTHONUNBUFFERED": "1",
             }
         )
-        completed = subprocess.run(
-            [
-                mpiexec,
-                "--oversubscribe",
-                "-n",
-                str(MULTIRANK_WORLD_SIZE),
-                sys.executable,
-                str(Path(__file__).resolve()),
-            ],
-            cwd=ROOT,
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=240,
-        )
+        command = [
+            mpiexec,
+            "--oversubscribe",
+            "-n",
+            str(MULTIRANK_WORLD_SIZE),
+            sys.executable,
+            str(Path(__file__).resolve()),
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=240,
+            )
+        except subprocess.TimeoutExpired as error:
+            self.fail(
+                "MPI worker timed out\n"
+                f"stdout:\n{error.stdout or ''}\n"
+                f"stderr:\n{error.stderr or ''}"
+            )
         self.assertEqual(
             completed.returncode,
             0,
