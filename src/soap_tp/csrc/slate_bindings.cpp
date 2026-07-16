@@ -46,44 +46,47 @@ void slate_power_iteration_qr_float(
     float *a = reinterpret_cast<float *>(a_address);
     float *q = reinterpret_cast<float *>(q_address);
     float *work = reinterpret_cast<float *>(work_address);
-    slate::Options options = {{slate::Option::Target, target}};
+    // Destroy every SLATE object before freeing its communicator.
+    {
+        slate::Options options = {{slate::Option::Target, target}};
 
 #if defined(SOAP_TP_SLATE_WITH_CUDA) || defined(SOAP_TP_SLATE_WITH_ROCM)
-    float *a_devices[] = {a};
-    float *q_devices[] = {q};
-    float *work_devices[] = {work};
-    auto A = slate::SymmetricMatrix<float>::fromDevices(
-        slate::Uplo::Lower, n, a_devices, 1, lda, block_size,
-        process_rows, process_cols, communicator);
-    auto Q = slate::Matrix<float>::fromDevices(
-        n, n, q_devices, 1, lda, block_size, block_size,
-        process_rows, process_cols, communicator);
-    auto Y = slate::Matrix<float>::fromDevices(
-        n, n, work_devices, 1, lda, block_size, block_size,
-        process_rows, process_cols, communicator);
+        float *a_devices[] = {a};
+        float *q_devices[] = {q};
+        float *work_devices[] = {work};
+        auto A = slate::SymmetricMatrix<float>::fromDevices(
+            slate::Uplo::Lower, n, a_devices, 1, lda, block_size,
+            process_rows, process_cols, communicator);
+        auto Q = slate::Matrix<float>::fromDevices(
+            n, n, q_devices, 1, lda, block_size, block_size,
+            process_rows, process_cols, communicator);
+        auto Y = slate::Matrix<float>::fromDevices(
+            n, n, work_devices, 1, lda, block_size, block_size,
+            process_rows, process_cols, communicator);
 #else
-    auto A = slate::SymmetricMatrix<float>::fromScaLAPACK(
-        slate::Uplo::Lower, n, a, lda, block_size,
-        process_rows, process_cols, communicator);
-    auto Q = slate::Matrix<float>::fromScaLAPACK(
-        n, n, q, lda, block_size, block_size,
-        process_rows, process_cols, communicator);
-    auto Y = slate::Matrix<float>::fromScaLAPACK(
-        n, n, work, lda, block_size, block_size,
-        process_rows, process_cols, communicator);
+        auto A = slate::SymmetricMatrix<float>::fromScaLAPACK(
+            slate::Uplo::Lower, n, a, lda, block_size,
+            process_rows, process_cols, communicator);
+        auto Q = slate::Matrix<float>::fromScaLAPACK(
+            n, n, q, lda, block_size, block_size,
+            process_rows, process_cols, communicator);
+        auto Y = slate::Matrix<float>::fromScaLAPACK(
+            n, n, work, lda, block_size, block_size,
+            process_rows, process_cols, communicator);
 #endif
 
-    slate::symm(slate::Side::Left, 1.0f, A, Q, 0.0f, Y, options);
-    slate::TriangularFactors<float> factors;
-    slate::geqrf(Y, factors, options);
-    slate::set(0.0f, 1.0f, Q, options);
-    slate::unmqr(
-        slate::Side::Left,
-        slate::Op::NoTrans,
-        Y,
-        factors,
-        Q,
-        options);
+        slate::symm(slate::Side::Left, 1.0f, A, Q, 0.0f, Y, options);
+        slate::TriangularFactors<float> factors;
+        slate::geqrf(Y, factors, options);
+        slate::set(0.0f, 1.0f, Q, options);
+        slate::unmqr(
+            slate::Side::Left,
+            slate::Op::NoTrans,
+            Y,
+            factors,
+            Q,
+            options);
+    }
 
     MPI_Comm_free(&communicator);
 }
