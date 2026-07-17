@@ -1,1 +1,1 @@
-__all__ = ["ops", "reference", "steps", "utils"]
+__all__ = ["ops", "reference", "soap", "steps", "utils"]

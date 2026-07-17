@@ -1,18 +1,16 @@
-"""Tests for the SLATE Python binding."""
+"""Unit tests for the distributed SLATE power-iteration QR binding."""
 
 import importlib.util
+import math
 import os
 from pathlib import Path
 import shutil
-import socket
 import subprocess
 import sys
 import unittest
 
 from mpi4py import MPI
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 from torch.utils.cpp_extension import load
 
 
@@ -24,47 +22,27 @@ PREFIX = Path(
         ROOT / "build" / "slate-install" / PROFILE,
     )
 )
-MULTIRANK_WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "4"))
+MULTIRANK_WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "8"))
 
-MULTIRANK_WORKER = "SOAP_TP_SLATE_MULTIRANK_WORKER"
-BINDING_PATH = "SOAP_TP_SLATE_BINDING_PATH"
+WORKER_MODE = "SOAP_TP_SLATE_WORKER_MODE"
+WORKER_BINDING = "SOAP_TP_SLATE_WORKER_BINDING"
+WORKER_WORLD_SIZE = "SOAP_TP_SLATE_WORKER_WORLD_SIZE"
 
-# These cases cover the meaningful relationships between the matrix dimension,
-# block size, and local leading dimension without involving MPI distribution.
+# These cases exercise block size 1, n < block, n == block, n == block + 1,
+# exact block multiples, partial boundary blocks, and padded local leading
+# dimensions without adding MPI ownership as a second variable.
 SINGLE_RANK_CASES = (
-    ("singleton_unit_block", 1, 1, 0),
-    ("block_larger_than_matrix", 1, 2, 0),
-    ("block_equals_matrix", 2, 2, 0),
-    ("partial_block_with_padded_lda", 3, 2, 2),
-    ("exact_block_multiple", 4, 2, 0),
+    ("singleton", 1, 1, 0),
+    ("unit_tiles", 3, 1, 0),
+    ("block_larger_than_matrix", 2, 3, 0),
+    ("block_equals_matrix", 3, 3, 0),
+    ("one_past_block", 4, 3, 0),
+    ("exact_block_multiple", 6, 3, 0),
+    ("partial_block_and_padded_lda", 5, 2, 2),
 )
 
 
-def _free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def _init_process_group(rank, world_size, port, backend):
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group(backend, rank=rank, world_size=world_size)
-
-
-def _device_for_profile():
-    if PROFILE == "cpu":
-        return torch.device("cpu")
-    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
-        raise RuntimeError(f"{PROFILE} requires one visible GPU per MPI rank")
-    return torch.device("cuda:0")
-
-
-def _backend_for_device(device):
-    return "nccl" if device.type == "cuda" else "gloo"
-
-
-def _extension_from_path(path):
+def _load_extension(path):
     name = Path(path).name.split(".", 1)[0]
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
@@ -72,8 +50,19 @@ def _extension_from_path(path):
     return module
 
 
-def _block_cyclic_indices(size, block_size, process, process_count):
-    # SOAP-TP assigns 2D block-cyclic tiles using row-major process coordinates.
+def _device_for_profile():
+    if PROFILE == "cpu":
+        return torch.device("cpu")
+    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+        raise RuntimeError(
+            f"{PROFILE} requires exactly one visible GPU per MPI rank"
+        )
+    return torch.device("cuda:0")
+
+
+def _owned_indices(size, block_size, process, process_count):
+    # This is the row-major 2D block-cyclic ownership definition used by the
+    # caller, independent of SLATE's internal column-major rank convention.
     return [
         index
         for index in range(size)
@@ -81,9 +70,9 @@ def _block_cyclic_indices(size, block_size, process, process_count):
     ]
 
 
-def _pack_local_matrix(matrix, rows, columns, lda_padding):
-    # Transposing the allocation gives SLATE column-major local storage without
-    # moving the logical matrix between ranks or devices.
+def _pack_column_major(matrix, rows, columns, lda_padding):
+    # A transposed allocation has stride (1, lda), matching the documented
+    # ScaLAPACK-style local buffer without copying data between ranks.
     lda = max(1, len(rows) + lda_padding)
     local = torch.full(
         (max(1, len(columns)), lda),
@@ -101,31 +90,48 @@ def _pack_local_matrix(matrix, rows, columns, lda_padding):
 
 
 def _reference_problem(size, device):
-    index = torch.arange(size, dtype=torch.float32)
+    # Increasing diagonal values make the estimated-eigenvalue ordering
+    # nontrivial, while the positive diagonal dominance keeps QR full rank.
+    index = torch.arange(size, dtype=torch.float32, device=device)
     distance = (index[:, None] - index[None, :]).abs()
     matrix = 0.25 / (distance + 1.0)
     matrix.diagonal().add_(size + index)
-    orthogonal = torch.eye(size)
-    return matrix.to(device), orthogonal.to(device)
+
+    # Adjacent Givens rotations provide a deterministic non-identity old basis
+    # without using the QR routine that serves as the numerical oracle.
+    orthogonal = torch.eye(size, dtype=torch.float32, device=device)
+    for column in range(size - 1):
+        angle = 0.19 * (column + 1)
+        cosine = math.cos(angle)
+        sine = math.sin(angle)
+        rotation = torch.eye(size, dtype=torch.float32, device=device)
+        rotation[column, column] = cosine
+        rotation[column, column + 1] = -sine
+        rotation[column + 1, column] = sine
+        rotation[column + 1, column + 1] = cosine
+        orthogonal = orthogonal @ rotation
+    return matrix, orthogonal
 
 
-def _torch_qr_reference(matrix, orthogonal):
-    # This is the relevant portion of get_orthogonal_matrix_QR: order the old
-    # basis by its estimated eigenvalues, then perform one power iteration + QR.
-    estimated_eigenvalues = torch.diag(
-        orthogonal.T @ matrix @ orthogonal
-    )
-    sort_index = torch.argsort(estimated_eigenvalues, descending=True)
-    sorted_orthogonal = orthogonal[:, sort_index]
+def _torch_reference(matrix, orthogonal):
+    # This is the independent Torch behavior required by
+    # get_orthogonal_matrix_QR: sort the old basis, take one power iteration,
+    # then compute the reduced QR factor.
+    estimated = torch.diag(orthogonal.T @ matrix @ orthogonal)
+    order = torch.argsort(estimated, descending=True)
+    sorted_orthogonal = orthogonal[:, order]
     expected, _ = torch.linalg.qr(matrix @ sorted_orthogonal)
     return sorted_orthogonal, expected
 
 
-def _assert_matches_torch(case_name, actual, expected):
-    # Householder QR may independently flip each output column. Align only
-    # those signs before comparing values; a permutation or rotation still fails.
-    assert torch.isfinite(actual).all(), f"{case_name}: non-finite Q"
+def _assert_same_q(actual, expected, case_name):
+    # A full-rank real QR factor is unique up to independent column signs.
+    # Align only those signs; permutations and arbitrary rotations still fail.
+    assert torch.isfinite(actual).all(), f"{case_name}: Q is not finite"
     alignment = torch.diag(expected.T @ actual)
+    assert torch.all(alignment.abs() > 0.9), (
+        f"{case_name}: SLATE returned different QR columns"
+    )
     signs = torch.where(alignment < 0, -1.0, 1.0)
     torch.testing.assert_close(
         actual * signs,
@@ -139,51 +145,50 @@ def _assert_matches_torch(case_name, actual, expected):
         torch.eye(actual.size(0)),
         atol=2e-3,
         rtol=2e-3,
-        msg=case_name,
+        msg=f"{case_name}: Q is not orthogonal",
     )
 
 
-def _check_power_iteration_case(
-    binding,
-    rank,
-    process_grid,
-    case,
-    device,
-):
+def _run_case(binding, rank, process_grid, case, device):
     name, size, block_size, lda_padding = case
+    process_rows, process_columns = process_grid
+    process_row = rank // process_columns
+    process_column = rank % process_columns
+    rows = _owned_indices(size, block_size, process_row, process_rows)
+    columns = _owned_indices(
+        size,
+        block_size,
+        process_column,
+        process_columns,
+    )
     case_name = (
-        f"{name}: n={size}, block={block_size}, grid={process_grid}"
-    )
-    process_rows, process_cols = process_grid
-    process_row = rank // process_cols
-    process_col = rank % process_cols
-    rows = _block_cyclic_indices(
-        size, block_size, process_row, process_rows
-    )
-    columns = _block_cyclic_indices(
-        size, block_size, process_col, process_cols
+        f"{name}: n={size}, block={block_size}, "
+        f"grid={process_rows}x{process_columns}"
     )
 
     matrix, orthogonal = _reference_problem(size, device)
-    sorted_orthogonal, expected = _torch_qr_reference(matrix, orthogonal)
+    sorted_orthogonal, expected = _torch_reference(matrix, orthogonal)
 
-    # A is declared lower-triangular storage. NaNs in the upper triangle make
-    # an accidental upper-triangle read visible in the reconstructed result.
+    # Only the lower triangle belongs to the symmetric input contract. NaNs in
+    # the upper triangle turn any accidental upper-triangle read into a failure.
     stored_matrix = matrix.clone()
-    upper = torch.triu(torch.ones_like(matrix, dtype=torch.bool), diagonal=1)
+    upper = torch.triu(
+        torch.ones_like(stored_matrix, dtype=torch.bool),
+        diagonal=1,
+    )
     stored_matrix.masked_fill_(upper, torch.nan)
 
-    a = _pack_local_matrix(
-        stored_matrix, rows, columns, lda_padding
-    )
-    q = _pack_local_matrix(
-        sorted_orthogonal, rows, columns, lda_padding
-    )
+    a = _pack_column_major(stored_matrix, rows, columns, lda_padding)
+    q = _pack_column_major(sorted_orthogonal, rows, columns, lda_padding)
     work = torch.full_like(q, torch.nan, memory_format=torch.preserve_format)
     a_before = a.clone(memory_format=torch.preserve_format)
 
-    if rank == 0 and os.environ.get(MULTIRANK_WORKER) == "1":
-        print(f"SLATE start: {case_name}", flush=True)
+    logical_q = torch.zeros_like(q, dtype=torch.bool)
+    if rows and columns:
+        logical_q[: len(rows), : len(columns)] = True
+
+    if rank == 0:
+        print(f"start {case_name}", flush=True)
     binding.slate_power_iteration_qr_float(
         a.data_ptr(),
         q.data_ptr(),
@@ -192,10 +197,11 @@ def _check_power_iteration_case(
         a.stride(1),
         block_size,
         process_rows,
-        process_cols,
+        process_columns,
     )
-    if rank == 0 and os.environ.get(MULTIRANK_WORKER) == "1":
-        print(f"SLATE done: {case_name}", flush=True)
+
+    # Reconstruct Q according to row-major ownership. A rank transposition,
+    # omitted shard, or duplicated shard changes either Q or the owner counts.
     actual = torch.zeros((size, size), dtype=torch.float32, device=device)
     owners = torch.zeros_like(actual)
     if rows and columns:
@@ -206,154 +212,168 @@ def _check_power_iteration_case(
         ]
         owners[row_index[:, None], column_index] = 1
 
-    a_unchanged = torch.all(
-        (a == a_before) | (torch.isnan(a) & torch.isnan(a_before))
-    ).to(dtype=torch.float32)
-    dist.all_reduce(actual)
-    dist.all_reduce(owners)
-    dist.all_reduce(a_unchanged, op=dist.ReduceOp.MIN)
-    if rank == 0 and os.environ.get(MULTIRANK_WORKER) == "1":
-        print(f"Torch collectives done: {case_name}", flush=True)
+    # Verification uses portable host MPI buffers, so GPU tests do not require
+    # a CUDA-aware MPI installation. The binding itself still receives and
+    # operates on the original device pointers.
+    actual = actual.cpu()
+    owners = owners.cpu()
+    a_unchanged = torch.tensor(
+        [
+            torch.all(
+                (a == a_before)
+                | (torch.isnan(a) & torch.isnan(a_before))
+            ).item()
+        ],
+        dtype=torch.int32,
+    )
+    q_padding_unchanged = torch.tensor(
+        [torch.isnan(q[~logical_q]).all().item()],
+        dtype=torch.int32,
+    )
+    MPI.COMM_WORLD.Allreduce(MPI.IN_PLACE, actual.numpy(), op=MPI.SUM)
+    MPI.COMM_WORLD.Allreduce(MPI.IN_PLACE, owners.numpy(), op=MPI.SUM)
+    MPI.COMM_WORLD.Allreduce(
+        MPI.IN_PLACE,
+        a_unchanged.numpy(),
+        op=MPI.MIN,
+    )
+    MPI.COMM_WORLD.Allreduce(
+        MPI.IN_PLACE,
+        q_padding_unchanged.numpy(),
+        op=MPI.MIN,
+    )
 
     assert a_unchanged.item() == 1, f"{case_name}: A was modified"
-    torch.testing.assert_close(owners, torch.ones_like(owners), msg=case_name)
-    _assert_matches_torch(case_name, actual.cpu(), expected.cpu())
+    assert q_padding_unchanged.item() == 1, (
+        f"{case_name}: Q padding was modified"
+    )
+    torch.testing.assert_close(
+        owners,
+        torch.ones_like(owners),
+        msg=f"{case_name}: each entry must have exactly one owner",
+    )
+    _assert_same_q(actual, expected.cpu(), case_name)
+    if rank == 0:
+        print(f"pass {case_name}", flush=True)
 
 
-def _single_rank_worker(rank, world_size, port, binding_path):
-    assert rank == MPI.COMM_WORLD.Get_rank() == 0
-    assert world_size == MPI.COMM_WORLD.Get_size() == 1
-    device = _device_for_profile()
-    if device.type == "cuda":
-        torch.cuda.set_device(device)
-    _init_process_group(rank, world_size, port, _backend_for_device(device))
-
-    try:
-        binding = _extension_from_path(binding_path)
-        for case in SINGLE_RANK_CASES:
-            _check_power_iteration_case(
-                binding, rank, (1, 1), case, device
-            )
-    finally:
-        dist.destroy_process_group()
-
-
-def _multirank_worker(binding_path, port):
+def _worker():
     rank = MPI.COMM_WORLD.Get_rank()
     world_size = MPI.COMM_WORLD.Get_size()
-    assert world_size == MULTIRANK_WORLD_SIZE > 1
+    expected_world_size = int(os.environ[WORKER_WORLD_SIZE])
+    assert world_size == expected_world_size
+
     device = _device_for_profile()
     if device.type == "cuda":
         torch.cuda.set_device(device)
-    if rank == 0:
-        print("Torch process-group start", flush=True)
-    _init_process_group(rank, world_size, port, _backend_for_device(device))
-    if rank == 0:
-        print("Torch process-group ready", flush=True)
+    binding = _load_extension(os.environ[WORKER_BINDING])
+    mode = os.environ[WORKER_MODE]
+    if mode == "single":
+        assert world_size == 1
+        for case in SINGLE_RANK_CASES:
+            _run_case(binding, rank, (1, 1), case, device)
+        return
 
-    cases = (
-        # More ranks than tiles forces ranks with no local rows or columns.
-        ("empty_local_owners", 1, 1, 0),
-        # Every process-grid orientation receives equally sized local shards.
-        ("equal_shards", 2 * world_size, 2, 0),
-        # The final partial block produces uneven shards and padded local LDAs.
-        ("uneven_shards", 2 * world_size + 1, 2, 1),
-    )
+    assert mode == "multirank"
+    assert world_size > 1
     process_grids = [
-        (rows, world_size // rows)
-        for rows in range(1, world_size + 1)
-        if world_size % rows == 0
+        (process_rows, world_size // process_rows)
+        for process_rows in range(1, world_size + 1)
+        if world_size % process_rows == 0
     ]
+    cases = (
+        # A single tile leaves most ranks with no local rows or columns.
+        ("empty_local_shards", 1, 1, 0),
+        # Eight tile rows and columns divide evenly over an eight-rank grid.
+        ("equal_shards", 2 * world_size, 2, 0),
+        # A ninth partial tile creates uneven ownership and padded LDAs.
+        ("uneven_partial_shards", 2 * world_size + 1, 2, 1),
+    )
+    for case in cases:
+        for process_grid in process_grids:
+            _run_case(binding, rank, process_grid, case, device)
 
-    try:
-        binding = _extension_from_path(binding_path)
-        for case in cases:
-            for process_grid in process_grids:
-                _check_power_iteration_case(
-                    binding,
-                    rank,
-                    process_grid,
-                    case,
-                    device,
-                )
-    finally:
-        if rank == 0:
-            print("Torch process-group destroy start", flush=True)
-        dist.destroy_process_group()
-        if rank == 0:
-            print("Torch process-group destroyed", flush=True)
+    # Repeating a prior decomposition after all communicator reorderings
+    # catches stale SLATE state and premature communicator cleanup.
+    repeat_grid = process_grids[len(process_grids) // 2]
+    _run_case(
+        binding,
+        rank,
+        repeat_grid,
+        ("repeated_after_grid_changes", 2 * world_size, 2, 0),
+        device,
+    )
 
 
-class TestSlateBinding(unittest.TestCase):
+def _output_text(output):
+    if output is None:
+        return ""
+    if isinstance(output, bytes):
+        return output.decode(errors="replace")
+    return output
+
+
+class TestSlateBindings(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if PROFILE not in {"cpu", "cuda", "rocm"}:
             raise RuntimeError("SLATE_PROFILE must be cpu, cuda, or rocm")
 
-        include_dir = PREFIX / "include"
-        library_dir = next(
-            (path for path in (PREFIX / "lib", PREFIX / "lib64") if path.is_dir()),
+        include_directory = PREFIX / "include"
+        library_directory = next(
+            (
+                path
+                for path in (PREFIX / "lib", PREFIX / "lib64")
+                if path.is_dir()
+            ),
             None,
         )
-        if not (include_dir / "slate/slate.hh").is_file() or library_dir is None:
+        if (
+            not (include_directory / "slate/slate.hh").is_file()
+            or library_directory is None
+        ):
             raise RuntimeError(f"SLATE is not installed under {PREFIX}")
 
         os.environ["CXX"] = "mpicxx"
-        os.environ["PATH"] = f"{Path(sys.executable).parent}:{os.environ['PATH']}"
-        os.environ["TORCH_EXTENSIONS_DIR"] = str(ROOT / "build/torch-extensions")
+        os.environ["PATH"] = (
+            f"{Path(sys.executable).parent}:{os.environ['PATH']}"
+        )
+        os.environ["TORCH_EXTENSIONS_DIR"] = str(
+            ROOT / "build/torch-extensions"
+        )
 
-        extra_cflags = ["-O0"]
+        compile_flags = ["-O0"]
         if PROFILE == "cuda":
-            extra_cflags.append("-DSOAP_TP_SLATE_WITH_CUDA=1")
+            compile_flags.append("-DSOAP_TP_SLATE_WITH_CUDA=1")
         elif PROFILE == "rocm":
-            extra_cflags.append("-DSOAP_TP_SLATE_WITH_ROCM=1")
+            compile_flags.append("-DSOAP_TP_SLATE_WITH_ROCM=1")
 
         cls.binding = load(
             name=f"_soap_tp_slate_{PROFILE}_test",
             sources=[str(ROOT / "src/soap_tp/csrc/slate_bindings.cpp")],
-            extra_include_paths=[str(include_dir)],
-            extra_cflags=extra_cflags,
+            extra_include_paths=[str(include_directory)],
+            extra_cflags=compile_flags,
             extra_ldflags=[
-                f"-L{library_dir}",
+                f"-L{library_directory}",
                 "-lslate",
                 "-llapackpp",
                 "-lblaspp",
-                f"-Wl,-rpath,{library_dir}",
+                f"-Wl,-rpath,{library_directory}",
             ],
         )
 
-    def test_compiled_backend_matches_profile(self):
-        # Detects a build that selected a different SLATE backend than requested.
-        expected = {"cpu": "none", "cuda": "cuda", "rocm": "rocm"}[PROFILE]
-        self.assertEqual(self.binding.compiled_gpu_backend(), expected)
-
-    def test_single_rank_matches_torch_power_iteration_qr(self):
-        # Compares SLATE with the sorted Torch reference at singleton, partial,
-        # exact, oversized-block, and padded-leading-dimension boundaries.
-        mp.spawn(
-            _single_rank_worker,
-            args=(1, _free_port(), self.binding.__file__),
-            nprocs=1,
-            join=True,
-        )
-
-    def test_multirank_row_major_result_matches_torch(self):
-        # Exercises every legal process-grid orientation for the multirank world
-        # and catches rank transposition, missing shards, and duplicates.
-        self.assertGreater(MULTIRANK_WORLD_SIZE, 1)
+    def _run_worker(self, mode, world_size):
         mpiexec = shutil.which("mpiexec")
         self.assertIsNotNone(mpiexec, "mpiexec is required")
 
         environment = os.environ.copy()
         environment.update(
             {
-                MULTIRANK_WORKER: "1",
-                BINDING_PATH: self.binding.__file__,
-                "GLOO_SOCKET_IFNAME": "lo0" if sys.platform == "darwin" else "lo",
-                "MASTER_ADDR": "127.0.0.1",
-                "MASTER_PORT": str(_free_port()),
+                WORKER_MODE: mode,
+                WORKER_BINDING: self.binding.__file__,
+                WORKER_WORLD_SIZE: str(world_size),
                 "MKL_NUM_THREADS": "1",
-                "OMP_NUM_THREADS": "1",
+                "OMP_NUM_THREADS": "2",
                 "OPENBLAS_NUM_THREADS": "1",
                 "PYTHONUNBUFFERED": "1",
             }
@@ -362,7 +382,7 @@ class TestSlateBinding(unittest.TestCase):
             mpiexec,
             "--oversubscribe",
             "-n",
-            str(MULTIRANK_WORLD_SIZE),
+            str(world_size),
             sys.executable,
             str(Path(__file__).resolve()),
         ]
@@ -377,25 +397,63 @@ class TestSlateBinding(unittest.TestCase):
             )
         except subprocess.TimeoutExpired as error:
             self.fail(
-                "MPI worker timed out\n"
-                f"stdout:\n{error.stdout or ''}\n"
-                f"stderr:\n{error.stderr or ''}"
+                f"{mode} MPI worker timed out\n"
+                f"stdout:\n{_output_text(error.stdout)}\n"
+                f"stderr:\n{_output_text(error.stderr)}"
             )
         self.assertEqual(
             completed.returncode,
             0,
             msg=(
-                f"MPI worker failed\nstdout:\n{completed.stdout}"
+                f"{mode} MPI worker failed\nstdout:\n{completed.stdout}"
                 f"\nstderr:\n{completed.stderr}"
             ),
         )
 
+    def test_compiled_backend_matches_requested_profile(self):
+        # This catches an extension compiled for host memory while the test
+        # expects device pointers, or vice versa.
+        expected = {"cpu": "none", "cuda": "cuda", "rocm": "rocm"}[PROFILE]
+        self.assertEqual(self.binding.compiled_gpu_backend(), expected)
+
+    def test_rejects_non_integer_pointer_arguments(self):
+        # The public pybind API accepts raw addresses as integers. A Python
+        # object must fail conversion before native code can dereference it.
+        valid = {
+            "a": 1,
+            "q": 1,
+            "work": 1,
+            "n": 1,
+            "lda": 1,
+            "block_size": 1,
+            "process_rows": 1,
+            "process_cols": 1,
+        }
+        for pointer in ("a", "q", "work"):
+            with self.subTest(pointer=pointer):
+                arguments = valid.copy()
+                arguments[pointer] = object()
+                with self.assertRaises(TypeError):
+                    self.binding.slate_power_iteration_qr_float(**arguments)
+
+    def test_single_rank_matches_torch_across_block_boundaries(self):
+        # One rank isolates numerical behavior and covers unit, oversized,
+        # exact, partial, and padded block-storage boundaries.
+        self._run_worker("single", 1)
+
+    def test_eight_ranks_match_torch_for_every_row_major_grid(self):
+        # Eight ranks exercise 1x8, 2x4, 4x2, and 8x1 row-major grids. The
+        # cases include equal, uneven, partial, and empty local ownership.
+        self.assertEqual(
+            MULTIRANK_WORLD_SIZE,
+            8,
+            "the multirank SLATE contract test requires eight ranks",
+        )
+        self._run_worker("multirank", MULTIRANK_WORLD_SIZE)
+
 
 if __name__ == "__main__":
-    if os.environ.get(MULTIRANK_WORKER) == "1":
-        _multirank_worker(
-            os.environ[BINDING_PATH],
-            int(os.environ["MASTER_PORT"]),
-        )
+    if WORKER_MODE in os.environ:
+        _worker()
     else:
         unittest.main()
