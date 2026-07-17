@@ -3,6 +3,8 @@
 #include <mpi.h>
 #include <slate/slate.hh>
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 
 namespace py = pybind11;
@@ -42,6 +44,13 @@ void slate_power_iteration_qr_float(
     const int slate_rank = process_row + process_col * process_rows;
     MPI_Comm communicator = MPI_COMM_NULL;
     MPI_Comm_split(MPI_COMM_WORLD, 0, slate_rank, &communicator);
+    const bool trace = std::getenv("SOAP_TP_SLATE_TRACE") != nullptr;
+    auto trace_stage = [rank, trace](const char *stage) {
+        if (rank == 0 && trace) {
+            std::fprintf(stderr, "%s\n", stage);
+            std::fflush(stderr);
+        }
+    };
 
     float *a = reinterpret_cast<float *>(a_address);
     float *q = reinterpret_cast<float *>(q_address);
@@ -75,10 +84,15 @@ void slate_power_iteration_qr_float(
             process_rows, process_cols, communicator);
 #endif
 
+        trace_stage("SLATE symm start");
         slate::symm(slate::Side::Left, 1.0f, A, Q, 0.0f, Y, options);
+        trace_stage("SLATE symm done");
         slate::TriangularFactors<float> factors;
+        trace_stage("SLATE geqrf start");
         slate::geqrf(Y, factors, options);
+        trace_stage("SLATE geqrf done");
         slate::set(0.0f, 1.0f, Q, options);
+        trace_stage("SLATE unmqr start");
         slate::unmqr(
             slate::Side::Left,
             slate::Op::NoTrans,
@@ -86,6 +100,7 @@ void slate_power_iteration_qr_float(
             factors,
             Q,
             options);
+        trace_stage("SLATE unmqr done");
     }
 
     MPI_Comm_free(&communicator);

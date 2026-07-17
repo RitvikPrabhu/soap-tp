@@ -373,9 +373,10 @@ class TestSlateBindings(unittest.TestCase):
                 WORKER_BINDING: self.binding.__file__,
                 WORKER_WORLD_SIZE: str(world_size),
                 "MKL_NUM_THREADS": "1",
-                "OMP_NUM_THREADS": "2",
+                "OMP_NUM_THREADS": "4",
                 "OPENBLAS_NUM_THREADS": "1",
                 "PYTHONUNBUFFERED": "1",
+                "SOAP_TP_SLATE_TRACE": "1",
             }
         )
         command = [
