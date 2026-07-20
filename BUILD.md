@@ -212,10 +212,11 @@ first and passes these values automatically.
 
 ## Running the SLATE binding
 
-`slate_power_iteration_qr_float` uses the selected SLATE build profile. A CPU
-installation wraps host memory and runs the host-task backend. CUDA and ROCm
-installations wrap device memory and run SLATE's device backend. The caller does
-not pass a runtime target.
+The public functions in `soap_tp.ops` validate the buffers and call focused
+SLATE operations for symmetric multiplication, QR, and forward/backward basis
+rotation. A CPU installation wraps host memory and runs the host-task backend.
+CUDA and ROCm installations wrap device memory and run SLATE's device backend.
+The caller does not pass a runtime target.
 
 GPU execution uses one MPI rank per accelerator. For a node with eight GPUs,
 launch eight ranks and configure the scheduler or MPI launcher to expose one
@@ -225,14 +226,14 @@ GPU-binding option. NVIDIA ranks use `CUDA_VISIBLE_DEVICES`; AMD ranks use
 `ROCR_VISIBLE_DEVICES`. Each rank must pass pointers belonging to its assigned
 accelerator.
 
-The operation is collective over `MPI_COMM_WORLD`; `process_rows * process_cols`
-must equal the world size. MPI must already be initialized, normally by importing
-`mpi4py.MPI`.
+The operations are collective over `MPI_COMM_WORLD`;
+`process_rows * process_cols` must equal the world size. MPI must already be
+initialized, normally by importing `mpi4py.MPI`.
 
-The three buffers are raw integer addresses. Each must describe a distinct,
-column-major, rank-local ScaLAPACK-style `float32` allocation with the requested
-2D block-cyclic distribution. Individual row-major PyTorch tile tensors must be
-packed into that layout before calling the binding.
+Native buffers are distinct, column-major, rank-local ScaLAPACK-style
+`float32` allocations with the requested 2D block-cyclic distribution. Use
+`soap_tp.ops.allocate_2d_block_cyclic` rather than packing individual tile
+tensors manually.
 
 On macOS, the SLATE build rewrites its OpenMP dependency to use the active
 PyTorch installation's `libomp.dylib`. This prevents Torch and SLATE from

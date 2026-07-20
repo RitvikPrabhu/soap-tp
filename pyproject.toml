@@ -7,8 +7,5 @@ name = "soap-tp"
 version = "0.1.0"
 requires-python = ">=3.10"
 
-[project.scripts]
-soap-tp = "soap_tp.soap:main"
-
 [tool.setuptools.packages.find]
 where = ["src"]

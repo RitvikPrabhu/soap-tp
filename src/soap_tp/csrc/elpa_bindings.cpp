@@ -1,8 +1,12 @@
 #include <pybind11/pybind11.h>
+#include <mpi.h>
 #include <elpa/elpa.h>
 #include <elpa/elpa_configured_options.h>
+#include <elpa/elpa_version.h>
 
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 
 namespace py = pybind11;
 
@@ -42,6 +46,131 @@ namespace
         return error;
     }
 
+    void get_mpi_world_info(int &rank, int &size)
+    {
+        int initialized = 0;
+        MPI_Initialized(&initialized);
+        if (!initialized) {
+            throw std::runtime_error(
+                "MPI must be initialized before using ELPA");
+        }
+
+        int finalized = 0;
+        MPI_Finalized(&finalized);
+        if (finalized) {
+            throw std::runtime_error("MPI has already been finalized");
+        }
+
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        MPI_Comm_size(MPI_COMM_WORLD, &size);
+    }
+
+    void require_elpa_ok(int error, const char *operation)
+    {
+        if (error != ELPA_OK) {
+            throw std::runtime_error(
+                std::string(operation) + ": " + elpa_strerr(error));
+        }
+    }
+
+    void eigenvectors_2d_block_cyclic_float(
+        std::uintptr_t a_address,
+        std::uintptr_t eigenvalues_address,
+        std::uintptr_t q_address,
+        std::int64_t n,
+        std::int64_t local_rows,
+        std::int64_t local_columns,
+        std::int64_t block_size,
+        int process_rows,
+        int process_columns)
+    {
+        int rank = 0;
+        int world_size = 0;
+        get_mpi_world_info(rank, world_size);
+        if (process_rows <= 0 || process_columns <= 0 ||
+            process_rows * process_columns != world_size) {
+            throw std::invalid_argument(
+                "process grid must be positive and contain every MPI rank");
+        }
+        if (a_address == 0 || eigenvalues_address == 0 ||
+            q_address == 0) {
+            throw std::invalid_argument("ELPA buffer addresses must be nonzero");
+        }
+        if (n <= 0 || local_rows <= 0 || local_columns <= 0 ||
+            block_size <= 0) {
+            throw std::invalid_argument(
+                "matrix dimensions and block size must be positive");
+        }
+
+        const int process_row = rank / process_columns;
+        const int process_column = rank % process_columns;
+        const int elpa_rank =
+            process_row + process_column * process_rows;
+        MPI_Comm communicator = MPI_COMM_NULL;
+        MPI_Comm_split(MPI_COMM_WORLD, 0, elpa_rank, &communicator);
+
+        bool elpa_initialized = false;
+        elpa_t handle = nullptr;
+        int error = ELPA_OK;
+        try {
+            require_elpa_ok(elpa_init(ELPA_API_VERSION), "elpa_init");
+            elpa_initialized = true;
+            handle = elpa_allocate(&error);
+            require_elpa_ok(error, "elpa_allocate");
+            if (handle == nullptr) {
+                throw std::runtime_error("elpa_allocate returned null");
+            }
+
+            auto set_integer = [&](const char *name, int value) {
+                elpa_set_integer(handle, name, value, &error);
+                require_elpa_ok(error, name);
+            };
+            set_integer("na", static_cast<int>(n));
+            set_integer("nev", static_cast<int>(n));
+            set_integer("local_nrows", static_cast<int>(local_rows));
+            set_integer("local_ncols", static_cast<int>(local_columns));
+            set_integer("nblk", static_cast<int>(block_size));
+            set_integer(
+                "mpi_comm_parent",
+                static_cast<int>(MPI_Comm_c2f(communicator)));
+            set_integer("process_row", process_row);
+            set_integer("process_col", process_column);
+            require_elpa_ok(elpa_setup(handle), "elpa_setup");
+
+#if ELPA_WITH_NVIDIA_GPU_VERSION == 1
+            set_integer("nvidia-gpu", 1);
+#elif ELPA_WITH_AMD_GPU_VERSION == 1
+            set_integer("amd-gpu", 1);
+#endif
+
+            elpa_eigenvectors_float(
+                handle,
+                reinterpret_cast<float *>(a_address),
+                reinterpret_cast<float *>(eigenvalues_address),
+                reinterpret_cast<float *>(q_address),
+                &error);
+            require_elpa_ok(error, "elpa_eigenvectors_float");
+        }
+        catch (...) {
+            if (handle != nullptr) {
+                elpa_deallocate(handle, &error);
+            }
+            if (elpa_initialized) {
+                elpa_uninit(&error);
+            }
+            MPI_Comm_free(&communicator);
+            throw;
+        }
+
+        int deallocate_error = ELPA_OK;
+        int uninit_error = ELPA_OK;
+        elpa_deallocate(handle, &deallocate_error);
+        elpa_uninit(&uninit_error);
+        MPI_Comm_free(&communicator);
+        require_elpa_ok(deallocate_error, "elpa_deallocate");
+        require_elpa_ok(uninit_error, "elpa_uninit");
+    }
+
 } // namespace
 
 PYBIND11_MODULE(SOAP_TP_EXTENSION_NAME, handle)
@@ -52,11 +181,38 @@ PYBIND11_MODULE(SOAP_TP_EXTENSION_NAME, handle)
         &compiled_gpu_backend,
         "Return the GPU backend compiled into ELPA");
     handle.def(
+        "mpi_world_rank_and_size",
+        []() {
+            int rank = 0;
+            int size = 0;
+            get_mpi_world_info(rank, size);
+            return py::make_tuple(rank, size);
+        },
+        "Return the initialized MPI world rank and size.");
+    handle.def(
         "elpa_error_string",
         [](int error)
         { return elpa_strerr(error); },
         py::arg("error"),
         "Return ELPA's message for an error code");
+    handle.def(
+        "elpa_eigenvectors_2d_block_cyclic_float",
+        &eigenvectors_2d_block_cyclic_float,
+        py::arg("a"),
+        py::arg("eigenvalues"),
+        py::arg("q"),
+        py::arg("n"),
+        py::arg("local_rows"),
+        py::arg("local_columns"),
+        py::arg("block_size"),
+        py::arg("process_rows"),
+        py::arg("process_columns"),
+        py::call_guard<py::gil_scoped_release>(),
+        R"doc(Compute a full eigendecomposition using MPI_COMM_WORLD.
+
+The binding owns ELPA handle setup and remaps row-major process-grid ranks to
+ELPA's column-major communicator ordering. The input matrix is overwritten.
+)doc");
     handle.def(
         "elpa_eigenvectors_float",
         &eigenvectors_float,

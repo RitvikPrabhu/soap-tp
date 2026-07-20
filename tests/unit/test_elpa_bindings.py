@@ -16,6 +16,12 @@ import torch.multiprocessing as mp
 from mpi4py import MPI
 from torch.utils.cpp_extension import load
 
+from soap_tp.ops._utils import (
+    allocate_2d_block_cyclic,
+    block_cyclic_indices,
+)
+from soap_tp.ops.factorizations import initialize_basis_2d_block_cyclic_
+
 
 ROOT = Path(__file__).resolve().parents[2]
 PROFILE = os.environ.get("ELPA_PROFILE", "cpu")
@@ -433,6 +439,118 @@ def _solve_multirank_case(binding, elpa, case, rank, world_size):
     )
 
 
+def _solve_production_initializer_case(binding, rank, world_size, size):
+    block_size = 2
+    process_grid = (2, 2)
+    process_rows, process_columns = process_grid
+    assert process_rows * process_columns == world_size
+
+    generator = torch.Generator().manual_seed(314 + size)
+    random = torch.randn(size, size, generator=generator)
+    matrix = random @ random.T + torch.diag(
+        torch.linspace(1.0, 2.0, size)
+    )
+
+    preconditioner = allocate_2d_block_cyclic(
+        (size, size),
+        block_size,
+        process_grid,
+    )
+    Q = allocate_2d_block_cyclic(
+        (size, size),
+        block_size,
+        process_grid,
+    )
+    work = allocate_2d_block_cyclic(
+        (size, size),
+        block_size,
+        process_grid,
+    )
+    eigenvalues = torch.empty(size, dtype=torch.float32)
+
+    process_row = rank // process_columns
+    process_column = rank % process_columns
+    global_rows = block_cyclic_indices(
+        size,
+        block_size,
+        process_row,
+        process_rows,
+    )
+    global_columns = block_cyclic_indices(
+        size,
+        block_size,
+        process_column,
+        process_columns,
+    )
+    row_index = torch.tensor(global_rows, dtype=torch.long)
+    column_index = torch.tensor(global_columns, dtype=torch.long)
+    preconditioner[
+        : len(global_rows), : len(global_columns)
+    ].copy_(
+        matrix.index_select(0, row_index).index_select(1, column_index)
+    )
+
+    arguments = (
+        preconditioner,
+        Q,
+        work,
+        eigenvalues,
+        size,
+        block_size,
+        process_grid,
+    )
+    if size == 1:
+        try:
+            initialize_basis_2d_block_cyclic_(
+                *arguments,
+                elpa_binding=binding,
+            )
+        except ValueError as error:
+            assert "every rank to own" in str(error)
+        else:
+            raise AssertionError("empty ELPA ownership must be rejected")
+        return
+
+    result = initialize_basis_2d_block_cyclic_(
+        *arguments,
+        elpa_binding=binding,
+    )
+    assert result is Q
+
+    local_result = (
+        global_rows,
+        global_columns,
+        Q[: len(global_rows), : len(global_columns)].contiguous(),
+    )
+    all_results = [None] * world_size
+    dist.all_gather_object(all_results, local_result)
+    global_Q = torch.empty((size, size), dtype=torch.float32)
+    for shard_rows, shard_columns, shard in all_results:
+        shard_rows = torch.tensor(shard_rows, dtype=torch.long)
+        shard_columns = torch.tensor(shard_columns, dtype=torch.long)
+        global_Q[shard_rows[:, None], shard_columns] = shard
+
+    expected_values = torch.linalg.eigvalsh(matrix).flip(0)
+    torch.testing.assert_close(
+        eigenvalues,
+        expected_values,
+        atol=2e-3,
+        rtol=2e-3,
+    )
+    torch.testing.assert_close(
+        matrix @ global_Q,
+        global_Q * eigenvalues,
+        atol=3e-3,
+        rtol=3e-3,
+    )
+    torch.testing.assert_close(
+        global_Q.T @ global_Q,
+        torch.eye(size),
+        atol=2e-3,
+        rtol=2e-3,
+    )
+
+
 def _run_multirank_worker(binding_path, library_path):
     rank = MPI.COMM_WORLD.Get_rank()
     world_size = MPI.COMM_WORLD.Get_size()
@@ -444,6 +562,13 @@ def _run_multirank_worker(binding_path, library_path):
         elpa = _load_elpa(library_path)
         for case in MULTIRANK_CASES:
             _solve_multirank_case(binding, elpa, case, rank, world_size)
+        for size in (1, 9):
+            _solve_production_initializer_case(
+                binding,
+                rank,
+                world_size,
+                size,
+            )
     finally:
         dist.destroy_process_group()
 
@@ -516,7 +641,7 @@ class TestElpaBinding(unittest.TestCase):
     def test_eigenvectors_float_handles_repeated_eigenvalues(self):
         self._run_cases(REPEATED_EIGENVALUE_CASE, world_size=1)
 
-    # Tests: a collective four-rank solve under 1x4, 2x2, and 4x1 ELPA grids.
+    # Tests raw solves plus the production initializer's row-major rank remap.
     # Expected: gathered global eigenpairs match torch.linalg.eigh.
     def test_eigenvectors_float_multirank_block_cyclic(self):
         mpiexec = shutil.which("mpiexec")
