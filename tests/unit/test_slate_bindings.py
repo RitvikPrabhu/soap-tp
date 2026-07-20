@@ -4,6 +4,7 @@ import importlib.util
 import math
 import os
 from pathlib import Path
+import signal
 import shutil
 import socket
 import subprocess
@@ -248,11 +249,19 @@ def _run_rotation_case(binding, rank, process_grid, case, device):
             process_columns,
         )
 
-    for function, local in (
-        (binding.slate_forward_rotation_float, gradient),
-        (binding.slate_backward_rotation_float, momentum),
+    case_name = (
+        f"rotation: shape={rows}x{columns}, block={block_size}, "
+        f"grid={process_rows}x{process_columns}"
+    )
+    if rank == 0:
+        print(f"start {case_name}", flush=True)
+    for direction, function, local in (
+        ("forward", binding.slate_forward_rotation_float, gradient),
+        ("backward", binding.slate_backward_rotation_float, momentum),
     ):
         rotate(function, local)
+        if rank == 0:
+            print(f"{direction} done {case_name}", flush=True)
 
     actual_gradient = _gather_block_cyclic(
         gradient, (rows, columns), local_rows, local_columns
@@ -272,6 +281,8 @@ def _run_rotation_case(binding, rank, process_grid, case, device):
         atol=2e-4,
         rtol=2e-4,
     )
+    if rank == 0:
+        print(f"pass {case_name}", flush=True)
 
 
 def _run_fixed_basis_pipeline_case(binding, rank, world_size, device):
@@ -349,7 +360,18 @@ def _run_fixed_basis_pipeline_case(binding, rank, world_size, device):
         @ Q_right_global.T
     )
 
+    if rank == 0:
+        print(
+            f"start fixed_basis_pipeline: shape={rows}x{columns}, "
+            f"grid={process_rows}x{process_columns}",
+            flush=True,
+        )
     for shard_dim in (0, 1):
+        if rank == 0:
+            print(
+                f"start fixed_basis_pipeline shard_dim={shard_dim}",
+                flush=True,
+            )
         shard_size = gradient_global.size(shard_dim) // world_size
         shard_start = rank * shard_size
         gradient_shard = gradient_global.narrow(
@@ -411,6 +433,11 @@ def _run_fixed_basis_pipeline_case(binding, rank, world_size, device):
             atol=5e-4,
             rtol=5e-4,
         )
+        if rank == 0:
+            print(
+                f"preconditioners done shard_dim={shard_dim}",
+                flush=True,
+            )
 
         packed_gradient = redistribute_tp_shard_to_2d_block_cyclic(
             gradient_shard,
@@ -429,6 +456,11 @@ def _run_fixed_basis_pipeline_case(binding, rank, world_size, device):
             direction="forward",
             slate_binding=binding,
         )
+        if rank == 0:
+            print(
+                f"forward rotation done shard_dim={shard_dim}",
+                flush=True,
+            )
         momentum = torch.zeros_like(
             packed_gradient,
             memory_format=torch.preserve_format,
@@ -456,6 +488,11 @@ def _run_fixed_basis_pipeline_case(binding, rank, world_size, device):
             direction="backward",
             slate_binding=binding,
         )
+        if rank == 0:
+            print(
+                f"backward rotation done shard_dim={shard_dim}",
+                flush=True,
+            )
         update_shard = redistribute_2d_block_cyclic_to_tp_shard(
             packed_update,
             (rows, columns),
@@ -475,6 +512,11 @@ def _run_fixed_basis_pipeline_case(binding, rank, world_size, device):
             rtol=8e-4,
             msg=f"fixed-basis pipeline shard_dim={shard_dim}",
         )
+        if rank == 0:
+            print(
+                f"pass fixed_basis_pipeline shard_dim={shard_dim}",
+                flush=True,
+            )
 
     left_global = gradient_global @ gradient_global.T
     expected_order = torch.argsort(
@@ -491,6 +533,8 @@ def _run_fixed_basis_pipeline_case(binding, rank, world_size, device):
         process_grid,
         device=device,
     )
+    if rank == 0:
+        print("start fixed_basis_pipeline power_iteration", flush=True)
     actual_order = power_iteration_qr_2d_block_cyclic_(
         left_preconditioner,
         Q_left,
@@ -512,6 +556,8 @@ def _run_fixed_basis_pipeline_case(binding, rank, world_size, device):
         expected_Q_left.cpu(),
         "production power iteration",
     )
+    if rank == 0:
+        print("pass fixed_basis_pipeline power_iteration", flush=True)
 
 
 def _run_case(binding, rank, process_grid, case, device):
@@ -564,6 +610,8 @@ def _run_case(binding, rank, process_grid, case, device):
         process_rows,
         process_columns,
     )
+    if rank == 0:
+        print(f"symmetric multiply done {case_name}", flush=True)
     binding.slate_qr_float(
         work.data_ptr(),
         q.data_ptr(),
@@ -574,6 +622,8 @@ def _run_case(binding, rank, process_grid, case, device):
         process_rows,
         process_columns,
     )
+    if rank == 0:
+        print(f"QR done {case_name}", flush=True)
 
     # Reconstruct Q according to row-major ownership. A rank transposition,
     # omitted shard, or duplicated shard changes either Q or the owner counts.
@@ -691,9 +741,9 @@ def _worker():
     cases = (
         # A single tile leaves most ranks with no local rows or columns.
         ("empty_local_shards", 1, 1, 0),
-        # Eight tile rows and columns divide evenly over an eight-rank grid.
+        # One tile row and column per rank divides evenly over every grid.
         ("equal_shards", 2 * world_size, 2, 0),
-        # A ninth partial tile creates uneven ownership and padded LDAs.
+        # One additional partial tile creates uneven ownership and padded LDAs.
         ("uneven_partial_shards", 2 * world_size + 1, 2, 1),
     )
     for case in cases:
@@ -710,14 +760,6 @@ def _worker():
         ("repeated_after_grid_changes", 2 * world_size, 2, 0),
         device,
     )
-
-
-def _output_text(output):
-    if output is None:
-        return ""
-    if isinstance(output, bytes):
-        return output.decode(errors="replace")
-    return output
 
 
 class TestSlateBindings(unittest.TestCase):
@@ -790,34 +832,60 @@ class TestSlateBindings(unittest.TestCase):
         command = [
             mpiexec,
             "--oversubscribe",
+            "--bind-to",
+            "none",
             "-n",
             str(world_size),
             sys.executable,
             str(Path(__file__).resolve()),
         ]
+        print(
+            f"launch MPI worker: mode={mode}, ranks={world_size}",
+            flush=True,
+        )
+        process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            env=environment,
+            start_new_session=True,
+        )
         try:
-            completed = subprocess.run(
-                command,
-                cwd=ROOT,
-                env=environment,
-                capture_output=True,
-                text=True,
-                timeout=240,
-            )
-        except subprocess.TimeoutExpired as error:
+            returncode = process.wait(timeout=240)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
             self.fail(
-                f"{mode} MPI worker timed out\n"
-                f"stdout:\n{_output_text(error.stdout)}\n"
-                f"stderr:\n{_output_text(error.stderr)}"
+                f"{mode} MPI worker with {world_size} ranks timed out "
+                "after 240 seconds; worker output was streamed above"
             )
         self.assertEqual(
-            completed.returncode,
+            returncode,
             0,
-            msg=(
-                f"{mode} MPI worker failed\nstdout:\n{completed.stdout}"
-                f"\nstderr:\n{completed.stderr}"
-            ),
+            msg=f"{mode} MPI worker failed with exit code {returncode}",
         )
+
+    def _validated_multirank_world_size(self):
+        self.assertGreaterEqual(
+            MULTIRANK_WORLD_SIZE,
+            4,
+            "WORLD_SIZE must be an even integer of at least four",
+        )
+        self.assertEqual(
+            MULTIRANK_WORLD_SIZE % 2,
+            0,
+            "WORLD_SIZE must be an even integer of at least four",
+        )
+        return MULTIRANK_WORLD_SIZE
 
     def test_compiled_backend_matches_requested_profile(self):
         # This catches an extension compiled for host memory while the test
@@ -872,34 +940,23 @@ class TestSlateBindings(unittest.TestCase):
         # exact, partial, and padded block-storage boundaries.
         self._run_worker("single", 1)
 
-    def test_eight_ranks_match_torch_for_every_row_major_grid(self):
-        # Eight ranks exercise 1x8, 2x4, 4x2, and 8x1 row-major grids. The
-        # cases include equal, uneven, partial, and empty local ownership.
-        self.assertEqual(
-            MULTIRANK_WORLD_SIZE,
-            8,
-            "the multirank SLATE contract test requires eight ranks",
-        )
-        self._run_worker("multirank", MULTIRANK_WORLD_SIZE)
+    def test_multiple_ranks_match_torch_for_every_row_major_grid(self):
+        # The default eight ranks exercise 1x8, 2x4, 4x2, and 8x1 grids.
+        # CI uses four ranks to retain rectangular and square grid coverage
+        # without oversubscribing a hosted runner with 32 OpenMP threads.
+        world_size = self._validated_multirank_world_size()
+        self._run_worker("multirank", world_size)
 
     def test_forward_and_backward_rotation_single_rank(self):
         self._run_worker("rotation_single", 1)
 
-    def test_forward_and_backward_rotation_eight_ranks(self):
-        self.assertEqual(
-            MULTIRANK_WORLD_SIZE,
-            8,
-            "the multirank SLATE rotation test requires eight ranks",
-        )
-        self._run_worker("rotation_multirank", MULTIRANK_WORLD_SIZE)
+    def test_forward_and_backward_rotation_multiple_ranks(self):
+        world_size = self._validated_multirank_world_size()
+        self._run_worker("rotation_multirank", world_size)
 
     def test_fixed_basis_pipeline_for_row_and_column_shards(self):
-        self.assertEqual(
-            MULTIRANK_WORLD_SIZE,
-            8,
-            "the pipeline test requires eight ranks",
-        )
-        self._run_worker("pipeline_multirank", MULTIRANK_WORLD_SIZE)
+        world_size = self._validated_multirank_world_size()
+        self._run_worker("pipeline_multirank", world_size)
 
 
 if __name__ == "__main__":

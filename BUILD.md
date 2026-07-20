@@ -5,41 +5,59 @@ pins the BLAS++, LAPACK++, and TestSweeper revisions it uses. The cluster
 supplies MPI, compilers, and GPU toolkits because their module names and ABI
 versions are machine-specific.
 
-## One-command installation
+## Two-command setup
 
-After activating the desired Python environment and loading the cluster modules,
-run `scripts/install.sh`. It initializes the native sources if needed, finds the
-MPI wrappers, builds a ScaLAPACK/OpenBLAS fallback when the cluster does not
-provide ScaLAPACK, builds ELPA and SLATE, compiles both pybind11 extensions,
-installs the Python package, and imports the extensions as a final check.
-
-A CPU installation from a fresh checkout is:
+The top-level installer owns the complete development environment. From a fresh
+checkout, CPU setup is:
 
 ```bash
-git clone --recurse-submodules https://github.com/RitvikPrabhu/soap-tp.git
-cd soap-tp
-./scripts/install.sh cpu
+git clone https://github.com/RitvikPrabhu/soap-tp.git && cd soap-tp
+./install.sh cpu
 ```
 
-The script installs into the Python selected by `PYTHON`, defaulting to
-`python3`. For example:
+It creates or reuses `.venv`, installs CPU PyTorch and the remaining Python
+dependencies, initializes all submodules recursively, builds a
+ScaLAPACK/OpenBLAS fallback when the machine does not provide one, builds ELPA
+and SLATE, compiles both extensions, and installs the checkout in editable mode.
+It is safe to rerun and reuses completed native builds.
+
+Activate the resulting environment when working in a new shell:
 
 ```bash
-PYTHON="$HOME/venvs/soap/bin/python" ./scripts/install.sh cpu
+source .venv/bin/activate
 ```
-
-PyTorch must already be installed in that environment. This is intentionally a
-prerequisite: CUDA/ROCm PyTorch distributions are cluster-specific, and the
-installer must not silently replace a site-supported GPU build with a generic
-wheel. The installer can use the pybind11 headers bundled with PyTorch, so the
-native package build does not need network access.
 
 The normal native prerequisites are MPI, Autoconf, Automake, Libtool, a Fortran
 compiler, and a C++17 compiler with OpenMP support. CMake 3.18 or newer is
 required for SLATE; CMake 3.26 or newer is required when the pinned fallback
 math libraries must be built. The installer recognizes
 `mpicc`/`mpicxx`/`mpifort` and Cray `cc`/`CC`/`ftn`. A complete custom compiler
-triplet can be provided through `CC`, `CXX`, and `FC`.
+triplet can be provided through `CC`, `CXX`, and `FC`. The bootstrap checks
+these tools before installing anything and prints a Homebrew or Ubuntu/Debian
+package command when they are missing.
+
+To use an existing environment instead of `.venv`, select its interpreter:
+
+```bash
+PYTHON="$HOME/venvs/soap/bin/python" ./install.sh cpu
+```
+
+Pass `--no-editable` when a snapshot installation is preferable.
+
+### Preconfigured or offline Python environments
+
+`scripts/install.sh` is the lower-level entry point for environments where
+PyTorch is already provisioned and Python packages must not be downloaded. It
+builds the native dependencies and package but does not create a virtual
+environment or install PyTorch:
+
+```bash
+PYTHON="$HOME/venvs/soap/bin/python" ./scripts/install.sh cpu --editable
+```
+
+CUDA/ROCm PyTorch distributions are cluster-specific, so the bootstrap never
+guesses a GPU wheel index. It reuses PyTorch from the selected environment or
+installs from an explicitly supplied `TORCH_INDEX_URL`.
 
 ## GPU clusters
 
@@ -48,14 +66,14 @@ CUDA profile:
 
 ```bash
 module load <site-compiler> <site-mpi> <site-cuda>
-./scripts/install.sh cuda
+TORCH_INDEX_URL="<site CUDA wheel index>" ./install.sh cuda
 ```
 
 For an AMD cluster, load MPI and ROCm and select the ROCm profile:
 
 ```bash
 module load <site-compiler> <site-mpi> <site-rocm>
-./scripts/install.sh rocm
+TORCH_INDEX_URL="<site ROCm wheel index>" ./install.sh rocm
 ```
 
 The module commands are placeholders; use the names documented by each cluster.
@@ -69,7 +87,7 @@ unsuitable:
 ```bash
 ELPA_CONFIGURE_ARGS="--with-NVIDIA-GPU-compute-capability=sm_80,sm_90" \
 SLATE_CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=80;90" \
-    ./scripts/install.sh cuda
+    TORCH_INDEX_URL="<site CUDA wheel index>" ./install.sh cuda
 ```
 
 Other site-specific ELPA configure options and SLATE CMake definitions can be
@@ -102,21 +120,18 @@ prefixes:
 ELPA_PREFIX="$HOME/.local/soap-tp/elpa/cuda" \
 SLATE_PREFIX="$HOME/.local/soap-tp/slate/cuda" \
 MATH_PREFIX="$HOME/.local/soap-tp/math" \
-    ./scripts/install.sh cuda
+    TORCH_INDEX_URL="<site CUDA wheel index>" ./install.sh cuda
 ```
 
 The same command can be rerun after source changes; completed native build work
-is reused. Pass `--editable` for a development Python installation:
-
-```bash
-./scripts/install.sh cpu --editable
-```
+is reused. The top-level installer uses an editable Python installation by
+default.
 
 If both native solvers succeeded but a later packaging step failed, reuse those
 installations without recompiling either solver:
 
 ```bash
-./scripts/install.sh cpu --skip-elpa --skip-slate
+./install.sh cpu --skip-elpa --skip-slate
 ```
 
 Each flag can also be used independently. A skipped solver must already exist
@@ -246,4 +261,4 @@ initializing two OpenMP runtimes in one Python process.
 the Python package.
 `scripts/build_math_deps.sh` builds only the pinned OpenBLAS/ScaLAPACK fallback.
 They are primarily useful for troubleshooting; a normal installation should use
-`scripts/install.sh`.
+the top-level `./install.sh`.
