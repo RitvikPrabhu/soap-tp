@@ -214,6 +214,7 @@ def _run_dense_reference_test(rank, world_size, port):
 def _run_validation_test(rank, world_size, port):
     device = _device_for_rank(rank, world_size)
     _init(rank, world_size, port, device)
+    dist.barrier()
     try:
         process_grid_shape = _grid(world_size)
         gradient = torch.ones(2, 2, device=device)

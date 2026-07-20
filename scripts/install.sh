@@ -196,9 +196,11 @@ for library, actual in backends.items():
         raise SystemExit(
             f"{library} binding reports {actual!r}, expected {expected!r}"
         )
+elpa_backend = backends["ELPA"]
+slate_backend = backends["SLATE"]
 print(
     "soap-tp installed successfully "
-    f"(ELPA backend: {backends['ELPA']}, SLATE backend: {backends['SLATE']})"
+    f"(ELPA backend: {elpa_backend}, SLATE backend: {slate_backend})"
 )
 '
 
