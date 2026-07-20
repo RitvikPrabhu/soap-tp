@@ -62,10 +62,26 @@ if [[ ! -f "${SOURCE}/configure.ac" || \
 fi
 
 if [[ ! -x "${SOURCE}/configure" ]]; then
-    command -v autoreconf >/dev/null || {
+    if ! command -v autoreconf >/dev/null || \
+       ! command -v automake >/dev/null; then
         echo "Install or load Autoconf, Automake, and Libtool, then retry." >&2
         exit 1
-    }
+    fi
+
+    # Autoconf searches the source directory and its parents for install-sh or
+    # install.sh when choosing an auxiliary-file directory. From a fresh clone,
+    # it otherwise mistakes soap-tp's root install.sh for ELPA's helper and
+    # sends ltmain.sh two directories above the ELPA source. Seed ELPA with
+    # Automake's canonical helper so all generated files stay in the submodule.
+    AUTOMAKE_LIBDIR="$(automake --print-libdir)"
+    if [[ ! -f "${AUTOMAKE_LIBDIR}/install-sh" ]]; then
+        echo "Automake install-sh was not found under ${AUTOMAKE_LIBDIR}." >&2
+        exit 1
+    fi
+    if [[ ! -f "${SOURCE}/install-sh" ]]; then
+        cp "${AUTOMAKE_LIBDIR}/install-sh" "${SOURCE}/install-sh"
+    fi
+
     (cd "${SOURCE}" && ./autogen.sh)
 fi
 
