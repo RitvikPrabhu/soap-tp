@@ -28,6 +28,7 @@ jobs:
           python -m unittest
           tests.unit.test_preconditioners
           tests.unit.test_optimizer
+          tests.unit.test_soap
 
   cpu-bootstrap:
     runs-on: ubuntu-latest
@@ -65,17 +66,25 @@ jobs:
       - name: Verify the installed checkout and native backends
         run: |
           .venv/bin/python - <<'PY'
+          import inspect
           from pathlib import Path
 
           import soap_tp
+          import torch
+          import torch.distributed as dist
           from soap_tp import elpa_bindings, slate_bindings
 
           root = Path.cwd().resolve()
           package = Path(soap_tp.__file__).resolve()
           if root not in package.parents:
               raise SystemExit(f"soap_tp is not editable from {root}: {package}")
+          if "group_peer" not in inspect.signature(dist.P2POp).parameters:
+              raise SystemExit(
+                  f"PyTorch {torch.__version__} lacks P2POp(group_peer=...)"
+              )
           assert elpa_bindings.compiled_gpu_backend() == "none"
           assert slate_bindings.compiled_gpu_backend() == "none"
+          print(f"PyTorch: {torch.__version__}")
           print(f"editable package: {package}")
           PY
       - name: Run the complete unit suite

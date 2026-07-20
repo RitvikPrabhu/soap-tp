@@ -31,7 +31,7 @@ Environment:
   PYTHON            Use this Python instead of creating .venv.
   BOOTSTRAP_PYTHON  Python used to create .venv (default: python3).
   SOAP_TP_VENV      Virtual-environment path (default: <repo>/.venv).
-  TORCH_INDEX_URL   PyTorch wheel index. Required for automatic GPU setup.
+  TORCH_INDEX_URL   PyTorch 2.6+ wheel index. Required for automatic GPU setup.
 
 Additional options are forwarded to scripts/install.sh and then pip.
 System MPI/compiler prerequisites are listed when they are missing.
@@ -146,9 +146,38 @@ if ! "${PYTHON_BIN}" -m pip --version >/dev/null 2>&1; then
     "${PYTHON_BIN}" -m ensurepip --upgrade
 fi
 
-if ! "${PYTHON_BIN}" -c "import torch" >/dev/null 2>&1; then
-    echo "Installing PyTorch for the ${PROFILE} profile."
-    TORCH_ARGS=(torch)
+PYTORCH_REQUIREMENT="torch>=2.6"
+
+pytorch_is_compatible() {
+    "${PYTHON_BIN}" - <<'PY'
+import inspect
+
+try:
+    import torch.distributed as dist
+except ImportError:
+    raise SystemExit(1)
+
+raise SystemExit(
+    "group_peer" not in inspect.signature(dist.P2POp).parameters
+)
+PY
+}
+
+if ! pytorch_is_compatible; then
+    # Older virtualenvs can start with pip versions that reject normalized
+    # dependency names on the PyTorch wheel index and silently backtrack to an
+    # incompatible torch release.
+    "${PYTHON_BIN}" -m pip install --upgrade pip
+
+    if "${PYTHON_BIN}" -c "import torch" >/dev/null 2>&1; then
+        TORCH_VERSION="$("${PYTHON_BIN}" -c \
+            'import torch; print(torch.__version__)')"
+        echo "Upgrading incompatible PyTorch ${TORCH_VERSION} for ${PROFILE}."
+    else
+        echo "Installing PyTorch for the ${PROFILE} profile."
+    fi
+
+    TORCH_ARGS=("${PYTORCH_REQUIREMENT}")
     if [[ -n "${TORCH_INDEX_URL:-}" ]]; then
         TORCH_ARGS+=(--index-url "${TORCH_INDEX_URL}")
     elif [[ "${PROFILE}" == "cpu" && "$(uname -s)" == "Linux" ]]; then
@@ -159,9 +188,17 @@ if ! "${PYTHON_BIN}" -c "import torch" >/dev/null 2>&1; then
         echo "correct PyTorch build before rerunning this command." >&2
         exit 1
     fi
-    "${PYTHON_BIN}" -m pip install "${TORCH_ARGS[@]}"
+    "${PYTHON_BIN}" -m pip install --upgrade "${TORCH_ARGS[@]}"
 else
-    echo "Reusing PyTorch from ${PYTHON_BIN}"
+    TORCH_VERSION="$("${PYTHON_BIN}" -c 'import torch; print(torch.__version__)')"
+    echo "Reusing compatible PyTorch ${TORCH_VERSION} from ${PYTHON_BIN}"
+fi
+
+if ! pytorch_is_compatible; then
+    TORCH_VERSION="$("${PYTHON_BIN}" -c \
+        'import torch; print(torch.__version__)' 2>/dev/null || echo unavailable)"
+    echo "soap-tp requires PyTorch 2.6 or newer; found ${TORCH_VERSION}." >&2
+    exit 1
 fi
 
 "${PYTHON_BIN}" -m pip install \
