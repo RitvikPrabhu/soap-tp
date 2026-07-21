@@ -184,6 +184,11 @@ build_elpa() {
                 echo "The active ROCm environment does not expose librocblas." >&2
                 exit 1
             fi
+            if [[ -x "${rocm_root}/bin/hipcc" ]]; then
+                PATH="${rocm_root}/bin:${PATH}"
+                HIPCC="${rocm_root}/bin/hipcc"
+                export PATH HIPCC
+            fi
             CPPFLAGS="${CPPFLAGS:+${CPPFLAGS} }-I${rocm_root}/include"
             LDFLAGS="${LDFLAGS:+${LDFLAGS} }-L${rocm_libdir}"
             export CPPFLAGS LDFLAGS
@@ -211,6 +216,11 @@ build_elpa() {
             if [[ -z "${cuda_libdir}" ]]; then
                 echo "The active CUDA environment does not expose libcublas." >&2
                 exit 1
+            fi
+            if [[ -x "${cuda_root}/bin/nvcc" ]]; then
+                PATH="${cuda_root}/bin:${PATH}"
+                NVCC="${cuda_root}/bin/nvcc"
+                export PATH NVCC
             fi
             configure_args+=("--with-cuda-path=${cuda_root}")
             CPPFLAGS="${CPPFLAGS:+${CPPFLAGS} }-I${cuda_root}/include"
