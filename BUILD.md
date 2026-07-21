@@ -7,8 +7,9 @@ versions are machine-specific.
 
 ## Two-command setup
 
-The top-level installer owns the complete development environment. From a fresh
-checkout, CPU setup is:
+The top-level installer owns the complete development environment. It fetches
+submodules only for native libraries that it builds. From a fresh checkout,
+CPU setup is:
 
 ```bash
 git clone https://github.com/RitvikPrabhu/soap-tp.git && cd soap-tp
@@ -16,10 +17,10 @@ git clone https://github.com/RitvikPrabhu/soap-tp.git && cd soap-tp
 ```
 
 It creates or reuses `.venv`, installs CPU PyTorch and the remaining Python
-dependencies, initializes all submodules recursively, builds a
-ScaLAPACK/OpenBLAS fallback when the machine does not provide one, builds ELPA
-and SLATE, compiles both extensions, and installs the checkout in editable mode.
-It is safe to rerun and reuses completed native builds.
+dependencies, fetches sources for the native libraries selected for building,
+builds a ScaLAPACK/OpenBLAS fallback when the machine does not provide one,
+builds ELPA and SLATE, compiles both extensions, and installs the checkout in
+editable mode. It is safe to rerun and reuses completed native builds.
 
 Activate the resulting environment when working in a new shell:
 
@@ -136,6 +137,13 @@ installations without recompiling either solver:
 
 Each flag can also be used independently. A skipped solver must already exist
 at its selected prefix.
+
+The same flags select libraries supplied by environment modules. Load the
+module, pass its installation prefix, and skip that build:
+
+```bash
+SLATE_PREFIX=/path/exposed/by/the/module ./install.sh rocm --skip-slate
+```
 
 Additional arguments are forwarded to `pip install`, so `--user` and similar
 site options remain available.
@@ -256,9 +264,20 @@ initializing two OpenMP runtimes in one Python process.
 
 ## Lower-level scripts
 
-`scripts/build_elpa.sh` builds ELPA without installing the Python package.
-`scripts/build_slate.sh` builds SLATE, BLAS++, and LAPACK++ without installing
-the Python package.
-`scripts/build_math_deps.sh` builds only the pinned OpenBLAS/ScaLAPACK fallback.
-They are primarily useful for troubleshooting; a normal installation should use
-the top-level `./install.sh`.
+`scripts/build_native.sh` builds any requested combination of ELPA, SLATE, and
+the pinned OpenBLAS/ScaLAPACK fallback without installing the Python package.
+It is primarily useful for troubleshooting; a normal installation should use
+the top-level `./install.sh`, which requests only libraries not selected with a
+`--skip-*` option.
+
+After installation, use `scripts/rebuild_bindings.sh` for incremental pybind
+development. The installer records its profile, native prefixes, Python, and
+compiler wrappers in `build/bindings.env`, so rebuilding performs no dependency
+discovery and can be called from any working directory. For example:
+
+```bash
+/path/to/soap-tp/scripts/rebuild_bindings.sh
+```
+
+Pass `--force` when a compiler flag changed or a full extension rebuild is
+otherwise required. Ordinary C++ source changes are detected incrementally.

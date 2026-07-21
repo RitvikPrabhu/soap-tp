@@ -18,6 +18,7 @@ Examples:
   ./scripts/install.sh rocm --editable
   ./scripts/install.sh cpu --skip-elpa
   ./scripts/install.sh cpu --skip-slate
+  SLATE_PREFIX=/module/slate/prefix ./scripts/install.sh rocm --skip-slate
   PYTHON=$HOME/venvs/soap/bin/python ./scripts/install.sh cuda
 
 Before running on a cluster, load its compiler, MPI, and (for GPU builds)
@@ -145,6 +146,7 @@ echo "MPI Fortran compiler: ${FC}"
 echo "ELPA prefix: ${ELPA_PREFIX}"
 echo "SLATE prefix: ${SLATE_PREFIX}"
 
+NATIVE_TARGETS=()
 if [[ "${SKIP_ELPA}" == "1" ]]; then
     if [[ ! -d "${ELPA_PREFIX}/include" ]]; then
         echo "--skip-elpa was requested, but ${ELPA_PREFIX} is not installed." >&2
@@ -152,7 +154,7 @@ if [[ "${SKIP_ELPA}" == "1" ]]; then
     fi
     echo "Using the existing ELPA installation."
 else
-    "${ROOT}/scripts/build_elpa.sh" "${PROFILE}"
+    NATIVE_TARGETS+=(elpa)
 fi
 
 if [[ "${SKIP_SLATE}" == "1" ]]; then
@@ -164,7 +166,11 @@ if [[ "${SKIP_SLATE}" == "1" ]]; then
     fi
     echo "Using the existing SLATE installation."
 else
-    "${ROOT}/scripts/build_slate.sh" "${PROFILE}"
+    NATIVE_TARGETS+=(slate)
+fi
+
+if (( ${#NATIVE_TARGETS[@]} > 0 )); then
+    "${ROOT}/scripts/build_native.sh" "${PROFILE}" "${NATIVE_TARGETS[@]}"
 fi
 
 export SOAP_TP_BUILD_ELPA_BINDINGS=1
@@ -206,3 +212,18 @@ print(
 
 echo "Keep ${ELPA_PREFIX} available: the installed extension loads ELPA from there."
 echo "Keep ${SLATE_PREFIX} available: the installed extension loads SLATE from there."
+
+BUILD_CONFIG="${SOAP_TP_BUILD_CONFIG:-${SOAP_TP_BUILD_ROOT}/bindings.env}"
+BUILD_CONFIG_TEMP="${BUILD_CONFIG}.tmp.$$"
+mkdir -p "$(dirname "${BUILD_CONFIG}")"
+{
+    printf 'export SOAP_TP_PROFILE=%q\n' "${PROFILE}"
+    printf 'export SOAP_TP_PYTHON=%q\n' "${PYTHON}"
+    printf 'export ELPA_PREFIX=%q\n' "${ELPA_PREFIX}"
+    printf 'export SLATE_PREFIX=%q\n' "${SLATE_PREFIX}"
+    printf 'export CC=%q\n' "${CC}"
+    printf 'export CXX=%q\n' "${CXX}"
+    printf 'export FC=%q\n' "${FC}"
+} >"${BUILD_CONFIG_TEMP}"
+mv "${BUILD_CONFIG_TEMP}" "${BUILD_CONFIG}"
+echo "Binding build configuration: ${BUILD_CONFIG}"

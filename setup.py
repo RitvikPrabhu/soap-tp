@@ -125,14 +125,16 @@ def slate_extension() -> Extension:
     elif profile == "rocm":
         define_macros.append(("SOAP_TP_SLATE_WITH_ROCM", "1"))
 
-    # Link SLATE's BLAS++ and LAPACK++ dependencies explicitly so the extension
-    # resolves the same native stack selected by SLATE_PREFIX.
+    # The binding calls SLATE, so it links only libslate. SLATE's own dynamic
+    # dependency metadata is responsible for BLAS++, LAPACK++, BLAS, LAPACK,
+    # MPI, and the selected GPU runtime. This works for both self-built and
+    # module-provided installations without duplicating their package layout.
     return Extension(
         "soap_tp.slate_bindings",
         sources=["src/soap_tp/csrc/slate_bindings.cpp"],
         include_dirs=[PYBIND11_INCLUDE, str(include_dir)],
         library_dirs=[str(library_dir)],
-        libraries=["slate", "lapackpp", "blaspp"],
+        libraries=["slate"],
         define_macros=define_macros,
         language="c++",
         extra_compile_args=["-std=c++17"],

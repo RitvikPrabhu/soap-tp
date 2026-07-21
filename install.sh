@@ -2,7 +2,8 @@
 
 # Bootstrap a complete development installation from a fresh clone. Native
 # solver details remain in scripts/install.sh; this wrapper owns the virtual
-# environment, Python dependencies, and recursive submodule initialization.
+# environment and Python dependencies. Native build scripts initialize only
+# the submodules needed for libraries that are not supplied externally.
 set -eo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,14 +13,15 @@ usage() {
     cat <<'EOF'
 Usage: ./install.sh [cpu|cuda|rocm] [options]
 
-Creates or reuses .venv, installs Python dependencies, initializes every Git
-submodule, builds the native libraries, and installs soap-tp in editable mode.
+Creates or reuses .venv, installs Python dependencies, builds the selected
+native libraries, and installs soap-tp in editable mode.
 
 Examples:
   ./install.sh cpu
   TORCH_INDEX_URL=https://download.pytorch.org/whl/cuXXX ./install.sh cuda
   TORCH_INDEX_URL=https://download.pytorch.org/whl/rocmX.Y ./install.sh rocm
   ./install.sh cpu --skip-elpa --skip-slate
+  SLATE_PREFIX=/module/slate/prefix ./install.sh rocm --skip-slate
 
 Options:
   --no-editable    Install a snapshot instead of linking the checkout.
@@ -50,23 +52,35 @@ esac
 shift $(( $# > 0 ? 1 : 0 ))
 
 EDITABLE=1
+SKIP_ELPA=0
+SKIP_SLATE=0
 INSTALL_ARGS=()
 for argument in "$@"; do
     case "${argument}" in
         -h|--help) usage; exit 0 ;;
         --no-editable) EDITABLE=0 ;;
         --editable) EDITABLE=1 ;;
+        --skip-elpa) SKIP_ELPA=1; INSTALL_ARGS+=("${argument}") ;;
+        --skip-slate) SKIP_SLATE=1; INSTALL_ARGS+=("${argument}") ;;
         *) INSTALL_ARGS+=("${argument}") ;;
     esac
 done
 
 missing_tools=()
-for tool in git cmake make autoreconf automake; do
+required_tools=()
+if [[ "${SKIP_ELPA}" == "0" ]]; then
+    required_tools+=(git cmake make autoreconf automake)
+fi
+if [[ "${SKIP_SLATE}" == "0" ]]; then
+    required_tools+=(git cmake)
+fi
+for tool in "${required_tools[@]}"; do
     if ! command -v "${tool}" >/dev/null 2>&1; then
         missing_tools+=("${tool}")
     fi
 done
-if ! command -v libtoolize >/dev/null 2>&1 && \
+if [[ "${SKIP_ELPA}" == "0" ]] && \
+   ! command -v libtoolize >/dev/null 2>&1 && \
    ! command -v glibtoolize >/dev/null 2>&1; then
     missing_tools+=("libtool")
 fi
@@ -209,8 +223,6 @@ fi
     ninja \
     mpi4py \
     matplotlib
-
-git -C "${ROOT}" submodule update --init --recursive
 
 NATIVE_ARGS=("${PROFILE}")
 if [[ "${EDITABLE}" == "1" ]]; then
