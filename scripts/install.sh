@@ -119,6 +119,7 @@ fi
 # module. Ask the active C++ wrapper for its own library search path so native
 # modules and pybind extensions use one compatible ABI.
 SOAP_TP_CXX_LIBRARY_PATH=""
+SOAP_TP_CXX_RUNTIME=""
 if [[ "$(uname -s)" == "Linux" ]]; then
     compiler_library_path="$(
         "${CXX}" -print-search-dirs 2>/dev/null | \
@@ -137,6 +138,32 @@ if [[ "$(uname -s)" == "Linux" ]]; then
         fi
     done
     IFS="${old_ifs}"
+
+    if command -v readelf >/dev/null 2>&1; then
+        probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/soap-tp-cxx-runtime.XXXXXX")"
+        printf '%s\n' 'int main(void) { return 0; }' | \
+            "${CC}" -x c -o "${probe_dir}/c-probe" - >/dev/null 2>&1 || true
+        printf '%s\n' '#include <iostream>' \
+            'int main() { std::cout << 0; return 0; }' | \
+            "${CXX}" -x c++ -o "${probe_dir}/cxx-probe" - >/dev/null 2>&1 || true
+        if [[ -x "${probe_dir}/c-probe" && -x "${probe_dir}/cxx-probe" ]]; then
+            c_dependencies="$(LC_ALL=C readelf -d "${probe_dir}/c-probe" | \
+                sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p')"
+            while IFS= read -r dependency; do
+                [[ -n "${dependency}" ]] || continue
+                if printf '%s\n' "${c_dependencies}" | grep -Fxq "${dependency}"; then
+                    continue
+                fi
+                runtime_path="$("${CXX}" -print-file-name="${dependency}" 2>/dev/null || true)"
+                if [[ "${runtime_path}" == /* && -f "${runtime_path}" ]]; then
+                    SOAP_TP_CXX_RUNTIME="$(readlink -f "${runtime_path}")"
+                    break
+                fi
+            done < <(LC_ALL=C readelf -d "${probe_dir}/cxx-probe" | \
+                sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p')
+        fi
+        rm -rf -- "${probe_dir}"
+    fi
 fi
 if [[ -n "${SOAP_TP_CXX_LIBRARY_PATH}" ]]; then
     case ":${LD_LIBRARY_PATH:-}:" in
@@ -145,7 +172,14 @@ if [[ -n "${SOAP_TP_CXX_LIBRARY_PATH}" ]]; then
     esac
     export LD_LIBRARY_PATH
 fi
-export SOAP_TP_CXX_LIBRARY_PATH
+if [[ -n "${SOAP_TP_CXX_RUNTIME}" ]]; then
+    case ":${LD_PRELOAD:-}:" in
+        *":${SOAP_TP_CXX_RUNTIME}:"*) ;;
+        *) LD_PRELOAD="${SOAP_TP_CXX_RUNTIME}${LD_PRELOAD:+:${LD_PRELOAD}}" ;;
+    esac
+    export LD_PRELOAD
+fi
+export SOAP_TP_CXX_LIBRARY_PATH SOAP_TP_CXX_RUNTIME
 
 if [[ "${PROFILE}" == "cuda" ]] && \
    ! command -v nvcc >/dev/null 2>&1 && \
@@ -222,6 +256,9 @@ echo "MPI C++ compiler: ${CXX}"
 echo "MPI Fortran compiler: ${FC}"
 if [[ -n "${SOAP_TP_CXX_LIBRARY_PATH}" ]]; then
     echo "C++ library path: ${SOAP_TP_CXX_LIBRARY_PATH}"
+fi
+if [[ -n "${SOAP_TP_CXX_RUNTIME}" ]]; then
+    echo "C++ runtime: ${SOAP_TP_CXX_RUNTIME}"
 fi
 echo "ELPA prefix: ${ELPA_PREFIX}"
 echo "SLATE prefix: ${SLATE_PREFIX}"
@@ -305,10 +342,17 @@ mkdir -p "$(dirname "${BUILD_CONFIG}")"
     printf 'export CXX=%q\n' "${CXX}"
     printf 'export FC=%q\n' "${FC}"
     printf 'export SOAP_TP_CXX_LIBRARY_PATH=%q\n' "${SOAP_TP_CXX_LIBRARY_PATH}"
+    printf 'export SOAP_TP_CXX_RUNTIME=%q\n' "${SOAP_TP_CXX_RUNTIME}"
     if [[ -n "${SOAP_TP_CXX_LIBRARY_PATH}" ]]; then
         printf '%s\n' 'case ":${LD_LIBRARY_PATH:-}:" in'
         printf '%s\n' '    *":${SOAP_TP_CXX_LIBRARY_PATH}:"*) ;;'
         printf '%s\n' '    *) export LD_LIBRARY_PATH="${SOAP_TP_CXX_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ;;'
+        printf '%s\n' 'esac'
+    fi
+    if [[ -n "${SOAP_TP_CXX_RUNTIME}" ]]; then
+        printf '%s\n' 'case ":${LD_PRELOAD:-}:" in'
+        printf '%s\n' '    *":${SOAP_TP_CXX_RUNTIME}:"*) ;;'
+        printf '%s\n' '    *) export LD_PRELOAD="${SOAP_TP_CXX_RUNTIME}${LD_PRELOAD:+:${LD_PRELOAD}}" ;;'
         printf '%s\n' 'esac'
     fi
 } >"${BUILD_CONFIG_TEMP}"
