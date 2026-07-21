@@ -207,7 +207,8 @@ fi
     "pybind11>=2.11" \
     numpy \
     ninja \
-    mpi4py
+    mpi4py \
+    matplotlib
 
 git -C "${ROOT}" submodule update --init --recursive
 

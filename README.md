@@ -34,11 +34,39 @@ TORCH_INDEX_URL="<site ROCm wheel index>" ./install.sh rocm
 See [BUILD.md](BUILD.md) for system prerequisites, cluster modules, GPU
 architecture options, installation prefixes, and troubleshooting.
 
-## Current SOAP building blocks
+## SOAP step
 
-The repository now provides the operations needed to assemble a SOAP pipeline;
-it intentionally does not hide them behind an optimizer class yet. Import the
-supported surface from `soap_tp.ops`:
+`soap_tp.soap_step` is the framework-neutral entry point for a tensor-parallel
+optimizer integration. Give it a local gradient shard and a persistent
+per-parameter state dictionary:
+
+```python
+from soap_tp import soap_step
+
+soap_state = {}
+
+update_shard = soap_step(
+    gradient_shard,
+    soap_state,
+    global_shape=(rows, columns),
+    shard_dim=1,
+    block_size=128,
+    process_grid_shape=(2, 4),
+)
+local_parameter.add_(
+    update_shard.to(local_parameter.dtype),
+    alpha=-learning_rate,
+)
+```
+
+Reuse the same `soap_state` dictionary for that parameter on every step. The
+function allocates distributed state on its first call, initializes and
+refreshes the bases at the configured interval, and returns the normalized
+local update. Its first call is a warmup that returns zero, matching the
+[original public SOAP optimizer](https://github.com/nikhilvyas/SOAP/blob/main/soap.py).
+It has no Megatron or other training-framework dependency.
+
+The lower-level operations remain available from `soap_tp.ops`:
 
 - allocate packed, column-major 2D block-cyclic buffers;
 - update `G @ G.T` and `G.T @ G` preconditioners with an EMA;
@@ -54,12 +82,13 @@ Both contiguous row shards (`shard_dim=0`) and contiguous column shards
 
 ```text
 TP gradient shard
-  -> update left/right preconditioners
   -> redistribute to packed 2D block-cyclic storage
   -> rotate forward
   -> Adam update
   -> rotate backward
   -> redistribute to the original TP shard layout
+  -> update left/right preconditioners
+  -> refresh bases when due
 ```
 
 At initialization, call `initialize_basis_2d_block_cyclic_` once for each
@@ -83,5 +112,4 @@ The first pipeline should keep these constraints explicit:
 - packed native buffers use `float32` and should be created with
   `allocate_2d_block_cyclic`.
 
-There is no command-line entry point yet. The next layer can be a small
-pipeline that owns these buffers and calls the operations in the order above.
+Every rank must call `soap_step` for parameters in the same collective order.
