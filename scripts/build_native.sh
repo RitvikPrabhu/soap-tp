@@ -66,6 +66,33 @@ else
 fi
 export CC="${MPI_CC}" CXX="${MPI_CXX}" FC="${MPI_FC}"
 
+discover_library_dir_flags() {
+    local candidate
+    local directory
+    local flags=""
+    local library
+    local search_path
+    local IFS=:
+
+    search_path="${CMAKE_PREFIX_PATH:-}:${LIBRARY_PATH:-}:${LD_LIBRARY_PATH:-}"
+    for candidate in ${search_path}; do
+        [[ -n "${candidate}" ]] || continue
+        for directory in "${candidate}" "${candidate}/lib" "${candidate}/lib64"; do
+            [[ -d "${directory}" ]] || continue
+            for library in "$@"; do
+                if compgen -G "${directory}/lib${library}.*" >/dev/null; then
+                    case " ${flags} " in
+                        *" -L${directory} "*) ;;
+                        *) flags="${flags:+${flags} }-L${directory}" ;;
+                    esac
+                    break
+                fi
+            done
+        done
+    done
+    printf '%s\n' "${flags}"
+}
+
 fix_openblas_install_name() {
     if [[ "$(uname -s)" != "Darwin" ]]; then
         return
@@ -142,6 +169,8 @@ build_elpa() {
     local cuda_libdir=""
     local cuda_root=""
     local flags
+    local library_dir_flags
+    local library_dir_args=()
     local rocm_libdir=""
     local rocm_root=""
     local configure_args=(--prefix="${prefix}" --with-mpi=yes --with-test-programs=no)
@@ -269,6 +298,10 @@ build_elpa() {
 
     if [[ -z "${SCALAPACK_LDFLAGS:-}" ]]; then
         mkdir -p "${BUILD_ROOT}"
+        library_dir_flags="$(discover_library_dir_flags scalapack openblas)"
+        if [[ -n "${library_dir_flags}" ]]; then
+            read -r -a library_dir_args <<<"${library_dir_flags}"
+        fi
         cat >"${BUILD_ROOT}/scalapack_probe.f90" <<'EOF'
 program probe
   call blacs_pinfo(i, n)
@@ -285,9 +318,10 @@ EOF
             "-lmpiscalapack -llapack -lblas"; do
             read -r -a link_flags <<<"${flags}"
             if "${MPI_FC}" "${BUILD_ROOT}/scalapack_probe.f90" \
-                "${link_flags[@]}" -o "${BUILD_ROOT}/scalapack_probe" \
+                "${library_dir_args[@]}" "${link_flags[@]}" \
+                -o "${BUILD_ROOT}/scalapack_probe" \
                 >/dev/null 2>&1; then
-                SCALAPACK_LDFLAGS="${flags}"
+                SCALAPACK_LDFLAGS="${library_dir_flags:+${library_dir_flags} }${flags}"
                 break
             fi
         done
@@ -297,6 +331,17 @@ EOF
         SCALAPACK_LDFLAGS="-L${MATH_PREFIX}/lib -lscalapack ${MATH_PREFIX}/lib/libopenblas.a"
     fi
     export SCALAPACK_LDFLAGS
+    for flags in ${SCALAPACK_LDFLAGS}; do
+        case "${flags}" in
+            -L*)
+                case " ${LDFLAGS:-} " in
+                    *" ${flags} "*) ;;
+                    *) LDFLAGS="${LDFLAGS:+${LDFLAGS} }${flags}" ;;
+                esac
+                ;;
+        esac
+    done
+    export LDFLAGS
 
     mkdir -p "${build}" "${prefix}"
     (cd "${build}" && "${source}/configure" "${configure_args[@]}")
