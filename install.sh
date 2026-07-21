@@ -18,10 +18,10 @@ native libraries, and installs soap-tp in editable mode.
 
 Examples:
   ./install.sh cpu
-  TORCH_INDEX_URL=https://download.pytorch.org/whl/cuXXX ./install.sh cuda
-  TORCH_INDEX_URL=https://download.pytorch.org/whl/rocmX.Y ./install.sh rocm
+  ./install.sh cuda
+  ./install.sh rocm
   ./install.sh cpu --skip-elpa --skip-slate
-  SLATE_PREFIX=/module/slate/prefix ./install.sh rocm --skip-slate
+  ./install.sh rocm --skip-slate
 
 Options:
   --no-editable    Install a snapshot instead of linking the checkout.
@@ -33,7 +33,7 @@ Environment:
   PYTHON            Use this Python instead of creating .venv.
   BOOTSTRAP_PYTHON  Python used to create .venv (default: python3).
   SOAP_TP_VENV      Virtual-environment path (default: <repo>/.venv).
-  TORCH_INDEX_URL   PyTorch 2.6+ wheel index. Required for automatic GPU setup.
+  TORCH_INDEX_URL   Override the automatically selected PyTorch wheel index.
 
 Additional options are forwarded to scripts/install.sh and then pip.
 System MPI/compiler prerequisites are listed when they are missing.
@@ -162,6 +162,46 @@ fi
 
 PYTORCH_REQUIREMENT="torch>=2.6"
 
+detect_toolkit_version() {
+    local version=""
+
+    case "${PROFILE}" in
+        rocm)
+            if command -v hipconfig >/dev/null 2>&1; then
+                version="$(hipconfig --version 2>/dev/null | \
+                    grep -Eo '[0-9]+[.][0-9]+([.][0-9]+)?' | head -n 1 || true)"
+            fi
+            if [[ -z "${version}" && -n "${ROCM_PATH:-}" ]]; then
+                version="$(printf '%s\n' "${ROCM_PATH}" | \
+                    grep -Eo '[0-9]+[.][0-9]+([.][0-9]+)?' | head -n 1 || true)"
+            fi
+            ;;
+        cuda)
+            if command -v nvcc >/dev/null 2>&1; then
+                version="$(nvcc --version 2>/dev/null | sed -n \
+                    's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n 1)"
+            fi
+            ;;
+    esac
+    printf '%s\n' "${version}"
+}
+
+automatic_torch_index() {
+    local major
+    local minor
+    local version
+
+    version="$(detect_toolkit_version)"
+    [[ -n "${version}" ]] || return 1
+    major="${version%%.*}"
+    minor="${version#*.}"
+    minor="${minor%%.*}"
+    case "${PROFILE}" in
+        rocm) printf 'https://download.pytorch.org/whl/rocm%s.%s\n' "${major}" "${minor}" ;;
+        cuda) printf 'https://download.pytorch.org/whl/cu%s%s\n' "${major}" "${minor}" ;;
+    esac
+}
+
 pytorch_is_compatible() {
     "${PYTHON_BIN}" - <<'PY'
 import inspect
@@ -196,10 +236,13 @@ if ! pytorch_is_compatible; then
         TORCH_ARGS+=(--index-url "${TORCH_INDEX_URL}")
     elif [[ "${PROFILE}" == "cpu" && "$(uname -s)" == "Linux" ]]; then
         TORCH_ARGS+=(--index-url "https://download.pytorch.org/whl/cpu")
+    elif [[ "${PROFILE}" != "cpu" ]] && \
+         TORCH_INDEX_URL="$(automatic_torch_index)"; then
+        echo "Using PyTorch index ${TORCH_INDEX_URL}"
+        TORCH_ARGS+=(--index-url "${TORCH_INDEX_URL}")
     elif [[ "${PROFILE}" != "cpu" ]]; then
-        echo "Set TORCH_INDEX_URL to the CUDA or ROCm wheel index supplied" >&2
-        echo "for this machine, or activate an environment containing the" >&2
-        echo "correct PyTorch build before rerunning this command." >&2
+        echo "Unable to determine the active ${PROFILE} toolkit version." >&2
+        echo "Load the toolkit or set TORCH_INDEX_URL explicitly." >&2
         exit 1
     fi
     "${PYTHON_BIN}" -m pip install --upgrade "${TORCH_ARGS[@]}"

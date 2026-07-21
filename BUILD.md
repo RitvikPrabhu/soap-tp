@@ -56,9 +56,9 @@ environment or install PyTorch:
 PYTHON="$HOME/venvs/soap/bin/python" ./scripts/install.sh cpu --editable
 ```
 
-CUDA/ROCm PyTorch distributions are cluster-specific, so the bootstrap never
-guesses a GPU wheel index. It reuses PyTorch from the selected environment or
-installs from an explicitly supplied `TORCH_INDEX_URL`.
+The bootstrap reuses PyTorch from the selected environment or derives the
+PyTorch wheel index from the active CUDA or ROCm toolkit. `TORCH_INDEX_URL`
+remains available as an override.
 
 ## GPU clusters
 
@@ -67,14 +67,14 @@ CUDA profile:
 
 ```bash
 module load <site-compiler> <site-mpi> <site-cuda>
-TORCH_INDEX_URL="<site CUDA wheel index>" ./install.sh cuda
+./install.sh cuda
 ```
 
 For an AMD cluster, load MPI and ROCm and select the ROCm profile:
 
 ```bash
 module load <site-compiler> <site-mpi> <site-rocm>
-TORCH_INDEX_URL="<site ROCm wheel index>" ./install.sh rocm
+./install.sh rocm
 ```
 
 The module commands are placeholders; use the names documented by each cluster.
@@ -88,7 +88,7 @@ unsuitable:
 ```bash
 ELPA_CONFIGURE_ARGS="--with-NVIDIA-GPU-compute-capability=sm_80,sm_90" \
 SLATE_CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=80;90" \
-    TORCH_INDEX_URL="<site CUDA wheel index>" ./install.sh cuda
+    ./install.sh cuda
 ```
 
 Other site-specific ELPA configure options and SLATE CMake definitions can be
@@ -121,7 +121,7 @@ prefixes:
 ELPA_PREFIX="$HOME/.local/soap-tp/elpa/cuda" \
 SLATE_PREFIX="$HOME/.local/soap-tp/slate/cuda" \
 MATH_PREFIX="$HOME/.local/soap-tp/math" \
-    TORCH_INDEX_URL="<site CUDA wheel index>" ./install.sh cuda
+    ./install.sh cuda
 ```
 
 The same command can be rerun after source changes; completed native build work
@@ -139,10 +139,11 @@ Each flag can also be used independently. A skipped solver must already exist
 at its selected prefix.
 
 The same flags select libraries supplied by environment modules. Load the
-module, pass its installation prefix, and skip that build:
+module and skip that build; the prefix is discovered from the active package
+search path:
 
 ```bash
-SLATE_PREFIX=/path/exposed/by/the/module ./install.sh rocm --skip-slate
+./install.sh rocm --skip-slate
 ```
 
 Additional arguments are forwarded to `pip install`, so `--user` and similar

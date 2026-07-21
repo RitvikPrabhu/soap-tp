@@ -18,7 +18,6 @@ Examples:
   ./scripts/install.sh rocm --editable
   ./scripts/install.sh cpu --skip-elpa
   ./scripts/install.sh cpu --skip-slate
-  SLATE_PREFIX=/module/slate/prefix ./scripts/install.sh rocm --skip-slate
   PYTHON=$HOME/venvs/soap/bin/python ./scripts/install.sh cuda
 
 Before running on a cluster, load its compiler, MPI, and (for GPU builds)
@@ -90,26 +89,26 @@ if [[ -n "${CC:-}" && -n "${CXX:-}" && -n "${FC:-}" ]]; then
     export CC CXX FC
 elif [[ -n "${CC:-}" || -n "${CXX:-}" || -n "${FC:-}" ]]; then
     echo "Ignoring an incomplete CC/CXX/FC override and selecting MPI wrappers."
-    if command -v mpicc >/dev/null 2>&1 && \
-       command -v mpicxx >/dev/null 2>&1 && \
-       command -v mpifort >/dev/null 2>&1; then
-        export CC=mpicc CXX=mpicxx FC=mpifort
-    elif command -v cc >/dev/null 2>&1 && \
+    if command -v cc >/dev/null 2>&1 && \
          command -v CC >/dev/null 2>&1 && \
          command -v ftn >/dev/null 2>&1; then
         export CC=cc CXX=CC FC=ftn
+    elif command -v mpicc >/dev/null 2>&1 && \
+         command -v mpicxx >/dev/null 2>&1 && \
+         command -v mpifort >/dev/null 2>&1; then
+        export CC=mpicc CXX=mpicxx FC=mpifort
     else
         echo "No complete MPI compiler wrapper triplet was found." >&2
         exit 1
     fi
-elif command -v mpicc >/dev/null 2>&1 && \
-     command -v mpicxx >/dev/null 2>&1 && \
-     command -v mpifort >/dev/null 2>&1; then
-    export CC=mpicc CXX=mpicxx FC=mpifort
 elif command -v cc >/dev/null 2>&1 && \
      command -v CC >/dev/null 2>&1 && \
      command -v ftn >/dev/null 2>&1; then
     export CC=cc CXX=CC FC=ftn
+elif command -v mpicc >/dev/null 2>&1 && \
+     command -v mpicxx >/dev/null 2>&1 && \
+     command -v mpifort >/dev/null 2>&1; then
+    export CC=mpicc CXX=mpicxx FC=mpifort
 else
     echo "No MPI compiler wrappers found." >&2
     echo "Load the cluster MPI module, or set CC, CXX, and FC explicitly." >&2
@@ -132,7 +131,53 @@ if [[ "${PROFILE}" == "rocm" ]] && \
     exit 1
 fi
 
+prefix_is_usable() {
+    local package="$1"
+    local prefix="$2"
+
+    case "${package}" in
+        elpa)
+            compgen -G "${prefix}/include/elpa-*/elpa/elpa.h" >/dev/null && \
+                { compgen -G "${prefix}/lib/libelpa.*" >/dev/null || \
+                  compgen -G "${prefix}/lib64/libelpa.*" >/dev/null; }
+            ;;
+        slate)
+            [[ -f "${prefix}/include/slate/slate.hh" ]] && \
+                { compgen -G "${prefix}/lib/libslate.*" >/dev/null || \
+                  compgen -G "${prefix}/lib64/libslate.*" >/dev/null; }
+            ;;
+    esac
+}
+
+discover_prefix() {
+    local package="$1"
+    local candidate
+    local pkgconfig_prefix
+    local IFS=:
+
+    if command -v pkg-config >/dev/null 2>&1 && \
+       pkgconfig_prefix="$(pkg-config --variable=prefix "${package}" 2>/dev/null)" && \
+       [[ -n "${pkgconfig_prefix}" ]] && \
+       prefix_is_usable "${package}" "${pkgconfig_prefix}"; then
+        printf '%s\n' "${pkgconfig_prefix}"
+        return
+    fi
+
+    for candidate in ${CMAKE_PREFIX_PATH:-}; do
+        if prefix_is_usable "${package}" "${candidate}"; then
+            printf '%s\n' "${candidate}"
+            return
+        fi
+    done
+}
+
 export SOAP_TP_BUILD_ROOT="${SOAP_TP_BUILD_ROOT:-${ROOT}/build}"
+if [[ "${SKIP_ELPA}" == "1" && -z "${ELPA_PREFIX:-}" ]]; then
+    ELPA_PREFIX="$(discover_prefix elpa)"
+fi
+if [[ "${SKIP_SLATE}" == "1" && -z "${SLATE_PREFIX:-}" ]]; then
+    SLATE_PREFIX="$(discover_prefix slate)"
+fi
 export ELPA_PREFIX="${ELPA_PREFIX:-${SOAP_TP_BUILD_ROOT}/elpa-install/${PROFILE}}"
 export SLATE_PREFIX="${SLATE_PREFIX:-${SOAP_TP_BUILD_ROOT}/slate-install/${PROFILE}}"
 export MATH_PREFIX="${MATH_PREFIX:-${SOAP_TP_BUILD_ROOT}/math-install}"
@@ -148,8 +193,9 @@ echo "SLATE prefix: ${SLATE_PREFIX}"
 
 NATIVE_TARGETS=()
 if [[ "${SKIP_ELPA}" == "1" ]]; then
-    if [[ ! -d "${ELPA_PREFIX}/include" ]]; then
-        echo "--skip-elpa was requested, but ${ELPA_PREFIX} is not installed." >&2
+    if ! prefix_is_usable elpa "${ELPA_PREFIX}"; then
+        echo "--skip-elpa was requested, but no usable ELPA installation" >&2
+        echo "was found in the active package search path." >&2
         exit 1
     fi
     echo "Using the existing ELPA installation."
@@ -158,10 +204,9 @@ else
 fi
 
 if [[ "${SKIP_SLATE}" == "1" ]]; then
-    if [[ ! -f "${SLATE_PREFIX}/include/slate/slate.hh" ]] || \
-       { ! compgen -G "${SLATE_PREFIX}/lib/libslate.*" >/dev/null && \
-         ! compgen -G "${SLATE_PREFIX}/lib64/libslate.*" >/dev/null; }; then
-        echo "--skip-slate was requested, but ${SLATE_PREFIX} is not installed." >&2
+    if ! prefix_is_usable slate "${SLATE_PREFIX}"; then
+        echo "--skip-slate was requested, but no usable SLATE installation" >&2
+        echo "was found in the active package search path." >&2
         exit 1
     fi
     echo "Using the existing SLATE installation."

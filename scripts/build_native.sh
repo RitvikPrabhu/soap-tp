@@ -48,18 +48,18 @@ if [[ -n "${CC:-}" && -n "${CXX:-}" && -n "${FC:-}" ]]; then
     MPI_CC="${CC}"
     MPI_CXX="${CXX}"
     MPI_FC="${FC}"
-elif command -v mpicc >/dev/null 2>&1 && \
-     command -v mpicxx >/dev/null 2>&1 && \
-     command -v mpifort >/dev/null 2>&1; then
-    MPI_CC=mpicc
-    MPI_CXX=mpicxx
-    MPI_FC=mpifort
 elif command -v cc >/dev/null 2>&1 && \
      command -v CC >/dev/null 2>&1 && \
      command -v ftn >/dev/null 2>&1; then
     MPI_CC=cc
     MPI_CXX=CC
     MPI_FC=ftn
+elif command -v mpicc >/dev/null 2>&1 && \
+     command -v mpicxx >/dev/null 2>&1 && \
+     command -v mpifort >/dev/null 2>&1; then
+    MPI_CC=mpicc
+    MPI_CXX=mpicxx
+    MPI_FC=mpifort
 else
     echo "Load an MPI compiler environment or set CC, CXX, and FC." >&2
     exit 1
@@ -139,8 +139,11 @@ build_elpa() {
     local prefix="${ELPA_PREFIX:-${BUILD_ROOT}/elpa-install/${PROFILE}}"
     local automake_libdir
     local candidate
+    local cuda_libdir=""
+    local cuda_root=""
     local flags
     local rocm_libdir=""
+    local rocm_root=""
     local configure_args=(--prefix="${prefix}" --with-mpi=yes --with-test-programs=no)
     local make_args=(-j"${JOBS}")
     local link_flags=()
@@ -167,21 +170,23 @@ build_elpa() {
                 --disable-avx2-kernels
                 --disable-avx512-kernels
             )
-            if [[ -n "${ROCM_PATH:-}" ]]; then
-                for candidate in "${ROCM_PATH}/lib" "${ROCM_PATH}/lib64"; do
-                    if compgen -G "${candidate}/librocblas.*" >/dev/null; then
-                        rocm_libdir="${candidate}"
-                        break
-                    fi
-                done
-                if [[ -z "${rocm_libdir}" ]]; then
-                    echo "ROCm is loaded, but librocblas was not found under ${ROCM_PATH}." >&2
-                    exit 1
-                fi
-                CPPFLAGS="${CPPFLAGS:+${CPPFLAGS} }-I${ROCM_PATH}/include"
-                LDFLAGS="${LDFLAGS:+${LDFLAGS} }-L${rocm_libdir}"
-                export CPPFLAGS LDFLAGS
+            rocm_root="${ROCM_PATH:-${HIP_PATH:-}}"
+            if [[ -z "${rocm_root}" ]] && command -v hipcc >/dev/null 2>&1; then
+                rocm_root="$(cd "$(dirname "$(command -v hipcc)")/.." && pwd)"
             fi
+            for candidate in "${rocm_root}/lib" "${rocm_root}/lib64"; do
+                if compgen -G "${candidate}/librocblas.*" >/dev/null; then
+                    rocm_libdir="${candidate}"
+                    break
+                fi
+            done
+            if [[ -z "${rocm_libdir}" ]]; then
+                echo "The active ROCm environment does not expose librocblas." >&2
+                exit 1
+            fi
+            CPPFLAGS="${CPPFLAGS:+${CPPFLAGS} }-I${rocm_root}/include"
+            LDFLAGS="${LDFLAGS:+${LDFLAGS} }-L${rocm_libdir}"
+            export CPPFLAGS LDFLAGS
             ;;
         cuda)
             configure_args+=(
@@ -193,6 +198,24 @@ build_elpa() {
                 --disable-avx2-kernels
                 --disable-avx512-kernels
             )
+            cuda_root="${CUDA_HOME:-${CUDA_PATH:-}}"
+            if [[ -z "${cuda_root}" ]] && command -v nvcc >/dev/null 2>&1; then
+                cuda_root="$(cd "$(dirname "$(command -v nvcc)")/.." && pwd)"
+            fi
+            for candidate in "${cuda_root}/lib64" "${cuda_root}/lib"; do
+                if compgen -G "${candidate}/libcublas.*" >/dev/null; then
+                    cuda_libdir="${candidate}"
+                    break
+                fi
+            done
+            if [[ -z "${cuda_libdir}" ]]; then
+                echo "The active CUDA environment does not expose libcublas." >&2
+                exit 1
+            fi
+            configure_args+=("--with-cuda-path=${cuda_root}")
+            CPPFLAGS="${CPPFLAGS:+${CPPFLAGS} }-I${cuda_root}/include"
+            LDFLAGS="${LDFLAGS:+${LDFLAGS} }-L${cuda_libdir}"
+            export CPPFLAGS LDFLAGS
             ;;
     esac
 
