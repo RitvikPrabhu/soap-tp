@@ -278,7 +278,8 @@ PYTHON="${PYTHON_BIN}" "${ROOT}/scripts/install.sh" "${NATIVE_ARGS[@]}"
 echo
 echo "Installation complete."
 if [[ "${PYTHON_BIN}" == "${ROOT}/.venv/bin/python" ]]; then
-    echo "Activate it with: source .venv/bin/activate"
+    echo "Activate it with: source .venv/bin/activate && source build/bindings.env"
 else
     echo "Python: ${PYTHON_BIN}"
+    echo "Native runtime environment: source build/bindings.env"
 fi

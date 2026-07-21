@@ -25,8 +25,12 @@ editable mode. It is safe to rerun and reuses completed native builds.
 Activate the resulting environment when working in a new shell:
 
 ```bash
-source .venv/bin/activate
+source .venv/bin/activate && source build/bindings.env
 ```
+
+The second file records the native compiler runtime and library prefixes chosen
+by the installer. This prevents a Python distribution's bundled C++ runtime
+from overriding the compiler module used to build the extensions.
 
 The normal native prerequisites are MPI, Autoconf, Automake, Libtool, a Fortran
 compiler, and a C++17 compiler with OpenMP support. CMake 3.18 or newer is

@@ -115,6 +115,38 @@ else
     exit 1
 fi
 
+# Python environments can carry older runtime libraries than the compiler
+# module. Ask the active C++ wrapper for its own library search path so native
+# modules and pybind extensions use one compatible ABI.
+SOAP_TP_CXX_LIBRARY_PATH=""
+if [[ "$(uname -s)" == "Linux" ]]; then
+    compiler_library_path="$(
+        "${CXX}" -print-search-dirs 2>/dev/null | \
+            sed -n 's/^libraries: =//p' || true
+    )"
+    old_ifs="${IFS}"
+    IFS=:
+    for directory in ${compiler_library_path}; do
+        directory="${directory#=}"
+        if [[ -d "${directory}" ]]; then
+            directory="$(cd "${directory}" && pwd -P)"
+            case ":${SOAP_TP_CXX_LIBRARY_PATH}:" in
+                *":${directory}:"*) ;;
+                *) SOAP_TP_CXX_LIBRARY_PATH="${SOAP_TP_CXX_LIBRARY_PATH:+${SOAP_TP_CXX_LIBRARY_PATH}:}${directory}" ;;
+            esac
+        fi
+    done
+    IFS="${old_ifs}"
+fi
+if [[ -n "${SOAP_TP_CXX_LIBRARY_PATH}" ]]; then
+    case ":${LD_LIBRARY_PATH:-}:" in
+        *":${SOAP_TP_CXX_LIBRARY_PATH}:"*) ;;
+        *) LD_LIBRARY_PATH="${SOAP_TP_CXX_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ;;
+    esac
+    export LD_LIBRARY_PATH
+fi
+export SOAP_TP_CXX_LIBRARY_PATH
+
 if [[ "${PROFILE}" == "cuda" ]] && \
    ! command -v nvcc >/dev/null 2>&1 && \
    [[ ! -x "${CUDA_HOME:-/nonexistent}/bin/nvcc" ]]; then
@@ -188,6 +220,9 @@ echo "Building profile: ${PROFILE}"
 echo "MPI C compiler: ${CC}"
 echo "MPI C++ compiler: ${CXX}"
 echo "MPI Fortran compiler: ${FC}"
+if [[ -n "${SOAP_TP_CXX_LIBRARY_PATH}" ]]; then
+    echo "C++ library path: ${SOAP_TP_CXX_LIBRARY_PATH}"
+fi
 echo "ELPA prefix: ${ELPA_PREFIX}"
 echo "SLATE prefix: ${SLATE_PREFIX}"
 
@@ -269,6 +304,13 @@ mkdir -p "$(dirname "${BUILD_CONFIG}")"
     printf 'export CC=%q\n' "${CC}"
     printf 'export CXX=%q\n' "${CXX}"
     printf 'export FC=%q\n' "${FC}"
+    printf 'export SOAP_TP_CXX_LIBRARY_PATH=%q\n' "${SOAP_TP_CXX_LIBRARY_PATH}"
+    if [[ -n "${SOAP_TP_CXX_LIBRARY_PATH}" ]]; then
+        printf '%s\n' 'case ":${LD_LIBRARY_PATH:-}:" in'
+        printf '%s\n' '    *":${SOAP_TP_CXX_LIBRARY_PATH}:"*) ;;'
+        printf '%s\n' '    *) export LD_LIBRARY_PATH="${SOAP_TP_CXX_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ;;'
+        printf '%s\n' 'esac'
+    fi
 } >"${BUILD_CONFIG_TEMP}"
 mv "${BUILD_CONFIG_TEMP}" "${BUILD_CONFIG}"
 echo "Binding build configuration: ${BUILD_CONFIG}"
