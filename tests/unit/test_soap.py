@@ -19,12 +19,8 @@ MPI_WORKER = "SOAP_TP_ORIGINAL_SOAP_MPI_WORKER"
 MPI_RANKS = 4
 MAX_RELATIVE_ERROR = 5e-3
 
-OriginalSOAP = runpy.run_path(
-    ROOT / "tests" / "reference" / "soap.py"
-)["SOAP"]
-write_plot = runpy.run_path(
-    ROOT / "scripts" / "plot_soap_comparison.py"
-)["write_plot"]
+OriginalSOAP = runpy.run_path(ROOT / "tests" / "reference" / "soap.py")["SOAP"]
+write_plot = runpy.run_path(ROOT / "scripts" / "plot_soap_comparison.py")["write_plot"]
 
 try:
     from mpi4py import MPI
@@ -36,8 +32,25 @@ else:
 
 
 SHAPES = (
-    (8, 8), (8, 16), (16, 8), (16, 16),
-    (16, 24), (24, 16), (32, 48), (64, 64),
+    (8, 8),
+    (8, 16),
+    (16, 8),
+    (16, 16),
+    (16, 24),
+    (24, 16),
+    (32, 48),
+    (64, 64),
+    (128, 128),
+    (256, 256),
+    (512, 512),
+    (1024, 1024),
+    (3072, 3072),
+    (8192, 3072),
+    (11008, 4096),
+    (18000, 18000),
+    (32768, 8192),
+    (49152, 12288),
+    (65536, 16384),
 )
 
 
@@ -76,8 +89,12 @@ def _run_original_soap_comparison():
             for shard_dim in (0, 1):
                 parameter = torch.nn.Parameter(torch.zeros(shape))
                 original = OriginalSOAP(
-                    [parameter], lr=1.0, betas=(0.8, 0.9),
-                    shampoo_beta=0.75, eps=1e-6, weight_decay=0.0,
+                    [parameter],
+                    lr=1.0,
+                    betas=(0.8, 0.9),
+                    shampoo_beta=0.75,
+                    eps=1e-6,
+                    weight_decay=0.0,
                     precondition_frequency=2,
                 )
                 state = {}
@@ -91,11 +108,17 @@ def _run_original_soap_comparison():
 
                     shard = gradient.chunk(world_size, dim=shard_dim)[rank]
                     local = soap_step(
-                        shard.contiguous(), state, global_shape=shape,
-                        shard_dim=shard_dim, block_size=2,
+                        shard.contiguous(),
+                        state,
+                        global_shape=shape,
+                        shard_dim=shard_dim,
+                        block_size=2,
                         process_grid_shape=process_grid,
-                        preconditioner_beta=0.75, beta1=0.8, beta2=0.9,
-                        eps=1e-6, basis_refresh_interval=2,
+                        preconditioner_beta=0.75,
+                        beta1=0.8,
+                        beta2=0.9,
+                        eps=1e-6,
+                        basis_refresh_interval=2,
                     )
                     parts = [torch.empty_like(local) for _ in range(world_size)]
                     dist.all_gather(parts, local)
@@ -124,8 +147,13 @@ def _run_original_soap_comparison():
                 writer = csv.writer(file)
                 writer.writerow(
                     (
-                        "ranks", "rows", "columns", "shard_layout",
-                        "gradient", "relative_l2_error", "difference_percent",
+                        "ranks",
+                        "rows",
+                        "columns",
+                        "shard_layout",
+                        "gradient",
+                        "relative_l2_error",
+                        "difference_percent",
                     )
                 )
                 writer.writerows(records)
@@ -172,8 +200,14 @@ class TestOriginalSoapComparison(unittest.TestCase):
         )
         completed = subprocess.run(
             [
-                mpiexec, "--oversubscribe", "--bind-to", "none",
-                "-n", str(MPI_RANKS), sys.executable, str(Path(__file__).resolve()),
+                mpiexec,
+                "--oversubscribe",
+                "--bind-to",
+                "none",
+                "-n",
+                str(MPI_RANKS),
+                sys.executable,
+                str(Path(__file__).resolve()),
             ],
             cwd=ROOT,
             env=environment,
