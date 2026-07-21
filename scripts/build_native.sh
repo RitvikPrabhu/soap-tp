@@ -138,7 +138,9 @@ build_elpa() {
     local build="${BUILD_ROOT}/elpa/${PROFILE}"
     local prefix="${ELPA_PREFIX:-${BUILD_ROOT}/elpa-install/${PROFILE}}"
     local automake_libdir
+    local candidate
     local flags
+    local rocm_libdir=""
     local configure_args=(--prefix="${prefix}" --with-mpi=yes --with-test-programs=no)
     local make_args=(-j"${JOBS}")
     local link_flags=()
@@ -159,12 +161,37 @@ build_elpa() {
                 --enable-amd-gpu-kernels
                 --enable-gpu-streams=amd
                 --with-rocsolver=yes
+                --disable-sse-kernels
+                --disable-sse-assembly-kernels
+                --disable-avx-kernels
+                --disable-avx2-kernels
+                --disable-avx512-kernels
             )
+            if [[ -n "${ROCM_PATH:-}" ]]; then
+                for candidate in "${ROCM_PATH}/lib" "${ROCM_PATH}/lib64"; do
+                    if compgen -G "${candidate}/librocblas.*" >/dev/null; then
+                        rocm_libdir="${candidate}"
+                        break
+                    fi
+                done
+                if [[ -z "${rocm_libdir}" ]]; then
+                    echo "ROCm is loaded, but librocblas was not found under ${ROCM_PATH}." >&2
+                    exit 1
+                fi
+                CPPFLAGS="${CPPFLAGS:+${CPPFLAGS} }-I${ROCM_PATH}/include"
+                LDFLAGS="${LDFLAGS:+${LDFLAGS} }-L${rocm_libdir}"
+                export CPPFLAGS LDFLAGS
+            fi
             ;;
         cuda)
             configure_args+=(
                 --enable-nvidia-gpu-kernels
                 --enable-gpu-streams=nvidia
+                --disable-sse-kernels
+                --disable-sse-assembly-kernels
+                --disable-avx-kernels
+                --disable-avx2-kernels
+                --disable-avx512-kernels
             )
             ;;
     esac
