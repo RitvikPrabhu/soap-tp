@@ -173,6 +173,7 @@ build_elpa() {
     local library_dir_args=()
     local rocm_libdir=""
     local rocm_root=""
+    local rocsolver_header=""
     local configure_args=(--prefix="${prefix}" --with-mpi=yes --with-test-programs=no)
     local make_args=(-j"${JOBS}")
     local link_flags=()
@@ -217,6 +218,17 @@ build_elpa() {
                 PATH="${rocm_root}/bin:${PATH}"
                 HIPCC="${rocm_root}/bin/hipcc"
                 export PATH HIPCC
+            fi
+            if [[ -d "${rocm_root}/include" ]]; then
+                rocsolver_header="$(find "${rocm_root}/include" \
+                    -name rocsolver.h -print -quit 2>/dev/null)"
+                HIPCCFLAGS="${HIPCCFLAGS:-${CXXFLAGS:--g -O2}}"
+                HIPCCFLAGS="${HIPCCFLAGS:+${HIPCCFLAGS} }-I${rocm_root}/include"
+                if [[ -n "${rocsolver_header}" && \
+                      "$(dirname "${rocsolver_header}")" != "${rocm_root}/include" ]]; then
+                    HIPCCFLAGS="${HIPCCFLAGS} -I$(dirname "${rocsolver_header}")"
+                fi
+                export HIPCCFLAGS
             fi
             CPPFLAGS="${CPPFLAGS:+${CPPFLAGS} }-I${rocm_root}/include"
             LDFLAGS="${LDFLAGS:+${LDFLAGS} }-L${rocm_libdir}"
