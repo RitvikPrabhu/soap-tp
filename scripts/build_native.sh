@@ -168,6 +168,7 @@ build_elpa() {
     local candidate
     local cuda_libdir=""
     local cuda_root=""
+    local elpa_library_target=""
     local flags
     local library_dir_flags
     local library_dir_args=()
@@ -357,6 +358,16 @@ EOF
 
     mkdir -p "${build}" "${prefix}"
     (cd "${build}" && "${source}/configure" "${configure_args[@]}")
+    elpa_library_target="$(awk \
+        '$1 == "lib_LTLIBRARIES" && $2 == "=" { print $3; exit }' \
+        "${build}/Makefile")"
+    if [[ -z "${elpa_library_target}" ]]; then
+        echo "Could not determine the configured ELPA library target." >&2
+        exit 1
+    fi
+    # ELPA's shared test-helper target uses elpa.mod but does not declare the
+    # dependency. Finish the configured library first, then resume in parallel.
+    make -C "${build}" "${make_args[@]}" "${elpa_library_target}"
     make -C "${build}" "${make_args[@]}"
     make -C "${build}" install
     echo "ELPA installed in ${prefix}"
