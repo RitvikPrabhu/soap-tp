@@ -2,11 +2,11 @@
 
 soap-tp does not load modules, select compilers, install system packages, or
 choose a PyTorch wheel. Prepare those for the target machine before building.
+Clone with `--recurse-submodules`; the build script does not run Git commands.
 
 ## Required system software
 
 - MPI with C, C++, and Fortran compiler wrappers
-- BLAS, LAPACK, ScaLAPACK, and BLACS
 - CMake
 - Autoconf, Automake, Libtool, and Make
 - CUDA for a `cuda` build or ROCm for a `rocm` build
@@ -38,7 +38,8 @@ MPI4PY_BUILD_MPICC="$CC" python -m pip install -r requirements.txt
 
 ## Native libraries
 
-Build both pinned libraries with one command:
+Build both pinned libraries with one command. The script also builds the pinned
+OpenBLAS and ScaLAPACK submodules that they link against:
 
 ```bash
 ./scripts/build_native.sh cpu
@@ -51,6 +52,7 @@ Only run the line matching the desired build. Outputs go to:
 ```text
 build/elpa-install/<profile>
 build/slate-install/<profile>
+build/math-install
 ```
 
 The script accepts two omission flags:
@@ -75,16 +77,17 @@ Optional native build settings are deliberately explicit:
 
 ```text
 BUILD_JOBS
+ELPA_BUILD_JOBS
 SOAP_TP_BUILD_ROOT
+MATH_PREFIX
 ELPA_PREFIX
 SLATE_PREFIX
 ELPA_CONFIGURE_ARGS
 SLATE_CMAKE_ARGS
 ```
 
-The script never searches for another library installation or builds fallback
-BLAS/ScaLAPACK libraries. The loaded environment must provide what ELPA and
-SLATE need.
+The script never searches for another math-library installation. It always
+uses the repository's pinned OpenBLAS and ScaLAPACK sources.
 
 ## Python bindings
 

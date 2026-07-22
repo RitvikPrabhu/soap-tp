@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-# Build the pinned ELPA and SLATE submodules. The caller supplies the compiler,
-# MPI, math, and GPU environment; this script does not load or discover them.
+# Build the pinned math, ELPA, and SLATE submodules. The caller supplies the
+# compiler, MPI, and GPU environment; this script does not load or discover it.
 set -eo pipefail
 
 usage() {
@@ -10,10 +10,14 @@ Usage: scripts/build_native.sh <cpu|cuda|rocm> [--skip-elpa] [--skip-slate]
 
 Builds ELPA and SLATE into build/. Use a skip flag when that library is already
 available and set ELPA_PREFIX or SLATE_PREFIX to its installation prefix.
+OpenBLAS and ScaLAPACK are built from the pinned submodules when either native
+library is selected.
 
 Environment:
   BUILD_JOBS           Parallel jobs (default: 8)
+  ELPA_BUILD_JOBS      ELPA build jobs (default: 1)
   SOAP_TP_BUILD_ROOT   Build directory (default: <repo>/build)
+  MATH_PREFIX          OpenBLAS/ScaLAPACK install prefix
   ELPA_PREFIX          ELPA install prefix
   SLATE_PREFIX         SLATE install prefix
   ELPA_CONFIGURE_ARGS  Additional ELPA configure arguments
@@ -43,9 +47,11 @@ done
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_ROOT="${SOAP_TP_BUILD_ROOT:-${ROOT}/build}"
+MATH_PREFIX="${MATH_PREFIX:-${BUILD_ROOT}/math-install}"
 ELPA_PREFIX="${ELPA_PREFIX:-${BUILD_ROOT}/elpa-install/${PROFILE}}"
 SLATE_PREFIX="${SLATE_PREFIX:-${BUILD_ROOT}/slate-install/${PROFILE}}"
 JOBS="${BUILD_JOBS:-8}"
+ELPA_JOBS="${ELPA_BUILD_JOBS:-1}"
 export ELPA_PREFIX SLATE_PREFIX
 
 case "${PROFILE}" in
@@ -73,15 +79,47 @@ esac
 read -r -a EXTRA_ELPA_ARGS <<<"${ELPA_CONFIGURE_ARGS:-}"
 read -r -a EXTRA_SLATE_ARGS <<<"${SLATE_CMAKE_ARGS:-}"
 
+if [[ "${BUILD_ELPA}" == "1" || "${BUILD_SLATE}" == "1" ]]; then
+    OPENBLAS_SOURCE="${ROOT}/third_party/openblas"
+    SCALAPACK_SOURCE="${ROOT}/third_party/scalapack"
+    OPENBLAS_BUILD="${BUILD_ROOT}/math/openblas"
+    SCALAPACK_BUILD="${BUILD_ROOT}/math/scalapack"
+
+    cmake -S "${OPENBLAS_SOURCE}" -B "${OPENBLAS_BUILD}" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="${MATH_PREFIX}" \
+        -DCMAKE_INSTALL_LIBDIR=lib \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DBUILD_STATIC_LIBS=ON \
+        -DBUILD_SHARED_LIBS=ON \
+        -DBUILD_WITHOUT_LAPACKE=ON \
+        -DBUILD_TESTING=OFF
+    cmake --build "${OPENBLAS_BUILD}" \
+        --target openblas_static openblas_shared --parallel "${JOBS}"
+    cmake --install "${OPENBLAS_BUILD}"
+
+    cmake -S "${SCALAPACK_SOURCE}" -B "${SCALAPACK_BUILD}" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="${MATH_PREFIX}" \
+        -DCMAKE_INSTALL_LIBDIR=lib \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DSCALAPACK_BUILD_TESTS=OFF \
+        -DBLAS_LIBRARIES="${MATH_PREFIX}/lib/libopenblas.a" \
+        -DLAPACK_LIBRARIES="${MATH_PREFIX}/lib/libopenblas.a"
+    cmake --build "${SCALAPACK_BUILD}" --parallel "${JOBS}"
+    cmake --install "${SCALAPACK_BUILD}"
+fi
+
 if [[ "${BUILD_ELPA}" == "1" ]]; then
     ELPA_SOURCE="${ROOT}/third_party/elpa"
     ELPA_BUILD="${BUILD_ROOT}/elpa/${PROFILE}"
 
-    git -C "${ROOT}" submodule update --init third_party/elpa
     (cd "${ELPA_SOURCE}" && ./autogen.sh)
     mkdir -p "${ELPA_BUILD}" "${ELPA_PREFIX}"
     (
         cd "${ELPA_BUILD}"
+        SCALAPACK_LDFLAGS="-L${MATH_PREFIX}/lib -lscalapack ${MATH_PREFIX}/lib/libopenblas.a" \
         "${ELPA_SOURCE}/configure" \
             --prefix="${ELPA_PREFIX}" \
             --with-mpi=yes \
@@ -89,14 +127,13 @@ if [[ "${BUILD_ELPA}" == "1" ]]; then
             "${ELPA_GPU_ARGS[@]}" \
             "${EXTRA_ELPA_ARGS[@]}"
     )
-    make -C "${ELPA_BUILD}" -j"${JOBS}" install
+    make -C "${ELPA_BUILD}" -j"${ELPA_JOBS}" install
 fi
 
 if [[ "${BUILD_SLATE}" == "1" ]]; then
     SLATE_SOURCE="${ROOT}/third_party/slate"
     SLATE_BUILD="${BUILD_ROOT}/slate/${PROFILE}"
 
-    git -C "${ROOT}" submodule update --init --recursive third_party/slate
     cmake -S "${SLATE_SOURCE}" -B "${SLATE_BUILD}" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="${SLATE_PREFIX}" \
@@ -105,9 +142,12 @@ if [[ "${BUILD_SLATE}" == "1" ]]; then
         -DBUILD_TESTING=OFF \
         -Dbuild_tests=OFF \
         -Dgpu_backend="${SLATE_GPU_BACKEND}" \
+        -DBLAS_LIBRARIES="-L${MATH_PREFIX}/lib;-lopenblas" \
+        -DLAPACK_LIBRARIES="-L${MATH_PREFIX}/lib;-lopenblas" \
         "${EXTRA_SLATE_ARGS[@]}"
     cmake --build "${SLATE_BUILD}" --parallel "${JOBS}"
     cmake --install "${SLATE_BUILD}"
 fi
 
-printf 'ELPA_PREFIX=%s\nSLATE_PREFIX=%s\n' "${ELPA_PREFIX}" "${SLATE_PREFIX}"
+printf 'MATH_PREFIX=%s\nELPA_PREFIX=%s\nSLATE_PREFIX=%s\n' \
+    "${MATH_PREFIX}" "${ELPA_PREFIX}" "${SLATE_PREFIX}"
