@@ -432,7 +432,10 @@ def initialize_basis_2d_block_cyclic_(
         rank,
         world_size,
     )
-    work.copy_(preconditioner)
+    # ELPA returns eigenpairs in ascending eigenvalue order. Solving for -A
+    # makes that order correspond to descending eigenvalues of A, avoiding a
+    # distributed permutation of the eigenvector columns afterward.
+    work.copy_(preconditioner).neg_()
     process_rows, process_columns = process_grid_shape
     _synchronize(preconditioner.device)
     binding.elpa_eigenvectors_2d_block_cyclic_float(
@@ -448,16 +451,7 @@ def initialize_basis_2d_block_cyclic_(
     )
     _synchronize(preconditioner.device)
 
-    descending = tuple(reversed(range(size)))
-    permute_2d_block_cyclic_(
-        Q,
-        (size, size),
-        tuple(range(size)),
-        descending,
-        block_size,
-        process_grid_shape,
-    )
-    eigenvalues.copy_(eigenvalues.flip(0))
+    eigenvalues.neg_()
     return Q
 
 
