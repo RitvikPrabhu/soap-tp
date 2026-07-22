@@ -1,9 +1,4 @@
-"""Build the optional ELPA and SLATE Python extensions.
-
-The all-in-one installer sets the binding flags and native install prefixes.
-Keeping discovery here makes regular PEP 517 builds work without embedding
-paths from any one workstation or cluster in the repository.
-"""
+"""Build the optional ELPA and SLATE Python extensions."""
 
 from __future__ import annotations
 
@@ -20,9 +15,8 @@ try:
 
     PYBIND11_INCLUDE = pybind11.get_include()
 except ImportError:
-    # PyTorch vendors pybind11 headers. The all-in-one installer deliberately
-    # disables pip build isolation so it can use those headers on clusters
-    # whose login nodes cannot reach PyPI.
+    # PyTorch vendors pybind11 headers, which remain a useful fallback for
+    # environments where the standalone Python package is unavailable.
     from torch.utils.cpp_extension import include_paths
 
     PYBIND11_INCLUDE = include_paths()[0]
@@ -119,8 +113,7 @@ def elpa_extension() -> Extension:
     if not prefix_value:
         raise RuntimeError(
             "ELPA_PREFIX is required when building the ELPA binding. "
-            "Run ./scripts/install.sh <cpu|cuda|rocm> instead of invoking "
-            "the native build directly."
+            "Build ELPA or select an existing installation first."
         )
 
     prefix = Path(prefix_value).expanduser().resolve()
@@ -164,8 +157,7 @@ def slate_extension() -> Extension:
     if not prefix_value:
         raise RuntimeError(
             "SLATE_PREFIX is required when building the SLATE binding. "
-            "Run ./scripts/install.sh <cpu|cuda|rocm> instead of invoking "
-            "the native build directly."
+            "Build SLATE or select an existing installation first."
         )
 
     prefix = Path(prefix_value).expanduser().resolve()

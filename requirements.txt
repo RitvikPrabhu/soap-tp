@@ -1,0 +1,10 @@
+--no-binary=mpi4py
+
+torch>=2.6
+mpi4py
+numpy
+matplotlib
+pybind11>=2.11
+setuptools>=68
+wheel
+ninja

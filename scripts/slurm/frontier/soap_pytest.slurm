@@ -26,7 +26,7 @@ export OPENBLAS_NUM_THREADS=1
 
 REPO_ROOT="${SOAP_TP_ROOT:-${SLURM_SUBMIT_DIR}}"
 cd "${REPO_ROOT}"
-source .venv/bin/activate && source build/bindings.env
+source .venv/bin/activate
 export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
 srun -N 1 -n 8 --ntasks-per-node=8 -c 7 --gpus-per-task=1 --gpu-bind=closest python -u tests/unit/test_soap_gpu.py
