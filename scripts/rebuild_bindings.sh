@@ -29,6 +29,24 @@ PYTHON="${PYTHON:-python3}"
 ELPA_PREFIX="${ELPA_PREFIX:-${BUILD_ROOT}/elpa-install/${PROFILE}}"
 SLATE_PREFIX="${SLATE_PREFIX:-${BUILD_ROOT}/slate-install/${PROFILE}}"
 
+MPI_CXX="${MPICXX:-$(command -v mpicxx || command -v mpic++ || true)}"
+if [[ -z "${MPI_CXX}" ]]; then
+    echo "An MPI C++ compiler wrapper is required (mpicxx or mpic++)." >&2
+    echo "Set MPICXX to select a non-default MPI installation." >&2
+    exit 1
+fi
+
+if ! MPI_COMPILE_FLAGS="$("${MPI_CXX}" --showme:compile 2>/dev/null)" ||
+   ! MPI_LINK_FLAGS="$("${MPI_CXX}" --showme:link 2>/dev/null)"; then
+    echo "Could not query compile and link flags from ${MPI_CXX}." >&2
+    echo "Set MPICXX to an Open MPI C++ compiler wrapper." >&2
+    exit 1
+fi
+
+# Keep the selected host compiler (which may provide OpenMP for SLATE), while
+# adding the MPI headers and libraries required by the ELPA binding.
+export CPPFLAGS="${MPI_COMPILE_FLAGS}${CPPFLAGS:+ ${CPPFLAGS}}"
+export LDFLAGS="${MPI_LINK_FLAGS}${LDFLAGS:+ ${LDFLAGS}}"
 export ELPA_PREFIX SLATE_PREFIX
 export ELPA_PROFILE="${PROFILE}"
 export SLATE_PROFILE="${PROFILE}"

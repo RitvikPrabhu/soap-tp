@@ -1,5 +1,3 @@
-"""Tests for the ELPA Python binding."""
-
 import ctypes
 import importlib.util
 import os
@@ -8,8 +6,8 @@ import shutil
 import socket
 import subprocess
 import sys
-import unittest
-
+import pytest
+from typing import Literal
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -19,681 +17,477 @@ from torch.utils.cpp_extension import load
 from soap_tp.ops._utils import (
     allocate_2d_block_cyclic,
     block_cyclic_indices,
+    block_cyclic_tile_views,
 )
 from soap_tp.ops.factorizations import initialize_basis_2d_block_cyclic_
 
 
-ROOT = Path(__file__).resolve().parents[2]
-PROFILE = os.environ.get("ELPA_PROFILE", "cpu")
-PREFIX = ROOT / "build" / "elpa-install" / PROFILE
-ELPA_OK = 0
-
-BLOCK_BOUNDARY_CASES = (
-    {
-        "name": "singleton_unit_block",
-        "size": 1,
-        "nev": 1,
-        "nblk": 1,
-        "matrix": "singleton",
-    },
-    {
-        "name": "block_larger_than_matrix",
-        "size": 2,
-        "nev": 2,
-        "nblk": 3,
-        "matrix": "random",
-    },
-    {
-        "name": "block_equals_matrix",
-        "size": 3,
-        "nev": 3,
-        "nblk": 3,
-        "matrix": "random",
-    },
-    {
-        "name": "partial_boundary_block",
-        "size": 4,
-        "nev": 4,
-        "nblk": 3,
-        "matrix": "random",
-    },
-    {
-        "name": "exact_multiple_of_block",
-        "size": 6,
-        "nev": 6,
-        "nblk": 3,
-        "matrix": "random",
-    },
-    {
-        "name": "unit_blocks_known_order",
-        "size": 4,
-        "nev": 4,
-        "nblk": 1,
-        "matrix": "diagonal",
-    },
+SEED = 42
+BLOCK_SIZE = 2
+PROCESS_GRID_SHAPE = (2, 2)
+GRADIENT_SHAPES = (
+    # (8, 8),
+    # (8, 12),
+    (12, 8),
+    # (9, 13),
+    # (13, 9),
 )
 
-REPEATED_EIGENVALUE_CASE = (
-    {
-        "name": "repeated_eigenvalues",
-        "size": 4,
-        "nev": 4,
-        "nblk": 2,
-        "matrix": "repeated",
-    },
-)
 
-PARTIAL_EIGENVECTOR_CASE = (
-    {
-        "name": "partial_eigenvectors",
-        "size": 5,
-        "nev": 2,
-        "nblk": 2,
-        "matrix": "random",
-    },
-)
+def _setup_mpi():
+    rank = MPI.COMM_WORLD.Get_rank()
+    world_size = MPI.COMM_WORLD.Get_size()
 
-MULTIRANK_CASES = (
-    {
-        "name": "equal_shards_2x2_grid",
-        "size": 8,
-        "nev": 8,
-        "nblk": 2,
-        "process_grid": (2, 2),
-    },
-    {
-        "name": "uneven_columns_1x4_grid",
-        "size": 7,
-        "nev": 5,
-        "nblk": 2,
-        "process_grid": (1, 4),
-    },
-    {
-        "name": "uneven_rows_4x1_grid",
-        "size": 7,
-        "nev": 5,
-        "nblk": 2,
-        "process_grid": (4, 1),
-    },
-    {
-        "name": "uneven_shards_2x2_grid",
-        "size": 9,
-        "nev": 9,
-        "nblk": 2,
-        "process_grid": (2, 2),
-    },
-)
-
-MULTIRANK_WORKER = "SOAP_TP_ELPA_MULTIRANK_WORKER"
-MULTIRANK_BINDING_PATH = "SOAP_TP_ELPA_BINDING_PATH"
-MULTIRANK_LIBRARY_PATH = "SOAP_TP_ELPA_LIBRARY_PATH"
-
-
-def _free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def _load_binding(path):
-    name = Path(path).name.split(".", 1)[0]
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _load_elpa(path):
-    elpa = ctypes.CDLL(path)
-    error_pointer = ctypes.POINTER(ctypes.c_int)
-    elpa.elpa_init.argtypes = [ctypes.c_int]
-    elpa.elpa_init.restype = ctypes.c_int
-    elpa.elpa_allocate.argtypes = [error_pointer]
-    elpa.elpa_allocate.restype = ctypes.c_void_p
-    elpa.elpa_set_integer.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        error_pointer,
-    ]
-    elpa.elpa_setup.argtypes = [ctypes.c_void_p]
-    elpa.elpa_setup.restype = ctypes.c_int
-    elpa.elpa_deallocate.argtypes = [ctypes.c_void_p, error_pointer]
-    elpa.elpa_uninit.argtypes = [error_pointer]
-    return elpa
-
-
-def _set_integer(elpa, handle, error, name, value):
-    elpa.elpa_set_integer(
-        handle, name.encode(), value, ctypes.byref(error)
-    )
-    assert error.value == ELPA_OK
-
-
-def _make_symmetric_matrix(case):
-    size = case["size"]
-    if case["matrix"] == "singleton":
-        matrix = torch.tensor([[2.5]], dtype=torch.float32)
-    elif case["matrix"] == "diagonal":
-        diagonal = torch.tensor([4.0, -2.0, 1.0, 3.0])
-        matrix = torch.diag(diagonal)
-    elif case["matrix"] == "repeated":
-        matrix = torch.tensor(
-            [
-                [2.0, 1.0, 0.0, 0.0],
-                [1.0, 2.0, 0.0, 0.0],
-                [0.0, 0.0, 2.0, 1.0],
-                [0.0, 0.0, 1.0, 2.0],
-            ],
-            dtype=torch.float32,
-        )
-    else:
-        generator = torch.Generator().manual_seed(1000 + size)
-        random = torch.randn(size, size, generator=generator)
-        matrix = random + random.T
-    return matrix
-
-
-def _assert_matches_torch_eigh(
-    matrix,
-    eigenvalues,
-    eigenvectors,
-    requested_count,
-    case_name,
-    atol,
-    rtol,
-):
-    expected_values, expected_vectors = torch.linalg.eigh(matrix)
-    torch.testing.assert_close(
-        eigenvalues,
-        expected_values,
-        atol=atol,
-        rtol=rtol,
-        msg=case_name,
-    )
-
-    requested_vectors = eigenvectors[:, :requested_count]
-    group_start = 0
-    while group_start < requested_count:
-        group_end = group_start + 1
-        while group_end < requested_count and torch.isclose(
-            expected_values[group_end],
-            expected_values[group_start],
-            atol=1e-5,
-            rtol=1e-5,
-        ):
-            group_end += 1
-
-        actual_subspace = requested_vectors[:, group_start:group_end]
-        expected_subspace = expected_vectors[:, group_start:group_end]
-        torch.testing.assert_close(
-            actual_subspace @ actual_subspace.T,
-            expected_subspace @ expected_subspace.T,
-            atol=atol,
-            rtol=rtol,
-            msg=case_name,
-        )
-        group_start = group_end
-
-    torch.testing.assert_close(
-        matrix @ requested_vectors,
-        requested_vectors * eigenvalues[:requested_count],
-        atol=atol,
-        rtol=rtol,
-        msg=case_name,
-    )
-    torch.testing.assert_close(
-        requested_vectors.T @ requested_vectors,
-        torch.eye(requested_count),
-        atol=atol,
-        rtol=rtol,
-        msg=case_name,
-    )
-
-
-def _call_eigenvectors(
-    binding,
-    elpa,
-    case,
-    communicator,
-    process_row,
-    process_col,
-    a,
-    eigenvalues,
-    eigenvectors,
-):
-    error = ctypes.c_int()
-    initialized = False
-    handle = None
-    try:
-        assert elpa.elpa_init(20260202) == ELPA_OK
-        initialized = True
-        handle = elpa.elpa_allocate(ctypes.byref(error))
-        assert error.value == ELPA_OK
-        assert handle is not None
-
-        for name, value in (
-            ("na", case["size"]),
-            ("nev", case["nev"]),
-            ("local_nrows", a.shape[0]),
-            ("local_ncols", a.shape[1]),
-            ("nblk", case["nblk"]),
-            ("mpi_comm_parent", communicator.py2f()),
-            ("process_row", process_row),
-            ("process_col", process_col),
-        ):
-            _set_integer(elpa, handle, error, name, value)
-        assert elpa.elpa_setup(handle) == ELPA_OK
-
-        result = binding.elpa_eigenvectors_float(
-            handle,
-            a.data_ptr(),
-            eigenvalues.data_ptr(),
-            eigenvectors.data_ptr(),
-        )
-        assert result == ELPA_OK, (
-            f"{case['name']}: {binding.elpa_error_string(result)}"
-        )
-    finally:
-        if handle is not None:
-            elpa.elpa_deallocate(handle, ctypes.byref(error))
-        if initialized:
-            elpa.elpa_uninit(ctypes.byref(error))
-
-
-def _solve_eigenvector_case(binding, elpa, case):
-    size = case["size"]
-    matrix = _make_symmetric_matrix(case)
-    a = torch.empty(size, size, dtype=torch.float32).T
-    a.copy_(matrix)
-    eigenvectors = torch.empty_like(a)
-    eigenvectors.fill_(torch.nan)
-    eigenvalues = torch.full((size,), torch.nan, dtype=torch.float32)
-
-    _call_eigenvectors(
-        binding,
-        elpa,
-        case,
-        MPI.COMM_SELF,
-        0,
-        0,
-        a,
-        eigenvalues,
-        eigenvectors,
-    )
-
-    _assert_matches_torch_eigh(
-        matrix,
-        eigenvalues,
-        eigenvectors,
-        case["nev"],
-        case["name"],
-        atol=1e-3,
-        rtol=1e-3,
-    )
-
-
-def _run_eigenvector_cases(
-    rank,
-    world_size,
-    port,
-    binding_path,
-    library_path,
-    cases,
-):
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
-
-    try:
-        binding = _load_binding(binding_path)
-        elpa = _load_elpa(library_path)
-        for case in cases[rank::world_size]:
-            _solve_eigenvector_case(binding, elpa, case)
-    finally:
-        dist.destroy_process_group()
-
-
-def _owned_global_indices(size, block_size, process, process_count):
-    return [
-        index
-        for index in range(size)
-        if (index // block_size) % process_count == process
-    ]
-
-
-def _solve_multirank_case(binding, elpa, case, rank, world_size):
-    process_rows, process_cols = case["process_grid"]
-    assert process_rows * process_cols == world_size
-    process_row = rank % process_rows
-    process_col = rank // process_rows
-
-    size = case["size"]
-    matrix = torch.empty((size, size), dtype=torch.float32)
     if rank == 0:
-        generator = torch.Generator().manual_seed(2000 + size)
-        random = torch.randn(size, size, generator=generator)
-        matrix.copy_(random + random.T)
-    dist.broadcast(matrix, src=0)
+        address = os.environ.get("MASTER_ADDR", "127.0.0.1")
+        if "MASTER_PORT" in os.environ:
+            port = int(os.environ["MASTER_PORT"])
+        else:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind((address, 0))
+                port = sock.getsockname()[1]
+        rendezvous = address, port
+    else:
+        rendezvous = None
 
-    global_rows = _owned_global_indices(
-        size, case["nblk"], process_row, process_rows
-    )
-    global_cols = _owned_global_indices(
-        size, case["nblk"], process_col, process_cols
-    )
-    row_indices = torch.tensor(global_rows, dtype=torch.long)
-    col_indices = torch.tensor(global_cols, dtype=torch.long)
-    local_values = matrix.index_select(0, row_indices).index_select(
-        1, col_indices
-    )
-
-    a = torch.empty(
-        (len(global_cols), len(global_rows)), dtype=torch.float32
-    ).T
-    a.copy_(local_values)
-    eigenvectors = torch.empty_like(a)
-    eigenvectors.fill_(torch.nan)
-    eigenvalues = torch.full((size,), torch.nan, dtype=torch.float32)
-
-    _call_eigenvectors(
-        binding,
-        elpa,
-        case,
-        MPI.COMM_WORLD,
-        process_row,
-        process_col,
-        a,
-        eigenvalues,
-        eigenvectors,
+    address, port = MPI.COMM_WORLD.bcast(rendezvous, root=0)
+    os.environ["MASTER_ADDR"] = address
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world_size,
     )
 
-    local_result = (
-        global_rows,
-        global_cols,
-        eigenvectors.contiguous(),
-    )
-    all_results = [None] * world_size
-    dist.all_gather_object(all_results, local_result)
-
-    global_vectors = torch.full(
-        (size, size), torch.nan, dtype=torch.float32
-    )
-    for shard_rows, shard_cols, shard_vectors in all_results:
-        shard_row_indices = torch.tensor(shard_rows, dtype=torch.long)
-        shard_col_indices = torch.tensor(shard_cols, dtype=torch.long)
-        global_vectors[
-            shard_row_indices[:, None], shard_col_indices
-        ] = shard_vectors
-
-    requested_vectors = global_vectors[:, : case["nev"]]
-    assert torch.isfinite(requested_vectors).all(), case["name"]
-    _assert_matches_torch_eigh(
-        matrix,
-        eigenvalues,
-        global_vectors,
-        case["nev"],
-        case["name"],
-        atol=2e-3,
-        rtol=2e-3,
-    )
+    return rank, world_size
 
 
-def _solve_production_initializer_case(binding, rank, world_size, size):
-    block_size = 2
-    process_grid = (2, 2)
-    process_rows, process_columns = process_grid
-    assert process_rows * process_columns == world_size
+# Make a tensor of shape (m, n) using normal distribution, mean 0 and std 2
+def _make_gradient(m, n, dtype=torch.float32, seed=SEED):
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return torch.normal(mean=0, std=2, size=(m, n), generator=generator, dtype=dtype)
 
-    generator = torch.Generator().manual_seed(314 + size)
-    random = torch.randn(size, size, generator=generator)
-    matrix = random @ random.T + torch.diag(
-        torch.linspace(1.0, 2.0, size)
-    )
 
-    preconditioner = allocate_2d_block_cyclic(
-        (size, size),
+# Make the left preconditioner matrix of shape (m, m) and is GG^T
+def _make_left_preconditioner(gradient):
+    return torch.mm(gradient, gradient.T)
+
+
+# Make the right preconditioner matrix of shape (n, n) and is G^TG
+def _make_right_preconditioner(gradient):
+    return torch.mm(gradient.T, gradient)
+
+
+# Convert the full PyTorch tensor into local 2D block cyclic storage
+def _pack_full_matrix_2d_block_cyclic(
+    full_matrix,
+    local_matrix,
+    block_size,
+    process_grid_shape,
+    rank,
+):
+    views = block_cyclic_tile_views(
+        local_matrix,
+        tuple(full_matrix.shape),
         block_size,
-        process_grid,
+        process_grid_shape,
+        rank,
+        mode="full",
     )
-    Q = allocate_2d_block_cyclic(
-        (size, size),
+
+    for (block_row, block_column), local_view in views.items():
+        global_row_start = block_row * block_size
+        global_row_end = min(global_row_start + block_size, full_matrix.size(0))
+        global_column_start = block_column * block_size
+        global_column_end = min(global_column_start + block_size, full_matrix.size(1))
+
+        local_view.copy_(
+            full_matrix[
+                global_row_start:global_row_end, global_column_start:global_column_end
+            ]
+        )
+
+
+# Convert the local 2D block cyclic storage into a full PyTorch tensor
+def _unpack_matrix_2d_block_cyclic(
+    local_matrix,
+    global_shape,
+    block_size,
+    process_grid_shape,
+    rank,
+):
+    full_matrix = local_matrix.new_zeros(global_shape)
+    for (block_row, block_column), local_view in block_cyclic_tile_views(
+        local_matrix,
+        global_shape,
         block_size,
-        process_grid,
+        process_grid_shape,
+        rank,
+        mode="full",
+    ).items():
+        global_row_start = block_row * block_size
+        global_column_start = block_column * block_size
+        full_matrix[
+            global_row_start : global_row_start + local_view.size(0),
+            global_column_start : global_column_start + local_view.size(1),
+        ].copy_(local_view)
+
+    dist.all_reduce(full_matrix)
+    return full_matrix
+
+
+# Run the eigenvalue decomposition of a preconditioner matrix using torch.linalg.eigh
+def _run_linalg_eigh(preconditioner):
+    eigenvalues, eigenvectors = torch.linalg.eigh(preconditioner)
+
+    eigenvalues = torch.flip(eigenvalues, dims=[0])
+    eigenvectors = torch.flip(eigenvectors, dims=[1])
+
+    return eigenvalues, eigenvectors
+
+
+# Run the eigenvalue decomposition of a preconditioner matrix using ELPA
+def _run_elpa_eigh(preconditioner, block_size, process_grid_shape):
+    rank = dist.get_rank()
+    size = preconditioner.size(0)
+
+    local_preconditioner = allocate_2d_block_cyclic(
+        tuple(preconditioner.shape),
+        block_size,
+        process_grid_shape,
+        dtype=preconditioner.dtype,
+        device=preconditioner.device,
+    )
+    local_eigenvectors = allocate_2d_block_cyclic(
+        tuple(preconditioner.shape),
+        block_size,
+        process_grid_shape,
+        dtype=preconditioner.dtype,
+        device=preconditioner.device,
     )
     work = allocate_2d_block_cyclic(
-        (size, size),
+        tuple(preconditioner.shape),
         block_size,
-        process_grid,
+        process_grid_shape,
+        dtype=preconditioner.dtype,
+        device=preconditioner.device,
     )
-    eigenvalues = torch.empty(size, dtype=torch.float32)
+    eigenvalues = preconditioner.new_empty(size)
 
-    process_row = rank // process_columns
-    process_column = rank % process_columns
-    global_rows = block_cyclic_indices(
-        size,
-        block_size,
-        process_row,
-        process_rows,
-    )
-    global_columns = block_cyclic_indices(
-        size,
-        block_size,
-        process_column,
-        process_columns,
-    )
-    row_index = torch.tensor(global_rows, dtype=torch.long)
-    column_index = torch.tensor(global_columns, dtype=torch.long)
-    preconditioner[
-        : len(global_rows), : len(global_columns)
-    ].copy_(
-        matrix.index_select(0, row_index).index_select(1, column_index)
-    )
-
-    arguments = (
+    _pack_full_matrix_2d_block_cyclic(
         preconditioner,
-        Q,
+        local_preconditioner,
+        block_size,
+        process_grid_shape,
+        rank,
+    )
+    initialize_basis_2d_block_cyclic_(
+        local_preconditioner,
+        local_eigenvectors,
         work,
         eigenvalues,
         size,
         block_size,
-        process_grid,
+        process_grid_shape,
     )
-    if size == 1:
-        try:
-            initialize_basis_2d_block_cyclic_(
-                *arguments,
-                elpa_binding=binding,
-            )
-        except ValueError as error:
-            assert "every rank to own" in str(error)
-        else:
-            raise AssertionError("empty ELPA ownership must be rejected")
+
+    eigenvectors = _unpack_matrix_2d_block_cyclic(
+        local_eigenvectors,
+        tuple(preconditioner.shape),
+        block_size,
+        process_grid_shape,
+        rank,
+    )
+    return eigenvalues, eigenvectors
+
+
+# Check that the eigenvectors from non-zero eigenvalues from PyTorch and ELPA are equivalent up to sign
+def _check_eigenvectors_of_nonzero_eigenvalues_equivalent(
+    expected_eigenvalues,
+    expected_eigenvectors,
+    actual_eigenvalues,
+    actual_eigenvectors,
+):
+    assert expected_eigenvalues.shape == actual_eigenvalues.shape, (
+        "Eigenvalues shapes do not match."
+    )
+    assert expected_eigenvectors.shape == actual_eigenvectors.shape, (
+        "Eigenvectors shapes do not match."
+    )
+
+    # Put each set of eigenvalues on the diagonal of a matrix.
+    expected_diagonal_matrix = torch.diag(expected_eigenvalues)
+    actual_diagonal_matrix = torch.diag(actual_eigenvalues)
+
+    # Let PyTorch decide how many eigenvalues are numerically nonzero.
+    expected_rank = torch.linalg.matrix_rank(
+        expected_diagonal_matrix,
+        hermitian=True,
+    ).item()
+
+    actual_rank = torch.linalg.matrix_rank(
+        actual_diagonal_matrix,
+        hermitian=True,
+    ).item()
+
+    assert expected_rank == actual_rank, (
+        "PyTorch and ELPA disagree on the number of nonzero eigenvalues.\n"
+        f"PyTorch rank: {expected_rank}\n"
+        f"ELPA rank: {actual_rank}\n"
+        f"PyTorch eigenvalues: {expected_eigenvalues}\n"
+        f"ELPA eigenvalues: {actual_eigenvalues}"
+    )
+
+    # Eigenvalues are descending, so the first `rank` columns correspond
+    # to the numerically nonzero eigenvalues.
+    for index in range(expected_rank):
+        expected_vector = expected_eigenvectors[:, index]
+        actual_vector = actual_eigenvectors[:, index]
+
+        similarity = torch.cosine_similarity(
+            expected_vector,
+            actual_vector,
+            dim=0,
+        ).abs()
+
+        torch.testing.assert_close(
+            similarity,
+            torch.ones_like(similarity),
+            msg=(
+                f"Eigenvector {index} does not match "
+                "between PyTorch and ELPA up to sign."
+            ),
+        )
+
+    expected = expected_eigenvectors[:, :expected_rank]
+    merged = actual_eigenvectors[:, :actual_rank]
+    signs = torch.where(
+        (merged * expected).sum(dim=0) < 0,
+        -1.0,
+        1.0,
+    )
+    merged = merged * signs
+    difference = (merged - expected).norm()
+    original_size = expected.norm()
+    error = difference / original_size
+    if dist.get_rank() == 0:
+        print(
+            "Nonzero-eigenvector relative error: "
+            f"difference={difference.item():.6e}, "
+            f"original_size={original_size.item():.6e}, "
+            f"error={error.item():.6e}"
+        )
+
+
+# Check that the zero eigenspaces from PyTorch and ELPA are equivalent
+def _check_zero_eigenspaces_equivalent(
+    pytorch_eigenvalues,
+    pytorch_eigenvectors,
+    elpa_eigenvalues,
+    elpa_eigenvectors,
+):
+    """
+    Same order, possible sign difference:
+    overlap =
+    [ 1  0]
+    [ 0 -1]
+
+    different order:
+    overlap =
+    [0 1] ----> ELPA vector 0 matches PyTorch vector 1, sign = +1
+    [1 0]   ----> ELPA vector 1 matches PyTorch vector 0, sign = +1
+
+    Mixed or rotated within the same zero eigenspace:
+    overlap =
+    [ 0.707  0.707]
+    [ 0.707 -0.707]
+    """
+    # Convert the eigenvalue lists into diagonal matrices so that
+    # PyTorch can determine their numerical ranks.
+    pytorch_eigenvalue_matrix = torch.diag(pytorch_eigenvalues)
+    elpa_eigenvalue_matrix = torch.diag(elpa_eigenvalues)
+
+    pytorch_rank = torch.linalg.matrix_rank(
+        pytorch_eigenvalue_matrix,
+        hermitian=True,
+    ).item()
+
+    elpa_rank = torch.linalg.matrix_rank(
+        elpa_eigenvalue_matrix,
+        hermitian=True,
+    ).item()
+
+    # Both solvers should agree on how many eigenvalues are nonzero.
+    assert pytorch_rank == elpa_rank, (
+        "PyTorch and ELPA disagree on the number of zero eigenvalues.\n"
+        f"PyTorch rank: {pytorch_rank}\n"
+        f"ELPA rank: {elpa_rank}\n"
+        f"PyTorch eigenvalues: {pytorch_eigenvalues}\n"
+        f"ELPA eigenvalues: {elpa_eigenvalues}"
+    )
+
+    matrix_size = pytorch_eigenvalues.numel()
+    number_of_zero_eigenvalues = matrix_size - pytorch_rank
+
+    # There is nothing more to check when the matrix has full rank.
+    if number_of_zero_eigenvalues == 0:
         return
 
-    result = initialize_basis_2d_block_cyclic_(
-        *arguments,
-        elpa_binding=binding,
-    )
-    assert result is Q
+    # Eigenvalues are descending, so zero-eigenvalue eigenvectors
+    # occur in the final columns.
+    pytorch_zero_vectors = pytorch_eigenvectors[:, pytorch_rank:]
+    elpa_zero_vectors = elpa_eigenvectors[:, elpa_rank:]
 
-    local_result = (
-        global_rows,
-        global_columns,
-        Q[: len(global_rows), : len(global_columns)].contiguous(),
-    )
-    all_results = [None] * world_size
-    dist.all_gather_object(all_results, local_result)
-    global_Q = torch.empty((size, size), dtype=torch.float32)
-    for shard_rows, shard_columns, shard in all_results:
-        shard_rows = torch.tensor(shard_rows, dtype=torch.long)
-        shard_columns = torch.tensor(shard_columns, dtype=torch.long)
-        global_Q[shard_rows[:, None], shard_columns] = shard
+    # Build the matrix that projects onto each zero eigenspace.
+    pytorch_zero_projector = pytorch_zero_vectors @ pytorch_zero_vectors.T
+    elpa_zero_projector = elpa_zero_vectors @ elpa_zero_vectors.T
 
-    expected_values = torch.linalg.eigvalsh(matrix).flip(0)
+    overlap = pytorch_zero_vectors.T @ elpa_zero_vectors
+    absolute_overlap = overlap.abs()
+
+    if dist.get_rank() == 0:
+        print("Zero-eigenvector overlap:")
+        print(overlap)
+
+    # The individual vectors may differ, but their spanned space
+    # should be the same.
     torch.testing.assert_close(
-        eigenvalues,
-        expected_values,
-        atol=2e-3,
-        rtol=2e-3,
-    )
-    torch.testing.assert_close(
-        matrix @ global_Q,
-        global_Q * eigenvalues,
-        atol=3e-3,
-        rtol=3e-3,
-    )
-    torch.testing.assert_close(
-        global_Q.T @ global_Q,
-        torch.eye(size),
-        atol=2e-3,
-        rtol=2e-3,
+        elpa_zero_projector,
+        pytorch_zero_projector,
+        rtol=2e-4,
+        atol=2e-4,
     )
 
+    number_of_zero_vectors = absolute_overlap.shape[0]
 
-def _run_multirank_worker(binding_path, library_path):
-    rank = MPI.COMM_WORLD.Get_rank()
-    world_size = MPI.COMM_WORLD.Get_size()
-    assert world_size == 4
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    # Find which PyTorch vector best matches each ELPA vector.
+    matches = absolute_overlap.argmax(dim=0)
 
-    try:
-        binding = _load_binding(binding_path)
-        elpa = _load_elpa(library_path)
-        for case in MULTIRANK_CASES:
-            _solve_multirank_case(binding, elpa, case, rank, world_size)
-        for size in (1, 9):
-            _solve_production_initializer_case(
-                binding,
-                rank,
-                world_size,
-                size,
+    # Build the matrix expected for a pure reordering.
+    permutation = torch.zeros_like(absolute_overlap)
+    elpa_indices = torch.arange(
+        number_of_zero_vectors,
+        device=overlap.device,
+    )
+    permutation[matches, elpa_indices] = 1
+
+    if torch.allclose(
+        absolute_overlap,
+        torch.eye(
+            number_of_zero_vectors,
+            device=overlap.device,
+            dtype=overlap.dtype,
+        ),
+    ):
+        print("The vectors have the same order and may differ by sign.")
+
+    elif torch.unique(matches).numel() == number_of_zero_vectors and torch.allclose(
+        absolute_overlap, permutation
+    ):
+        print("The vectors differ only by order and/or sign.")
+
+        for elpa_index, pytorch_index in enumerate(matches.tolist()):
+            sign = overlap[pytorch_index, elpa_index].item()
+
+            print(
+                f"ELPA vector {elpa_index} matches "
+                f"PyTorch vector {pytorch_index}, "
+                f"sign = {sign:+.0f}"
             )
-    finally:
-        dist.destroy_process_group()
 
-
-class TestElpaBinding(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        include_dir = next((PREFIX / "include").glob("elpa-*"))
-        library_dir = PREFIX / "lib"
-        os.environ["CXX"] = "mpicxx"
-        os.environ["PATH"] = f"{Path(sys.executable).parent}:{os.environ['PATH']}"
-        os.environ["TORCH_EXTENSIONS_DIR"] = str(ROOT / "build/torch-extensions")
-        cls.binding = load(
-            name=f"_soap_tp_elpa_{PROFILE}_test",
-            sources=[str(ROOT / "src/soap_tp/csrc/elpa_bindings.cpp")],
-            extra_include_paths=[str(include_dir)],
-            extra_cflags=["-O0"],
-            extra_ldflags=[
-                f"-L{library_dir}",
-                "-lelpa",
-                f"-Wl,-rpath,{library_dir}",
-            ],
-        )
-        cls.library_path = next(
-            str(path)
-            for pattern in ("libelpa.*.dylib", "libelpa.so.*", "libelpa.so")
-            for path in library_dir.glob(pattern)
-        )
-
-    # Tests: the extension compiles, links against ELPA, and reports its backend.
-    # Expected: the reported backend is one supported by this binding.
-    def test_binding_loads(self):
-        self.assertIn(
-            self.binding.compiled_gpu_backend(),
-            {"none", "cuda", "rocm", "sycl"},
-        )
-
-    def _run_cases(self, cases, world_size):
-        mp.spawn(
-            _run_eigenvector_cases,
-            args=(
-                world_size,
-                _free_port(),
-                self.binding.__file__,
-                self.library_path,
-                cases,
-            ),
-            nprocs=world_size,
-            join=True,
-        )
-
-    # Tests: each raw-pointer argument enforces the documented integer-address API.
-    # Expected: a non-convertible value raises TypeError before native code runs.
-    def test_eigenvectors_float_rejects_non_integer_addresses(self):
-        valid_arguments = {"handle": 1, "a": 1, "ev": 1, "q": 1}
-        for argument in valid_arguments:
-            with self.subTest(argument=argument):
-                arguments = valid_arguments.copy()
-                arguments[argument] = object()
-                with self.assertRaises(TypeError):
-                    self.binding.elpa_eigenvectors_float(**arguments)
-
-    # Tests: single-rank solves at singleton, equal, partial, and oversized blocks.
-    # Expected: eigenvalues and eigenspaces match torch.linalg.eigh.
-    def test_eigenvectors_float_handles_block_boundaries(self):
-        self._run_cases(BLOCK_BOUNDARY_CASES, world_size=4)
-
-    # Tests: a symmetric matrix whose eigenvalues have multidimensional eigenspaces.
-    # Expected: ELPA and torch.linalg.eigh produce the same spectral projectors.
-    def test_eigenvectors_float_handles_repeated_eigenvalues(self):
-        self._run_cases(REPEATED_EIGENVALUE_CASE, world_size=1)
-
-    # Tests raw solves plus the production initializer's row-major rank remap.
-    # Expected: gathered global eigenpairs match torch.linalg.eigh.
-    def test_eigenvectors_float_multirank_block_cyclic(self):
-        mpiexec = shutil.which("mpiexec")
-        if mpiexec is None:
-            self.skipTest("mpiexec is required for the multirank ELPA test")
-
-        environment = os.environ.copy()
-        environment.update(
-            {
-                MULTIRANK_WORKER: "1",
-                MULTIRANK_BINDING_PATH: self.binding.__file__,
-                MULTIRANK_LIBRARY_PATH: self.library_path,
-                "MASTER_ADDR": "127.0.0.1",
-                "MASTER_PORT": str(_free_port()),
-                "OMP_NUM_THREADS": "1",
-            }
-        )
-        completed = subprocess.run(
-            [
-                mpiexec,
-                "--oversubscribe",
-                "-n",
-                "4",
-                sys.executable,
-                str(Path(__file__).resolve()),
-            ],
-            cwd=ROOT,
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        self.assertEqual(
-            completed.returncode,
-            0,
-            msg=(
-                f"multirank worker failed\nstdout:\n{completed.stdout}"
-                f"\nstderr:\n{completed.stderr}"
-            ),
-        )
-
-    # Tests: nev smaller than na while eigenvalue storage remains length na.
-    # Expected: all values and requested eigenspaces match torch.linalg.eigh.
-    def test_eigenvectors_float_returns_requested_eigenvectors(self):
-        self._run_cases(PARTIAL_EIGENVECTOR_CASE, world_size=1)
-
-
-if __name__ == "__main__":
-    if os.environ.get(MULTIRANK_WORKER) == "1":
-        _run_multirank_worker(
-            os.environ[MULTIRANK_BINDING_PATH],
-            os.environ[MULTIRANK_LIBRARY_PATH],
-        )
     else:
-        unittest.main()
+        print("The vectors are mixed or rotated within the same zero eigenspace.")
+
+
+def _check_elpa_matches_eigh(preconditioner):
+    expected_eigenvalues, expected_eigenvectors = _run_linalg_eigh(preconditioner)
+    actual_eigenvalues, actual_eigenvectors = _run_elpa_eigh(
+        preconditioner,
+        BLOCK_SIZE,
+        PROCESS_GRID_SHAPE,
+    )
+
+    if dist.get_rank() == 0:
+        print("PyTorch eigenvalues:")
+        print(expected_eigenvalues)
+
+        print("ELPA eigenvalues:")
+        print(actual_eigenvalues)
+
+        print("Difference:")
+        print(actual_eigenvalues - expected_eigenvalues)
+
+    torch.testing.assert_close(
+        actual_eigenvalues,
+        expected_eigenvalues,
+        rtol=2e-4,
+        atol=2e-4,
+    )
+
+    identity = torch.eye(
+        actual_eigenvectors.shape[1],
+        dtype=actual_eigenvectors.dtype,
+        device=actual_eigenvectors.device,
+    )
+    torch.testing.assert_close(
+        actual_eigenvectors.T @ actual_eigenvectors,
+        identity,
+        rtol=2e-4,
+        atol=2e-4,
+    )
+    torch.testing.assert_close(
+        preconditioner @ actual_eigenvectors,
+        actual_eigenvectors * actual_eigenvalues.unsqueeze(0),
+        rtol=2e-4,
+        atol=2e-4,
+    )
+
+    _check_eigenvectors_of_nonzero_eigenvalues_equivalent(
+        expected_eigenvalues,
+        expected_eigenvectors,
+        actual_eigenvalues,
+        actual_eigenvectors,
+    )
+    _check_zero_eigenspaces_equivalent(
+        expected_eigenvalues,
+        expected_eigenvectors,
+        actual_eigenvalues,
+        actual_eigenvectors,
+    )
+
+
+@pytest.fixture(scope="module")
+def mpi_world():
+    rank, world_size = _setup_mpi()
+    try:
+        if world_size != 4:
+            pytest.skip(
+                "ELPA binding tests require four MPI ranks; run with mpiexec -n 4."
+            )
+        yield rank, world_size
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "shape",
+    GRADIENT_SHAPES,
+    ids=lambda shape: f"{shape[0]}x{shape[1]}",
+)
+def test_left_preconditioner_eigendecomposition(shape, mpi_world):
+    gradient = _make_gradient(*shape)
+    preconditioner = _make_left_preconditioner(gradient)
+    _check_elpa_matches_eigh(preconditioner)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    GRADIENT_SHAPES,
+    ids=lambda shape: f"{shape[0]}x{shape[1]}",
+)
+def test_right_preconditioner_eigendecomposition(shape, mpi_world):
+    gradient = _make_gradient(*shape)
+    preconditioner = _make_right_preconditioner(gradient)
+    _check_elpa_matches_eigh(preconditioner)
