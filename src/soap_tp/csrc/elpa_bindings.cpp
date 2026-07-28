@@ -1,4 +1,5 @@
 #include <elpa/elpa.h>
+#include <elpa/elpa_configured_options.h>
 #include <elpa/elpa_version.h>
 #include <mpi.h>
 #include <pybind11/pybind11.h>
@@ -6,7 +7,6 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 namespace py = pybind11;
 
@@ -18,6 +18,16 @@ namespace py = pybind11;
 
 namespace
 {
+
+#if ELPA_WITH_NVIDIA_GPU_VERSION == 1 && ELPA_WITH_AMD_GPU_VERSION == 1
+#error "The ELPA binding cannot target NVIDIA and AMD GPUs simultaneously"
+#elif ELPA_WITH_NVIDIA_GPU_VERSION == 1
+constexpr char gpu_backend[] = "cuda";
+#elif ELPA_WITH_AMD_GPU_VERSION == 1
+constexpr char gpu_backend[] = "rocm";
+#else
+constexpr char gpu_backend[] = "none";
+#endif
 
 void require_elpa_ok(int error, const char *operation)
 {
@@ -57,7 +67,8 @@ void initialize_basis_2d_block_cyclic_(
     int local_columns,
     int block_size,
     int process_rows,
-    int process_columns)
+    int process_columns,
+    int gpu_id)
 {
     int rank = 0;
     int world_size = 0;
@@ -82,23 +93,23 @@ void initialize_basis_2d_block_cyclic_(
     const int process_row = rank / process_columns;
     const int process_column = rank % process_columns;
 
-    const auto *a = reinterpret_cast<const float *>(a_address);
-    auto *eigenvalues = reinterpret_cast<float *>(eigenvalues_address);
-    auto *q = reinterpret_cast<float *>(q_address);
-    const auto local_size =
-        static_cast<std::vector<double>::size_type>(local_rows) *
-        static_cast<std::vector<double>::size_type>(local_columns);
+    auto *a = reinterpret_cast<double *>(a_address);
+    auto *eigenvalues = reinterpret_cast<double *>(eigenvalues_address);
+    auto *q = reinterpret_cast<double *>(q_address);
 
-    std::vector<double> a_double(local_size);
-    std::vector<double> eigenvalues_double(n);
-    std::vector<double> q_double(local_size);
-
-    for (std::vector<double>::size_type index = 0;
-         index < local_size;
-         ++index)
+#if ELPA_WITH_NVIDIA_GPU_VERSION == 1 || ELPA_WITH_AMD_GPU_VERSION == 1
+    if (gpu_id < 0)
     {
-        a_double[index] = static_cast<double>(a[index]);
+        throw std::invalid_argument(
+            "a nonnegative GPU device index is required by this ELPA build");
     }
+#else
+    if (gpu_id != -1)
+    {
+        throw std::invalid_argument(
+            "the CPU ELPA build requires a GPU device index of -1");
+    }
+#endif
 
     bool elpa_initialized = false;
     elpa_t handle = nullptr;
@@ -135,27 +146,29 @@ void initialize_basis_2d_block_cyclic_(
         set_integer("process_col", process_column);
 
         require_elpa_ok(elpa_setup(handle), "elpa_setup");
+        set_integer("solver", ELPA_SOLVER_1STAGE);
+
+#if ELPA_WITH_NVIDIA_GPU_VERSION == 1
+        set_integer("nvidia-gpu", 1);
+#elif ELPA_WITH_AMD_GPU_VERSION == 1
+        set_integer("amd-gpu", 1);
+#endif
+
+#if ELPA_WITH_NVIDIA_GPU_VERSION == 1 || ELPA_WITH_AMD_GPU_VERSION == 1
+        set_integer("use_gpu_id", gpu_id);
+        // ELPA defaults use_ccl to one only when its library was built with
+        // NCCL or RCCL; otherwise its MPI communication path remains active.
+        require_elpa_ok(elpa_setup_gpu(handle), "elpa_setup_gpu");
+#endif
 
         error = ELPA_OK;
         elpa_eigenvectors_double(
             handle,
-            a_double.data(),
-            eigenvalues_double.data(),
-            q_double.data(),
+            a,
+            eigenvalues,
+            q,
             &error);
         require_elpa_ok(error, "elpa_eigenvectors_double");
-
-        for (std::vector<double>::size_type index = 0;
-             index < local_size;
-             ++index)
-        {
-            q[index] = static_cast<float>(q_double[index]);
-        }
-        for (int index = 0; index < n; ++index)
-        {
-            eigenvalues[index] =
-                static_cast<float>(eigenvalues_double[index]);
-        }
     }
     catch (...)
     {
@@ -186,12 +199,12 @@ void initialize_basis_2d_block_cyclic_(
 
 PYBIND11_MODULE(SOAP_TP_EXTENSION_NAME, module)
 {
-    module.doc() = "Minimal CPU bindings for ELPA";
+    module.doc() = "Minimal CPU and GPU bindings for ELPA";
 
     module.def(
         "compiled_gpu_backend",
         []()
-        { return "none"; });
+        { return gpu_backend; });
 
     module.def(
         "mpi_world_rank_and_size",
@@ -215,9 +228,9 @@ PYBIND11_MODULE(SOAP_TP_EXTENSION_NAME, module)
         py::arg("block_size"),
         py::arg("process_rows"),
         py::arg("process_columns"),
+        py::arg("gpu_id") = -1,
         py::call_guard<py::gil_scoped_release>());
 
-    // Compatibility name used by soap_tp.ops.factorizations.
-    module.attr("elpa_eigenvectors_2d_block_cyclic_float") =
+    module.attr("elpa_eigenvectors_2d_block_cyclic_double") =
         module.attr("initialize_basis_2d_block_cyclic_");
 }

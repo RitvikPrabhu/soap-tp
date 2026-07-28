@@ -14,6 +14,7 @@ import torch.multiprocessing as mp
 from mpi4py import MPI
 from torch.utils.cpp_extension import load
 
+from soap_tp import elpa_bindings
 from soap_tp.ops._utils import (
     allocate_2d_block_cyclic,
     block_cyclic_indices,
@@ -26,15 +27,71 @@ SEED = 42
 BLOCK_SIZE = 2
 PROCESS_GRID_SHAPE = (2, 2)
 GRADIENT_SHAPES = (
-    # (8, 8),
-    # (8, 12),
+    (8, 8),
+    (8, 12),
     (12, 8),
-    # (9, 13),
-    # (13, 9),
+    (9, 13),
+    (13, 9),
 )
 
 
-def _setup_mpi():
+def _compiled_backend_device():
+    backend = elpa_bindings.compiled_gpu_backend()
+    if backend not in {"none", "cuda", "rocm"}:
+        raise RuntimeError(f"ELPA reported unsupported backend {backend!r}.")
+    if backend == "none":
+        return backend, torch.device("cpu")
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(f"ELPA was compiled for {backend}, but no GPU is visible.")
+    runtime_backend = "rocm" if torch.version.hip is not None else "cuda"
+    if backend != runtime_backend:
+        raise RuntimeError(
+            f"ELPA was compiled for {backend}, but PyTorch uses {runtime_backend}."
+        )
+
+    shared_world = MPI.COMM_WORLD.Split_type(MPI.COMM_TYPE_SHARED)
+    try:
+        local_rank = shared_world.Get_rank()
+        local_size = shared_world.Get_size()
+        visible_device = next(
+            (
+                (name, os.environ[name])
+                for name in (
+                    "CUDA_VISIBLE_DEVICES",
+                    "ROCR_VISIBLE_DEVICES",
+                    "HIP_VISIBLE_DEVICES",
+                )
+                if os.environ.get(name)
+            ),
+            None,
+        )
+        visible_devices = shared_world.allgather(visible_device)
+    finally:
+        shared_world.Free()
+
+    device_count = torch.cuda.device_count()
+    if device_count == 1:
+        if local_size > 1 and (
+            None in visible_devices
+            or len(set(visible_devices)) != local_size
+        ):
+            raise RuntimeError(
+                "one GPU is visible to every local MPI rank, but the launcher "
+                "does not report a distinct per-rank GPU mask."
+            )
+        device_index = 0
+    elif local_size <= device_count:
+        device_index = local_rank
+    else:
+        raise RuntimeError(
+            f"{local_size} local MPI ranks share only {device_count} visible GPUs."
+        )
+    torch.cuda.set_device(device_index)
+    return backend, torch.device("cuda", device_index)
+
+
+def _setup_mpi(device):
     rank = MPI.COMM_WORLD.Get_rank()
     world_size = MPI.COMM_WORLD.Get_size()
 
@@ -54,7 +111,7 @@ def _setup_mpi():
     os.environ["MASTER_ADDR"] = address
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(
-        "gloo",
+        "nccl" if device.type == "cuda" else "gloo",
         rank=rank,
         world_size=world_size,
     )
@@ -459,16 +516,28 @@ def _check_elpa_matches_eigh(preconditioner):
 
 @pytest.fixture(scope="module")
 def mpi_world():
-    rank, world_size = _setup_mpi()
+    backend, device = _compiled_backend_device()
+    rank, world_size = _setup_mpi(device)
     try:
         if world_size != 4:
             pytest.skip(
                 "ELPA binding tests require four MPI ranks; run with mpiexec -n 4."
             )
-        yield rank, world_size
+        yield rank, world_size, backend, device
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
+
+
+def test_compiled_backend_matches_test_device(mpi_world):
+    _rank, _world_size, backend, device = mpi_world
+    assert elpa_bindings.compiled_gpu_backend() == backend
+    assert device.type == ("cpu" if backend == "none" else "cuda")
+    if backend == "cuda":
+        assert torch.version.cuda is not None
+        assert torch.version.hip is None
+    elif backend == "rocm":
+        assert torch.version.hip is not None
 
 
 @pytest.mark.parametrize(
@@ -477,7 +546,8 @@ def mpi_world():
     ids=lambda shape: f"{shape[0]}x{shape[1]}",
 )
 def test_left_preconditioner_eigendecomposition(shape, mpi_world):
-    gradient = _make_gradient(*shape)
+    _rank, _world_size, _backend, device = mpi_world
+    gradient = _make_gradient(*shape).to(device)
     preconditioner = _make_left_preconditioner(gradient)
     _check_elpa_matches_eigh(preconditioner)
 
@@ -488,6 +558,7 @@ def test_left_preconditioner_eigendecomposition(shape, mpi_world):
     ids=lambda shape: f"{shape[0]}x{shape[1]}",
 )
 def test_right_preconditioner_eigendecomposition(shape, mpi_world):
-    gradient = _make_gradient(*shape)
+    _rank, _world_size, _backend, device = mpi_world
+    gradient = _make_gradient(*shape).to(device)
     preconditioner = _make_right_preconditioner(gradient)
     _check_elpa_matches_eigh(preconditioner)

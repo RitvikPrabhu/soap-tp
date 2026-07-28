@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any, Literal, Optional, Tuple
 
 import torch
@@ -377,7 +378,8 @@ def initialize_basis_2d_block_cyclic_(
     """Initialize a descending eigenbasis with ELPA.
 
     The packed preconditioner must contain both triangles. ``work`` is
-    overwritten because ELPA may destroy its input.
+    overwritten because ELPA may destroy its input. The public buffers remain
+    float32 while ELPA solves staged float64 buffers on the same device.
     """
     rank, world_size = _validate_world(process_grid_shape)
     local_rows = local_columns = 0
@@ -436,22 +438,52 @@ def initialize_basis_2d_block_cyclic_(
     # makes that order correspond to descending eigenvalues of A, avoiding a
     # distributed permutation of the eigenvector columns afterward.
     work.copy_(preconditioner).neg_()
-    process_rows, process_columns = process_grid_shape
-    _synchronize(preconditioner.device)
-    binding.elpa_eigenvectors_2d_block_cyclic_float(
-        work.data_ptr(),
-        eigenvalues.data_ptr(),
-        Q.data_ptr(),
-        size,
-        local_rows,
-        local_columns,
-        block_size,
-        process_rows,
-        process_columns,
+    work_double = torch.empty_strided(
+        work.size(),
+        work.stride(),
+        dtype=torch.float64,
+        device=work.device,
     )
-    _synchronize(preconditioner.device)
+    work_double.copy_(work)
+    Q_double = torch.empty_strided(
+        Q.size(),
+        Q.stride(),
+        dtype=torch.float64,
+        device=Q.device,
+    )
+    eigenvalues_double = torch.empty_like(
+        eigenvalues,
+        dtype=torch.float64,
+    )
+    process_rows, process_columns = process_grid_shape
+    gpu_id = -1
+    if preconditioner.device.type == "cuda":
+        gpu_id = preconditioner.device.index
+        if gpu_id is None:
+            gpu_id = torch.cuda.current_device()
+    device_guard = (
+        torch.cuda.device(preconditioner.device)
+        if preconditioner.device.type == "cuda"
+        else nullcontext()
+    )
+    with device_guard:
+        _synchronize(preconditioner.device)
+        binding.elpa_eigenvectors_2d_block_cyclic_double(
+            work_double.data_ptr(),
+            eigenvalues_double.data_ptr(),
+            Q_double.data_ptr(),
+            size,
+            local_rows,
+            local_columns,
+            block_size,
+            process_rows,
+            process_columns,
+            gpu_id,
+        )
+        _synchronize(preconditioner.device)
 
-    eigenvalues.neg_()
+    Q.copy_(Q_double)
+    eigenvalues.copy_(eigenvalues_double).neg_()
     return Q
 
 

@@ -55,6 +55,15 @@ build/slate-install/<profile>
 build/math-install
 ```
 
+All three profiles build the same source. The profile selects the ELPA and
+SLATE backends and the native libraries linked into the Python extensions. A
+CPU-only machine does not need CUDA, ROCm, NCCL, or RCCL:
+
+```bash
+./scripts/build_native.sh cpu
+./scripts/rebuild_bindings.sh cpu
+```
+
 The script accepts two omission flags:
 
 ```bash
@@ -89,16 +98,49 @@ SLATE_CMAKE_ARGS
 The script never searches for another math-library installation. It always
 uses the repository's pinned OpenBLAS and ScaLAPACK sources.
 
+### Optional GPU collectives
+
+CUDA and ROCm builds use MPI by default. ELPA can additionally use NCCL or RCCL
+for GPU collectives when the corresponding library is installed:
+
+```bash
+ELPA_CONFIGURE_ARGS="--enable-gpu-ccl=nccl --with-nccl-path=/path/to/nccl" \
+    ./scripts/build_native.sh cuda
+
+ELPA_CONFIGURE_ARGS="--enable-gpu-ccl=rccl" \
+    ./scripts/build_native.sh rocm
+```
+
+Omit `--with-nccl-path` when the active compiler and dynamic linker already
+find NCCL. This vendored ELPA release parses `--with-rccl-path`, but does not
+apply it to the compiler or linker flags; make RCCL discoverable through the
+active module environment, `CPPFLAGS`, and `LDFLAGS` instead.
+
+When CCL support is compiled in, ELPA enables `use_ccl` by default and creates
+its own parent, process-row, and process-column communicators during GPU setup.
+ELPA still uses MPI to bootstrap those communicators. Its CCL detector expects
+one MPI rank per GPU and every rank on a node to see the node's GPU set; map
+each local rank to a distinct device. If ranks see only their individually
+masked GPU, ELPA falls back to MPI collectives. CCL support cannot be combined
+with ELPA OpenMP (`--enable-openmp`) or CUDA-aware MPI
+(`--enable-cuda-aware-mpi`). After CCL is active, communicator or collective
+failures terminate the MPI job rather than switching back to MPI.
+
 ## Python bindings
 
 After the native build, compile the pybind extensions in place:
 
 ```bash
 ./scripts/rebuild_bindings.sh cpu
+./scripts/rebuild_bindings.sh cuda
+./scripts/rebuild_bindings.sh rocm
 ```
 
-Use the same profile, compiler variables, and external prefixes used for the
-native libraries. Add `--force` only when a full extension rebuild is needed:
+Only run the line matching the native build. The same binding source supports
+host tensors in the `cpu` profile and device tensors in the `cuda` and `rocm`
+profiles. Use the same profile, compiler variables, and external prefixes used
+for the native libraries. Add `--force` only when a full extension rebuild is
+needed:
 
 ```bash
 ./scripts/rebuild_bindings.sh rocm --force
@@ -110,5 +152,15 @@ Make the source tree importable:
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
-The native library modules used during the build must also be available at
-runtime.
+The dynamic loader must find the selected ELPA and SLATE libraries, the pinned
+math libraries, and, for GPU builds, the CUDA or ROCm and optional NCCL or RCCL
+runtime libraries. Prefer the machine's module or loader configuration. When
+needed on Linux, add the local prefixes explicitly:
+
+```bash
+PROFILE=cuda
+export LD_LIBRARY_PATH="$PWD/build/elpa-install/$PROFILE/lib:$PWD/build/slate-install/$PROFILE/lib:$PWD/build/math-install/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+```
+
+Use `DYLD_LIBRARY_PATH` instead on macOS. Also include non-system GPU or CCL
+library directories when their installation is not already discoverable.
