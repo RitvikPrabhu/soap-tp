@@ -244,9 +244,7 @@ def correctness_worker(args, rank, ranks, device):
         "ranks": ranks,
         "iterations": [],
         "update_relative_l2": [],
-        "parameter_relative_l2": [],
         "update_opposite_fraction": [],
-        "parameter_opposite_fraction": [],
     }
 
     for call in range(args.iterations + 1):
@@ -270,24 +268,11 @@ def correctness_worker(args, rank, ranks, device):
         reference_update = scatter(
             reference_update, args.n, args.shard_dim, rank, ranks, device
         )
-        reference_value = scatter(
-            reference_parameter.detach() if rank == 0 else None,
-            args.n,
-            args.shard_dim,
-            rank,
-            ranks,
-            device,
-        )
         update_error, update_sign = compare_tensors(update, reference_update, device)
-        parameter_error, parameter_sign = compare_tensors(
-            parameter, reference_value, device
-        )
         if call:
             result["iterations"].append(call)
             result["update_relative_l2"].append(update_error)
-            result["parameter_relative_l2"].append(parameter_error)
             result["update_opposite_fraction"].append(update_sign)
-            result["parameter_opposite_fraction"].append(parameter_sign)
     return result if rank == 0 else None
 
 
@@ -504,8 +489,8 @@ def plot_correctness(results, output):
     from matplotlib.ticker import PercentFormatter
 
     data = [result for result in results if result["experiment"] == "correctness"]
-    figure, axes = plt.subplots(1, 3, figsize=(17, 4.8))
-    all_update_errors, all_parameter_errors = [], []
+    figure, axes = plt.subplots(1, 2, figsize=(11.5, 4.8))
+    all_update_errors = []
     for result in data:
         label = f"N={result['n']}"
         axes[0].plot(
@@ -513,30 +498,16 @@ def plot_correctness(results, output):
         )
         axes[1].plot(
             result["iterations"],
-            result["parameter_relative_l2"],
+            result["update_opposite_fraction"],
             marker="o",
             label=label,
         )
-        axes[2].plot(
-            result["iterations"],
-            result["update_opposite_fraction"],
-            label=f"{label} update",
-        )
-        axes[2].plot(
-            result["iterations"],
-            result["parameter_opposite_fraction"],
-            linestyle="--",
-            label=f"{label} parameter",
-        )
         all_update_errors += result["update_relative_l2"]
-        all_parameter_errors += result["parameter_relative_l2"]
 
     if all(value > 0 for value in all_update_errors):
         axes[0].set_yscale("log")
-    if all(value > 0 for value in all_parameter_errors):
-        axes[1].set_yscale("log")
-    axes[2].yaxis.set_major_formatter(PercentFormatter(1.0))
-    titles = ("SOAP update relative L2", "Parameter relative L2", "Opposite signs")
+    axes[1].yaxis.set_major_formatter(PercentFormatter(1.0))
+    titles = ("SOAP update relative L2", "SOAP update opposite signs")
     for axis, title in zip(axes, titles):
         axis.set_title(title)
         axis.set_xlabel("Update")
@@ -658,9 +629,7 @@ def write_log(results, path):
         "repeat",
         "iteration",
         "update_relative_l2",
-        "parameter_relative_l2",
         "update_opposite_fraction",
-        "parameter_opposite_fraction",
         "seconds_per_step",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -680,14 +649,8 @@ def write_log(results, path):
                         "ranks": result["ranks"],
                         "iteration": iteration,
                         "update_relative_l2": result["update_relative_l2"][index],
-                        "parameter_relative_l2": result["parameter_relative_l2"][
-                            index
-                        ],
                         "update_opposite_fraction": result[
                             "update_opposite_fraction"
-                        ][index],
-                        "parameter_opposite_fraction": result[
-                            "parameter_opposite_fraction"
                         ][index],
                     }
                 )
