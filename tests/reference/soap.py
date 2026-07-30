@@ -1,3 +1,6 @@
+import json
+import os
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -6,6 +9,40 @@ from itertools import chain
 
 # Parts of the code are modifications of Pytorch's AdamW optimizer
 # Parts of the code are modifications of code from https://github.com/jiaweizzhao/GaLore/blob/master/galore_torch/galore_projector.py
+
+
+def _soap_profile_enabled(step):
+    if os.environ.get("SOAP_PROFILE", "").lower() not in {"1", "true", "yes"}:
+        return False
+    requested_steps = os.environ.get("SOAP_PROFILE_STEPS")
+    if not requested_steps:
+        return True
+    return step in {
+        int(requested_step.strip())
+        for requested_step in requested_steps.split(",")
+        if requested_step.strip()
+    }
+
+
+def _soap_profile_tensor(stage, step, tensor):
+    if not _soap_profile_enabled(step):
+        return
+    detached = tensor.detach()
+    print(
+        "SOAP_PROFILE "
+        + json.dumps(
+            {
+                "impl": "reference",
+                "step": step,
+                "stage": stage,
+                "shape": list(detached.shape),
+                "dtype": str(detached.dtype).removeprefix("torch."),
+                "values": detached.cpu().reshape(-1).tolist(),
+            },
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
 
 
 class SOAP(optim.Optimizer):
@@ -125,6 +162,15 @@ class SOAP(optim.Optimizer):
                 grad = p.grad
 
                 state = self.state[p]
+                profile_step = (
+                    0 if "Q" not in state else int(state.get("step", 0)) + 1
+                )
+                profile_parameter_before = (
+                    p.detach().clone()
+                    if _soap_profile_enabled(profile_step)
+                    else None
+                )
+                _soap_profile_tensor("gradient", profile_step, grad)
 
                 if "step" not in state:
                     state["step"] = 0
@@ -150,12 +196,51 @@ class SOAP(optim.Optimizer):
                                                max_precond_dim=group['max_precond_dim'],
                                                merge_dims=group["merge_dims"],
                                                precondition_1d=group["precondition_1d"])
+                    if len(state["GG"]) == 2:
+                        _soap_profile_tensor(
+                            "left_preconditioner", profile_step, state["GG"][0]
+                        )
+                        _soap_profile_tensor(
+                            "right_preconditioner", profile_step, state["GG"][1]
+                        )
+                        _soap_profile_tensor(
+                            "left_basis", profile_step, state["Q"][0]
+                        )
+                        _soap_profile_tensor(
+                            "right_basis", profile_step, state["Q"][1]
+                        )
+                    _soap_profile_tensor(
+                        "returned_update", profile_step, torch.zeros_like(grad)
+                    )
                     continue # first step is skipped so that we never use the current gradients in the projection.
+
+                if len(state["GG"]) == 2:
+                    _soap_profile_tensor(
+                        "left_preconditioner", profile_step, state["GG"][0]
+                    )
+                    _soap_profile_tensor(
+                        "right_preconditioner", profile_step, state["GG"][1]
+                    )
+                    _soap_profile_tensor(
+                        "left_basis", profile_step, state["Q"][0]
+                    )
+                    _soap_profile_tensor(
+                        "right_basis", profile_step, state["Q"][1]
+                    )
+                _soap_profile_tensor(
+                    "momentum_before_adam", profile_step, state["exp_avg"]
+                )
+                _soap_profile_tensor(
+                    "variance_before_adam", profile_step, state["exp_avg_sq"]
+                )
 
                 # Projecting gradients to the eigenbases of Shampoo's preconditioner
                 # i.e. projecting to the eigenbases of matrices in state['GG']
                 grad_projected = self.project(grad, state, merge_dims=group["merge_dims"],
                                               max_precond_dim=group['max_precond_dim'])
+                _soap_profile_tensor(
+                    "projected_gradient", profile_step, grad_projected
+                )
 
                 exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
                 beta1, beta2 = group["betas"]
@@ -166,6 +251,12 @@ class SOAP(optim.Optimizer):
                 # In-place operations to update the averages at the same time
                 exp_avg.mul_(beta1).add_(grad_projected, alpha=(1.0 - beta1))
                 exp_avg_sq.mul_(beta2).add_(grad_projected.square(), alpha=(1.0 - beta2))
+                _soap_profile_tensor(
+                    "momentum_after_adam", profile_step, exp_avg
+                )
+                _soap_profile_tensor(
+                    "variance_after_adam", profile_step, exp_avg_sq
+                )
 
                 denom = exp_avg_sq.sqrt().add_(group["eps"])
 
@@ -181,6 +272,12 @@ class SOAP(optim.Optimizer):
                     bias_correction2 = 1.0 - beta2 ** (state["step"])
                     step_size = step_size * (bias_correction2 ** .5) / bias_correction1
 
+                _soap_profile_tensor(
+                    "coordinate_update",
+                    profile_step,
+                    (exp_avg_projected / denom) * step_size,
+                )
+
                 # Projecting back the preconditioned (by Adam) exponential moving average of gradients
                 # to the original space
                 norm_grad = self.project_back(exp_avg_projected / denom, state, merge_dims=group["merge_dims"],
@@ -189,6 +286,9 @@ class SOAP(optim.Optimizer):
                 if group["normalize_grads"]:
                     norm_grad = norm_grad / (1e-30+torch.mean(norm_grad**2)**0.5)
 
+                _soap_profile_tensor(
+                    "backrotated_update", profile_step, norm_grad * step_size
+                )
                 p.add_(norm_grad, alpha=-step_size)
 
 
@@ -203,11 +303,44 @@ class SOAP(optim.Optimizer):
                 if group["weight_decay"] > 0.0:
                     p.add_(p, alpha=(-group["lr"] * group["weight_decay"]))
 
+                _soap_profile_tensor(
+                    "parameter_after_step", profile_step, p
+                )
+                if profile_parameter_before is not None:
+                    _soap_profile_tensor(
+                        "returned_update",
+                        profile_step,
+                        profile_parameter_before - p.detach(),
+                    )
+
                 # Update is done after the gradient step to avoid using current gradients in the projection.
                 self.update_preconditioner(grad, state,
                                                max_precond_dim=group['max_precond_dim'],
                                                merge_dims=group["merge_dims"],
                                                precondition_1d=group["precondition_1d"])
+                if len(state["GG"]) == 2:
+                    _soap_profile_tensor(
+                        "left_preconditioner_after_step",
+                        profile_step,
+                        state["GG"][0],
+                    )
+                    _soap_profile_tensor(
+                        "right_preconditioner_after_step",
+                        profile_step,
+                        state["GG"][1],
+                    )
+                    _soap_profile_tensor(
+                        "left_basis_after_step", profile_step, state["Q"][0]
+                    )
+                    _soap_profile_tensor(
+                        "right_basis_after_step", profile_step, state["Q"][1]
+                    )
+                _soap_profile_tensor(
+                    "momentum_after_step", profile_step, state["exp_avg"]
+                )
+                _soap_profile_tensor(
+                    "variance_after_step", profile_step, state["exp_avg_sq"]
+                )
 
         return loss
 

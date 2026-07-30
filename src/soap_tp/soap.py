@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import math
+import os
 from typing import Any, Literal, MutableMapping
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 
 from .ops import (
@@ -17,6 +20,104 @@ from .ops import (
     update_left_preconditioner_2d_block_cyclic_,
     update_right_preconditioner_2d_block_cyclic_,
 )
+from .ops._utils import block_cyclic_indices
+
+
+def _soap_profile_enabled(step: int) -> bool:
+    if os.environ.get("SOAP_PROFILE", "").lower() not in {"1", "true", "yes"}:
+        return False
+    requested_steps = os.environ.get("SOAP_PROFILE_STEPS")
+    if not requested_steps:
+        return True
+    return step in {
+        int(requested_step.strip())
+        for requested_step in requested_steps.split(",")
+        if requested_step.strip()
+    }
+
+
+def _soap_profile_tensor(stage: str, step: int, tensor: Tensor) -> None:
+    if dist.get_rank() != 0:
+        return
+    detached = tensor.detach()
+    print(
+        "SOAP_PROFILE "
+        + json.dumps(
+            {
+                "impl": "tp",
+                "step": step,
+                "stage": stage,
+                "shape": list(detached.shape),
+                "dtype": str(detached.dtype).removeprefix("torch."),
+                "values": detached.cpu().reshape(-1).tolist(),
+            },
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
+
+
+def _soap_profile_tp_shard(
+    stage: str,
+    step: int,
+    tensor: Tensor,
+    shard_dim: Literal[0, 1],
+) -> None:
+    if not _soap_profile_enabled(step):
+        return
+    shards = [
+        torch.empty_like(tensor)
+        for _ in range(dist.get_world_size())
+    ]
+    dist.all_gather(shards, tensor.contiguous())
+    _soap_profile_tensor(stage, step, torch.cat(shards, dim=shard_dim))
+
+
+def _soap_profile_2d_block_cyclic(
+    stage: str,
+    step: int,
+    tensor: Tensor,
+    global_shape: tuple[int, int],
+    block_size: int,
+    process_grid_shape: tuple[int, int],
+) -> None:
+    if not _soap_profile_enabled(step):
+        return
+    rank = dist.get_rank()
+    process_rows, process_columns = process_grid_shape
+    process_row = rank // process_columns
+    process_column = rank % process_columns
+    rows, columns = global_shape
+    row_indices = block_cyclic_indices(
+        rows,
+        block_size,
+        process_row,
+        process_rows,
+    )
+    column_indices = block_cyclic_indices(
+        columns,
+        block_size,
+        process_column,
+        process_columns,
+    )
+    full_tensor = tensor.new_zeros(global_shape)
+    if row_indices and column_indices:
+        row_index = torch.tensor(
+            row_indices,
+            dtype=torch.long,
+            device=tensor.device,
+        )
+        column_index = torch.tensor(
+            column_indices,
+            dtype=torch.long,
+            device=tensor.device,
+        )
+        full_tensor[row_index[:, None], column_index] = tensor[
+            : len(row_indices),
+            : len(column_indices),
+        ]
+    dist.all_reduce(full_tensor)
+    _soap_profile_tensor(stage, step, full_tensor)
 
 
 @torch.no_grad()
@@ -74,6 +175,13 @@ def soap_step(
             )
 
     gradient_float = gradient_shard.detach().to(torch.float32).contiguous()
+    profile_step = 0 if initializing else int(state["step"]) + 1
+    _soap_profile_tp_shard(
+        "gradient",
+        profile_step,
+        gradient_float,
+        shard_dim,
+    )
 
     if initializing:
         update_left_preconditioner_2d_block_cyclic_(
@@ -84,6 +192,14 @@ def soap_step(
             process_grid_shape,
             shard_dim=shard_dim,
         )
+        _soap_profile_2d_block_cyclic(
+            "left_preconditioner",
+            profile_step,
+            state["left_preconditioner"],
+            (rows, rows),
+            block_size,
+            process_grid_shape,
+        )
         update_right_preconditioner_2d_block_cyclic_(
             gradient_float,
             state["right_preconditioner"],
@@ -91,6 +207,14 @@ def soap_step(
             block_size,
             process_grid_shape,
             shard_dim=shard_dim,
+        )
+        _soap_profile_2d_block_cyclic(
+            "right_preconditioner",
+            profile_step,
+            state["right_preconditioner"],
+            (columns, columns),
+            block_size,
+            process_grid_shape,
         )
         initialize_basis_2d_block_cyclic_(
             state["left_preconditioner"],
@@ -101,6 +225,14 @@ def soap_step(
             block_size,
             process_grid_shape,
             elpa_binding=elpa_binding,
+        )
+        _soap_profile_2d_block_cyclic(
+            "left_basis",
+            profile_step,
+            state["left_basis"],
+            (rows, rows),
+            block_size,
+            process_grid_shape,
         )
         initialize_basis_2d_block_cyclic_(
             state["right_preconditioner"],
@@ -116,16 +248,87 @@ def soap_step(
             process_grid_shape,
             elpa_binding=elpa_binding,
         )
+        _soap_profile_2d_block_cyclic(
+            "right_basis",
+            profile_step,
+            state["right_basis"],
+            (columns, columns),
+            block_size,
+            process_grid_shape,
+        )
         state["step"] = 0
-        return torch.zeros_like(gradient_float)
+        zero_update = torch.zeros_like(gradient_float)
+        _soap_profile_tp_shard(
+            "returned_update",
+            profile_step,
+            zero_update,
+            shard_dim,
+        )
+        return zero_update
 
     step = int(state["step"]) + 1
+    _soap_profile_2d_block_cyclic(
+        "left_preconditioner",
+        profile_step,
+        state["left_preconditioner"],
+        (rows, rows),
+        block_size,
+        process_grid_shape,
+    )
+    _soap_profile_2d_block_cyclic(
+        "right_preconditioner",
+        profile_step,
+        state["right_preconditioner"],
+        (columns, columns),
+        block_size,
+        process_grid_shape,
+    )
+    _soap_profile_2d_block_cyclic(
+        "left_basis",
+        profile_step,
+        state["left_basis"],
+        (rows, rows),
+        block_size,
+        process_grid_shape,
+    )
+    _soap_profile_2d_block_cyclic(
+        "right_basis",
+        profile_step,
+        state["right_basis"],
+        (columns, columns),
+        block_size,
+        process_grid_shape,
+    )
+    _soap_profile_2d_block_cyclic(
+        "momentum_before_adam",
+        profile_step,
+        state["momentum"],
+        global_shape,
+        block_size,
+        process_grid_shape,
+    )
+    _soap_profile_2d_block_cyclic(
+        "variance_before_adam",
+        profile_step,
+        state["variance"],
+        global_shape,
+        block_size,
+        process_grid_shape,
+    )
     packed_gradient = redistribute_tp_shard_to_2d_block_cyclic(
         gradient_float,
         global_shape,
         block_size,
         process_grid_shape,
         shard_dim=shard_dim,
+    )
+    _soap_profile_2d_block_cyclic(
+        "gradient_2d",
+        profile_step,
+        packed_gradient,
+        global_shape,
+        block_size,
+        process_grid_shape,
     )
     rotate_2d_block_cyclic_(
         packed_gradient,
@@ -137,6 +340,14 @@ def soap_step(
         direction="forward",
         slate_binding=slate_binding,
     )
+    _soap_profile_2d_block_cyclic(
+        "projected_gradient",
+        profile_step,
+        packed_gradient,
+        global_shape,
+        block_size,
+        process_grid_shape,
+    )
     packed_update = adam_update(
         packed_gradient,
         state["momentum"],
@@ -145,6 +356,30 @@ def soap_step(
         beta1,
         beta2,
         eps / math.sqrt(1.0 - beta2**step),
+    )
+    _soap_profile_2d_block_cyclic(
+        "momentum_after_adam",
+        profile_step,
+        state["momentum"],
+        global_shape,
+        block_size,
+        process_grid_shape,
+    )
+    _soap_profile_2d_block_cyclic(
+        "variance_after_adam",
+        profile_step,
+        state["variance"],
+        global_shape,
+        block_size,
+        process_grid_shape,
+    )
+    _soap_profile_2d_block_cyclic(
+        "coordinate_update",
+        profile_step,
+        packed_update,
+        global_shape,
+        block_size,
+        process_grid_shape,
     )
     rotate_2d_block_cyclic_(
         packed_update,
@@ -156,12 +391,26 @@ def soap_step(
         direction="backward",
         slate_binding=slate_binding,
     )
+    _soap_profile_2d_block_cyclic(
+        "backrotated_update",
+        profile_step,
+        packed_update,
+        global_shape,
+        block_size,
+        process_grid_shape,
+    )
     update_shard = redistribute_2d_block_cyclic_to_tp_shard(
         packed_update,
         global_shape,
         block_size,
         process_grid_shape,
         shard_dim=shard_dim,
+    )
+    _soap_profile_tp_shard(
+        "returned_update",
+        profile_step,
+        update_shard,
+        shard_dim,
     )
 
     update_left_preconditioner_2d_block_cyclic_(
@@ -172,6 +421,14 @@ def soap_step(
         process_grid_shape,
         shard_dim=shard_dim,
     )
+    _soap_profile_2d_block_cyclic(
+        "left_preconditioner_after_step",
+        profile_step,
+        state["left_preconditioner"],
+        (rows, rows),
+        block_size,
+        process_grid_shape,
+    )
     update_right_preconditioner_2d_block_cyclic_(
         gradient_float,
         state["right_preconditioner"],
@@ -179,6 +436,14 @@ def soap_step(
         block_size,
         process_grid_shape,
         shard_dim=shard_dim,
+    )
+    _soap_profile_2d_block_cyclic(
+        "right_preconditioner_after_step",
+        profile_step,
+        state["right_preconditioner"],
+        (columns, columns),
+        block_size,
+        process_grid_shape,
     )
     if step % basis_refresh_interval == 0:
         refresh_bases_and_transport_optimizer_state_(
@@ -196,6 +461,38 @@ def soap_step(
             slate_binding=slate_binding,
         )
 
+    _soap_profile_2d_block_cyclic(
+        "left_basis_after_step",
+        profile_step,
+        state["left_basis"],
+        (rows, rows),
+        block_size,
+        process_grid_shape,
+    )
+    _soap_profile_2d_block_cyclic(
+        "right_basis_after_step",
+        profile_step,
+        state["right_basis"],
+        (columns, columns),
+        block_size,
+        process_grid_shape,
+    )
+    _soap_profile_2d_block_cyclic(
+        "momentum_after_step",
+        profile_step,
+        state["momentum"],
+        global_shape,
+        block_size,
+        process_grid_shape,
+    )
+    _soap_profile_2d_block_cyclic(
+        "variance_after_step",
+        profile_step,
+        state["variance"],
+        global_shape,
+        block_size,
+        process_grid_shape,
+    )
     state["step"] = step
     return update_shard
 

@@ -220,9 +220,7 @@ def estimated_eigenvalue_order_2d_block_cyclic_(
             raise ValueError("preconditioner, Q, and work must share a device.")
     if len({matrix.data_ptr() for _, matrix in buffers}) != len(buffers):
         raise ValueError("preconditioner, Q, and work must not overlap.")
-    if not (
-        preconditioner.stride(1) == Q.stride(1) == work.stride(1)
-    ):
+    if not (preconditioner.stride(1) == Q.stride(1) == work.stride(1)):
         raise ValueError("preconditioner, Q, and work LDAs must match.")
 
     binding = _validated_native_binding(
@@ -255,8 +253,7 @@ def estimated_eigenvalue_order_2d_block_cyclic_(
         process_columns,
     )
     local_estimates = (
-        Q[:local_rows, :local_columns]
-        * work[:local_rows, :local_columns]
+        Q[:local_rows, :local_columns] * work[:local_rows, :local_columns]
     ).sum(dim=0)
     estimates = torch.zeros(
         size,
@@ -427,6 +424,72 @@ def initialize_basis_2d_block_cyclic_(
     if eigenvalues.device != preconditioner.device:
         raise ValueError("eigenvalues must share the matrix device.")
 
+    # ###########################################################################
+    # # TEMPORARY TORCH EIGH PATH
+    # #
+    # # Delete/comment this block and uncomment the ELPA block below to restore
+    # # the distributed ELPA eigensolve.
+    # ###########################################################################
+    # process_rows, process_columns = process_grid_shape
+    # process_row = rank // process_columns
+    # process_column = rank % process_columns
+    # row_indices = torch.tensor(
+    #     block_cyclic_indices(
+    #         size,
+    #         block_size,
+    #         process_row,
+    #         process_rows,
+    #     ),
+    #     dtype=torch.long,
+    #     device=preconditioner.device,
+    # )
+    # column_indices = torch.tensor(
+    #     block_cyclic_indices(
+    #         size,
+    #         block_size,
+    #         process_column,
+    #         process_columns,
+    #     ),
+    #     dtype=torch.long,
+    #     device=preconditioner.device,
+    # )
+
+    # full_preconditioner = preconditioner.new_zeros((size, size))
+    # full_preconditioner[row_indices[:, None], column_indices] = preconditioner[
+    #     :local_rows,
+    #     :local_columns,
+    # ]
+    # dist.reduce(full_preconditioner, dst=0)
+
+    # if rank == 0:
+    #     full_eigenvalues, full_Q = torch.linalg.eigh(
+    #         full_preconditioner
+    #         + 1e-30
+    #         * torch.eye(
+    #             size,
+    #             dtype=full_preconditioner.dtype,
+    #             device=full_preconditioner.device,
+    #         )
+    #     )
+    #     eigenvalues.copy_(full_eigenvalues.flip(0))
+    #     full_preconditioner.copy_(full_Q.flip(1))
+
+    # dist.broadcast(eigenvalues, src=0)
+    # dist.broadcast(full_preconditioner, src=0)
+    # Q[:local_rows, :local_columns].copy_(
+    #     full_preconditioner[row_indices[:, None], column_indices]
+    # )
+    # return Q
+    # ###########################################################################
+    # # END TEMPORARY TORCH EIGH PATH
+    # ###########################################################################
+
+    ###########################################################################
+    # ELPA PATH -- TEMPORARILY COMMENTED OUT
+    #
+    # Uncomment this block and remove/comment the temporary Torch block above
+    # to restore ELPA.
+    ###########################################################################
     binding = _validated_native_binding(
         elpa_binding,
         "elpa_bindings",
@@ -484,6 +547,9 @@ def initialize_basis_2d_block_cyclic_(
 
     Q.copy_(Q_double)
     eigenvalues.copy_(eigenvalues_double).neg_()
+    ###########################################################################
+    # END ELPA PATH
+    ###########################################################################
     return Q
 
 
