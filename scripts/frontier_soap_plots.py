@@ -494,8 +494,6 @@ def timing_mean(results, experiment, implementation, n, ranks):
 
 def set_rank_axis(axis, ranks):
     axis.set_xticks(ranks)
-    if len(ranks) > 1 and ranks[-1] / ranks[0] >= 4:
-        axis.set_xscale("log", base=2)
 
 
 def plot_correctness(results, output):
@@ -568,8 +566,21 @@ def plot_strong(results, sizes, ranks, output):
             results, "strong", "original_soap", n, 1
         )
         line = axes[0].plot(ranks, times, marker="o", label=f"TP N={n}")[0]
+        axes[0].plot(
+            ranks,
+            [reference] * len(ranks),
+            linestyle=":",
+            color=line.get_color(),
+            alpha=0.7,
+            label=f"Original N={n} (1-GPU baseline)",
+        )
         axes[0].scatter(
-            [1], [reference], marker="x", color=line.get_color(), label=f"Original N={n}"
+            [1],
+            [reference],
+            marker="*",
+            s=110,
+            color=line.get_color(),
+            zorder=3,
         )
         axes[1].plot(
             ranks,
@@ -610,25 +621,26 @@ def plot_weak(results, cases, output):
         1000 * timing_mean(results, "weak", "tp_soap", n, rank)
         for rank, n in cases
     ]
-    reference_times = [
-        1000 * timing_mean(results, "weak", "original_soap", n, 1)
-        for n in sizes
-    ]
-    figure, axes = plt.subplots(1, 2, figsize=(11.5, 4.8))
-    axes[0].plot(ranks, tp_times, marker="o", label="TP SOAP")
-    axes[0].axhline(tp_times[0], color="black", linestyle="--", label="Ideal")
-    axes[1].plot(sizes, tp_times, marker="o", label="TP SOAP")
-    axes[1].plot(sizes, reference_times, marker="x", label="Original SOAP")
-    axes[0].set_title("TP compute weak scaling")
-    axes[1].set_title("Same matrix sizes")
-    axes[0].set_xlabel("Ranks / GPUs")
-    axes[1].set_xlabel("Square matrix dimension N")
-    for axis in axes:
-        axis.set_ylabel("Mean ms / update (refreshes included)")
-        axis.set_yscale("log")
-        axis.grid(True, which="both", alpha=0.3)
-        axis.legend()
-    set_rank_axis(axes[0], ranks)
+    figure, axis = plt.subplots(figsize=(7.5, 4.8))
+    axis.plot(ranks, tp_times, marker="o", label="TP SOAP")
+    axis.axhline(tp_times[0], color="black", linestyle="--", label="Ideal")
+    for rank, n, milliseconds in zip(ranks, sizes, tp_times):
+        axis.annotate(
+            f"N={n}",
+            (rank, milliseconds),
+            xytext=(0, 8),
+            textcoords="offset points",
+            ha="center",
+            fontsize="small",
+        )
+    axis.set_title("TP SOAP compute weak scaling")
+    axis.set_xlabel("Ranks / GPUs")
+    axis.set_ylabel("Mean ms / update (refreshes included)")
+    axis.set_yscale("log")
+    axis.margins(y=0.15)
+    axis.grid(True, which="both", alpha=0.3)
+    axis.legend()
+    set_rank_axis(axis, ranks)
     figure.suptitle(r"Weak scaling: $N(P) \approx N(1)P^{1/3}$")
     figure.tight_layout()
     path = output / "weak_scaling.png"
@@ -686,6 +698,12 @@ def driver_main(args):
     ranks = parse_list(args.ranks, "--ranks")
     if ranks[0] != 1:
         raise ValueError("--ranks must start with 1 for the speedup baseline")
+    strong_multiple = math.lcm(*ranks)
+    if any(n % strong_multiple for n in sizes):
+        raise ValueError(
+            "every --sizes entry must be divisible by every rank count; "
+            f"for ranks {ranks}, use multiples of {strong_multiple}"
+        )
     if min(
         args.iterations,
         args.repeats,
@@ -730,13 +748,6 @@ def driver_main(args):
             results.append(
                 run_worker(args, "timing", "weak", "tp_soap", n, rank, repeat)
             )
-    for n in weak_sizes:
-        for repeat in range(args.repeats):
-            results.append(
-                run_worker(
-                    args, "timing", "weak", "original_soap", n, 1, repeat
-                )
-            )
 
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -756,9 +767,20 @@ def driver_main(args):
 
 def make_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sizes", default="512,1024,2048")
-    parser.add_argument("--ranks", default="1,2,4,8")
-    parser.add_argument("--weak-base-size", type=int, default=2048)
+    parser.add_argument(
+        "--sizes",
+        help="increasing square dimensions for correctness and strong scaling",
+    )
+    parser.add_argument(
+        "--ranks",
+        default="1,2,3,4,5,6,7,8",
+        help="GPU counts (default: 1,2,3,4,5,6,7,8)",
+    )
+    parser.add_argument(
+        "--weak-base-size",
+        type=int,
+        help="square dimension for the one-GPU weak-scaling case",
+    )
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--block-size", type=int, default=128)
@@ -778,7 +800,10 @@ def make_parser():
 
 
 def main():
-    args = make_parser().parse_args()
+    parser = make_parser()
+    args = parser.parse_args()
+    if not args.worker and (args.sizes is None or args.weak_base_size is None):
+        parser.error("--sizes and --weak-base-size are required")
     return worker_main(args) if args.worker else driver_main(args)
 
 

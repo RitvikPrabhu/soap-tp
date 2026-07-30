@@ -1,9 +1,10 @@
 #!/bin/bash
 #
+# Tune the sizes on Frontier; strong-scaling sizes must be multiples of 840.
 # Example:
 # sbatch -A PROJECT -N 1 --ntasks-per-node=8 -c 7 -t 02:00:00 \
 #   scripts/slurm/frontier/soap_benchmark.slurm \
-#   --sizes 512,1024,2048 --ranks 1,2,4,8 \
+#   --sizes 3360,6720 --weak-base-size 3360 \
 #   --output-dir soap_plots --log-file plot_data.csv
 
 set -euo pipefail
