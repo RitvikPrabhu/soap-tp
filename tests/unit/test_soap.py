@@ -45,9 +45,9 @@ BETA2 = 0.9
 EPS = 1e-6
 BASIS_REFRESH_INTERVAL = 2
 COMPARISON_SHAPES = (
-    # (8, 8),
+    (8, 8),
     (20, 20),
-    # (12, 12),
+    (12, 12),
     # (12, 20),
     # (20, 12),
 )
