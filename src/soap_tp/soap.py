@@ -134,6 +134,7 @@ def soap_step(
     beta2: float = 0.95,
     eps: float = 1e-8,
     basis_refresh_interval: int = 10,
+    basis_implementation: Literal["elpa", "eigh"] = "elpa",
     elpa_binding: Any | None = None,
     slate_binding: Any | None = None,
 ) -> Tensor:
@@ -147,10 +148,16 @@ def soap_step(
     update, matching the reference SOAP optimizer. Later calls return the
     normalized ``float32`` SOAP update for this rank's shard. Applying a
     learning rate, weight decay, and the update to the parameter remains the
-    caller's responsibility.
+    caller's responsibility. ``basis_implementation`` selects ELPA or
+    ``torch.linalg.eigh`` for the initial eigenbases.
     """
     if basis_refresh_interval <= 0:
         raise ValueError("basis_refresh_interval must be positive.")
+    if basis_implementation not in {"elpa", "eigh"}:
+        raise ValueError(
+            "basis_implementation must be 'elpa' or 'eigh', got "
+            f"{basis_implementation!r}."
+        )
 
     rows, columns = global_shape
     initializing = "left_basis" not in state
@@ -224,6 +231,7 @@ def soap_step(
             rows,
             block_size,
             process_grid_shape,
+            implementation=basis_implementation,
             elpa_binding=elpa_binding,
         )
         _soap_profile_2d_block_cyclic(
@@ -246,6 +254,7 @@ def soap_step(
             columns,
             block_size,
             process_grid_shape,
+            implementation=basis_implementation,
             elpa_binding=elpa_binding,
         )
         _soap_profile_2d_block_cyclic(

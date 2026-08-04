@@ -64,13 +64,15 @@ function allocates distributed state on its first call, initializes and
 refreshes the bases at the configured interval, and returns the normalized
 local update. Its first call is a warmup that returns zero, matching the
 [original public SOAP optimizer](https://github.com/nikhilvyas/SOAP/blob/main/soap.py).
-It has no Megatron or other training-framework dependency.
+Set `basis_implementation="eigh"` to use `torch.linalg.eigh` for the initial
+bases instead of the default ELPA implementation. It has no Megatron or other
+training-framework dependency.
 
 The lower-level operations remain available from `soap_tp.ops`:
 
 - allocate packed, column-major 2D block-cyclic buffers;
 - update `G @ G.T` and `G.T @ G` preconditioners with an EMA;
-- initialize descending eigenbases with ELPA;
+- initialize descending eigenbases with ELPA (default) or `torch.linalg.eigh`;
 - refresh bases with one SLATE power iteration and QR;
 - rotate gradients and updates with SLATE;
 - apply the local Adam update;

@@ -119,6 +119,13 @@ if [[ "${BUILD_ELPA}" == "1" ]]; then
     mkdir -p "${ELPA_BUILD}" "${ELPA_PREFIX}"
     (
         cd "${ELPA_BUILD}"
+        # ELPA restores its initial LDFLAGS after probing ScaLAPACK but keeps
+        # -lscalapack in LIBS.  Preserve the pinned math-library search path
+        # and OpenBLAS archive for its later GPU-library probes and final link.
+        # This is required when the libraries live outside the compiler's
+        # default search paths, as they do in this build tree.
+        LDFLAGS="-L${MATH_PREFIX}/lib${LDFLAGS:+ ${LDFLAGS}}" \
+        LIBS="${MATH_PREFIX}/lib/libopenblas.a${LIBS:+ ${LIBS}}" \
         SCALAPACK_LDFLAGS="-L${MATH_PREFIX}/lib -lscalapack ${MATH_PREFIX}/lib/libopenblas.a" \
         "${ELPA_SOURCE}/configure" \
             --prefix="${ELPA_PREFIX}" \
@@ -127,7 +134,13 @@ if [[ "${BUILD_ELPA}" == "1" ]]; then
             "${ELPA_GPU_ARGS[@]}" \
             "${EXTRA_ELPA_ARGS[@]}"
     )
-    make -C "${ELPA_BUILD}" -j"${ELPA_JOBS}" install
+    # ELPA's generated Fortran dependencies do not order the GPU test helper
+    # after the production module that provides hip_functions.mod.  Build the
+    # production library first, then invoke the install subtargets directly;
+    # the top-level install target otherwise builds an unconditional noinst
+    # test helper even when --with-test-programs=no was configured.
+    make -C "${ELPA_BUILD}" -j"${ELPA_JOBS}" libelpa.la
+    make -C "${ELPA_BUILD}" -j"${ELPA_JOBS}" install-exec-am install-data-am
 fi
 
 if [[ "${BUILD_SLATE}" == "1" ]]; then

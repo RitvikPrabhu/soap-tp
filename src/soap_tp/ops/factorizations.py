@@ -370,21 +370,31 @@ def initialize_basis_2d_block_cyclic_(
     block_size: int,
     process_grid_shape: Tuple[int, int],
     *,
+    implementation: Literal["elpa", "eigh"] = "elpa",
     elpa_binding: Optional[Any] = None,
 ) -> Tensor:
-    """Initialize a descending eigenbasis with ELPA.
+    """Initialize a descending eigenbasis with ELPA or ``torch.linalg.eigh``.
 
-    The packed preconditioner must contain both triangles. ``work`` is
-    overwritten because ELPA may destroy its input. The public buffers remain
-    float32 while ELPA solves staged float64 buffers on the same device.
+    The packed preconditioner must contain both triangles. The ``elpa``
+    implementation overwrites ``work`` because ELPA may destroy its input and
+    solves staged float64 buffers on the same device. The ``eigh``
+    implementation gathers the preconditioner to rank zero, solves it in its
+    public float32 dtype, and broadcasts the result.
     """
+    if implementation not in {"elpa", "eigh"}:
+        raise ValueError(
+            "implementation must be 'elpa' or 'eigh', got "
+            f"{implementation!r}."
+        )
+
     rank, world_size = _validate_world(process_grid_shape)
     local_rows = local_columns = 0
-    for name, matrix in (
+    buffers = (
         ("preconditioner", preconditioner),
         ("Q", Q),
         ("work", work),
-    ):
+    )
+    for name, matrix in buffers:
         rows, columns = _validate_float_buffer(
             name,
             matrix,
@@ -394,24 +404,8 @@ def initialize_basis_2d_block_cyclic_(
             rank,
         )
         local_rows, local_columns = rows, columns
-        if matrix.stride(1) != max(1, rows):
-            raise ValueError(
-                f"{name} must use the exact ELPA leading dimension "
-                f"{max(1, rows)}, got {matrix.stride(1)}."
-            )
         if matrix.device != preconditioner.device:
             raise ValueError("preconditioner, Q, and work must share a device.")
-    empty_ownership = torch.tensor(
-        int(local_rows == 0 or local_columns == 0),
-        dtype=torch.int32,
-        device=preconditioner.device,
-    )
-    dist.all_reduce(empty_ownership, op=dist.ReduceOp.MAX)
-    if empty_ownership.item():
-        raise ValueError(
-            "ELPA initialization requires every rank to own at least one "
-            "local row and column."
-        )
     if len({preconditioner.data_ptr(), Q.data_ptr(), work.data_ptr()}) != 3:
         raise ValueError("preconditioner, Q, and work must not overlap.")
     if eigenvalues.shape != (size,) or eigenvalues.dtype != torch.float32:
@@ -424,72 +418,75 @@ def initialize_basis_2d_block_cyclic_(
     if eigenvalues.device != preconditioner.device:
         raise ValueError("eigenvalues must share the matrix device.")
 
-    # ###########################################################################
-    # # TEMPORARY TORCH EIGH PATH
-    # #
-    # # Delete/comment this block and uncomment the ELPA block below to restore
-    # # the distributed ELPA eigensolve.
-    # ###########################################################################
-    # process_rows, process_columns = process_grid_shape
-    # process_row = rank // process_columns
-    # process_column = rank % process_columns
-    # row_indices = torch.tensor(
-    #     block_cyclic_indices(
-    #         size,
-    #         block_size,
-    #         process_row,
-    #         process_rows,
-    #     ),
-    #     dtype=torch.long,
-    #     device=preconditioner.device,
-    # )
-    # column_indices = torch.tensor(
-    #     block_cyclic_indices(
-    #         size,
-    #         block_size,
-    #         process_column,
-    #         process_columns,
-    #     ),
-    #     dtype=torch.long,
-    #     device=preconditioner.device,
-    # )
+    if implementation == "eigh":
+        process_rows, process_columns = process_grid_shape
+        process_row = rank // process_columns
+        process_column = rank % process_columns
+        row_indices = torch.tensor(
+            block_cyclic_indices(
+                size,
+                block_size,
+                process_row,
+                process_rows,
+            ),
+            dtype=torch.long,
+            device=preconditioner.device,
+        )
+        column_indices = torch.tensor(
+            block_cyclic_indices(
+                size,
+                block_size,
+                process_column,
+                process_columns,
+            ),
+            dtype=torch.long,
+            device=preconditioner.device,
+        )
 
-    # full_preconditioner = preconditioner.new_zeros((size, size))
-    # full_preconditioner[row_indices[:, None], column_indices] = preconditioner[
-    #     :local_rows,
-    #     :local_columns,
-    # ]
-    # dist.reduce(full_preconditioner, dst=0)
+        full_preconditioner = preconditioner.new_zeros((size, size))
+        full_preconditioner[row_indices[:, None], column_indices] = (
+            preconditioner[:local_rows, :local_columns]
+        )
+        dist.reduce(full_preconditioner, dst=0)
 
-    # if rank == 0:
-    #     full_eigenvalues, full_Q = torch.linalg.eigh(
-    #         full_preconditioner
-    #         + 1e-30
-    #         * torch.eye(
-    #             size,
-    #             dtype=full_preconditioner.dtype,
-    #             device=full_preconditioner.device,
-    #         )
-    #     )
-    #     eigenvalues.copy_(full_eigenvalues.flip(0))
-    #     full_preconditioner.copy_(full_Q.flip(1))
+        if rank == 0:
+            full_eigenvalues, full_Q = torch.linalg.eigh(
+                full_preconditioner
+                + 1e-30
+                * torch.eye(
+                    size,
+                    dtype=full_preconditioner.dtype,
+                    device=full_preconditioner.device,
+                )
+            )
+            eigenvalues.copy_(full_eigenvalues.flip(0))
+            full_preconditioner.copy_(full_Q.flip(1))
 
-    # dist.broadcast(eigenvalues, src=0)
-    # dist.broadcast(full_preconditioner, src=0)
-    # Q[:local_rows, :local_columns].copy_(
-    #     full_preconditioner[row_indices[:, None], column_indices]
-    # )
-    # return Q
-    # ###########################################################################
-    # # END TEMPORARY TORCH EIGH PATH
-    # ###########################################################################
+        dist.broadcast(eigenvalues, src=0)
+        dist.broadcast(full_preconditioner, src=0)
+        Q[:local_rows, :local_columns].copy_(
+            full_preconditioner[row_indices[:, None], column_indices]
+        )
+        return Q
 
-    ###########################################################################
-    # ELPA PATH -- TEMPORARILY COMMENTED OUT
-    #
-    # Uncomment this block and remove/comment the temporary Torch block above
-    # to restore ELPA.
-    ###########################################################################
+    for name, matrix in buffers:
+        if matrix.stride(1) != max(1, local_rows):
+            raise ValueError(
+                f"{name} must use the exact ELPA leading dimension "
+                f"{max(1, local_rows)}, got {matrix.stride(1)}."
+            )
+    empty_ownership = torch.tensor(
+        int(local_rows == 0 or local_columns == 0),
+        dtype=torch.int32,
+        device=preconditioner.device,
+    )
+    dist.all_reduce(empty_ownership, op=dist.ReduceOp.MAX)
+    if empty_ownership.item():
+        raise ValueError(
+            "ELPA initialization requires every rank to own at least one "
+            "local row and column."
+        )
+
     binding = _validated_native_binding(
         elpa_binding,
         "elpa_bindings",
@@ -547,9 +544,6 @@ def initialize_basis_2d_block_cyclic_(
 
     Q.copy_(Q_double)
     eigenvalues.copy_(eigenvalues_double).neg_()
-    ###########################################################################
-    # END ELPA PATH
-    ###########################################################################
     return Q
 
 

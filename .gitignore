@@ -38,3 +38,4 @@ paper/*.toc
 
 build/*
 README.md
+*output*

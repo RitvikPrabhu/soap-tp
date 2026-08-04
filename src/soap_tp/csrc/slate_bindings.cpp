@@ -89,8 +89,8 @@ void slate_symmetric_multiply_float(
         float *a_devices[] = {a};
         float *q_devices[] = {q};
         float *work_devices[] = {work};
-        auto A = slate::SymmetricMatrix<float>::fromDevices(
-            slate::Uplo::Lower, n, a_devices, 1, lda, block_size,
+        auto A = slate::Matrix<float>::fromDevices(
+            n, n, a_devices, 1, lda, block_size, block_size,
             process_rows, process_cols, communicator);
         auto Q = slate::Matrix<float>::fromDevices(
             n, n, q_devices, 1, lda, block_size, block_size,
@@ -110,7 +110,13 @@ void slate_symmetric_multiply_float(
             process_rows, process_cols, communicator);
 #endif
 
+#if defined(SOAP_TP_SLATE_WITH_CUDA) || defined(SOAP_TP_SLATE_WITH_ROCM)
+        auto multiply_options = options;
+        multiply_options[slate::Option::MethodGemm] = slate::MethodGemm::A;
+        slate::gemm(1.0f, A, Q, 0.0f, Y, multiply_options);
+#else
         slate::symm(slate::Side::Left, 1.0f, A, Q, 0.0f, Y, options);
+#endif
     }
 
     MPI_Comm_free(&communicator);
@@ -252,7 +258,12 @@ void slate_rotation_float(
         H.insertLocalTiles(target);
         if (forward) {
             auto Q_left_transposed = slate::transpose(Q_left);
-            slate::gemm(1.0f, Q_left_transposed, X, 0.0f, H, options);
+            auto forward_options = options;
+#if defined(SOAP_TP_SLATE_WITH_CUDA) || defined(SOAP_TP_SLATE_WITH_ROCM)
+            forward_options[slate::Option::MethodGemm] = slate::MethodGemm::A;
+#endif
+            slate::gemm(
+                1.0f, Q_left_transposed, X, 0.0f, H, forward_options);
             slate::gemm(1.0f, H, Q_right, 0.0f, X, options);
         }
         else {

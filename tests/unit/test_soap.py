@@ -48,6 +48,7 @@ COMPARISON_SHAPES = (
     (8, 8),
     (20, 20),
     (12, 12),
+    # ()
     # (12, 20),
     # (20, 12),
 )
@@ -547,10 +548,16 @@ def _run_soap_comparison(
     seed=SEED,
     block_size=COMPARISON_BLOCK_SIZE,
     basis_refresh_interval=BASIS_REFRESH_INTERVAL,
+    basis_implementation="elpa",
     rtol=RTOL,
     device="cpu",
 ):
     """Compare original SOAP on rank zero with distributed SOAP on every rank."""
+    if basis_implementation not in {"elpa", "eigh"}:
+        raise ValueError(
+            "basis_implementation must be 'elpa' or 'eigh', got "
+            f"{basis_implementation!r}."
+        )
     distributed_was_initialized = dist.is_initialized()
     rank, world_size, process_grid = _initialize_distributed(device=device)
     try:
@@ -717,6 +724,7 @@ def _run_soap_comparison(
                 beta2=BETA2,
                 eps=EPS,
                 basis_refresh_interval=basis_refresh_interval,
+                basis_implementation=basis_implementation,
                 elpa_binding=elpa_bindings,
                 slate_binding=counted_slate,
             )
@@ -765,7 +773,8 @@ def _run_soap_comparison(
                         reference_parameter,
                     )
                     print(
-                        f"{shape[0]}x{shape[1]} dim{shard_dim} | "
+                        f"{shape[0]}x{shape[1]} dim{shard_dim} "
+                        f"basis={basis_implementation} | "
                         f"step {iteration} | "
                         f"SOAP relL2={soap_relative_l2_error:.2e} "
                         f"(ref={soap_reference_value:+.3e}, "
@@ -873,12 +882,14 @@ def _run_soap_comparison(
                 result = {
                     "shape": shape,
                     "shard_dim": shard_dim,
+                    "basis_implementation": basis_implementation,
                     "iterations": iterations,
                     "qr_calls": expected_qr_calls,
                 }
                 print(
                     "SOAP comparison passed: "
                     f"shape={shape}, shard_dim={shard_dim}, "
+                    f"basis={basis_implementation}, "
                     f"iterations={iterations}, qr_calls={expected_qr_calls}, "
                     f"rtol={rtol:.1e}",
                     flush=True,
