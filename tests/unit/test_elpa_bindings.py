@@ -73,8 +73,7 @@ def _compiled_backend_device():
     device_count = torch.cuda.device_count()
     if device_count == 1:
         if local_size > 1 and (
-            None in visible_devices
-            or len(set(visible_devices)) != local_size
+            None in visible_devices or len(set(visible_devices)) != local_size
         ):
             raise RuntimeError(
                 "one GPU is visible to every local MPI rank, but the launcher "
@@ -335,6 +334,7 @@ def _check_eigenvectors_of_nonzero_eigenvalues_equivalent(
             f"original_size={original_size.item():.6e}, "
             f"error={error.item():.6e}"
         )
+    return float(error.item())
 
 
 # Check that the zero eigenspaces from PyTorch and ELPA are equivalent
@@ -500,7 +500,7 @@ def _check_elpa_matches_eigh(preconditioner):
         atol=2e-4,
     )
 
-    _check_eigenvectors_of_nonzero_eigenvalues_equivalent(
+    relative_l2_error = _check_eigenvectors_of_nonzero_eigenvalues_equivalent(
         expected_eigenvalues,
         expected_eigenvectors,
         actual_eigenvalues,
@@ -512,6 +512,7 @@ def _check_elpa_matches_eigh(preconditioner):
         actual_eigenvalues,
         actual_eigenvectors,
     )
+    return relative_l2_error
 
 
 @pytest.fixture(scope="module")
@@ -527,6 +528,18 @@ def mpi_world():
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
+
+
+@pytest.fixture(scope="module")
+def elpa_l2_log(mpi_world, output_folder):
+    rank, _world_size, _backend, _device = mpi_world
+    if output_folder is None:
+        return None
+
+    path = output_folder / "elpa_l2.log"
+    if rank == 0:
+        path.write_text("matrix_shape relative_l2_error\n")
+    return path
 
 
 def test_compiled_backend_matches_test_device(mpi_world):
@@ -545,11 +558,21 @@ def test_compiled_backend_matches_test_device(mpi_world):
     GRADIENT_SHAPES,
     ids=lambda shape: f"{shape[0]}x{shape[1]}",
 )
-def test_left_preconditioner_eigendecomposition(shape, mpi_world):
-    _rank, _world_size, _backend, device = mpi_world
+def test_left_preconditioner_eigendecomposition(
+    shape,
+    mpi_world,
+    elpa_l2_log,
+):
+    rank, _world_size, _backend, device = mpi_world
     gradient = _make_gradient(*shape).to(device)
     preconditioner = _make_left_preconditioner(gradient)
-    _check_elpa_matches_eigh(preconditioner)
+    relative_l2_error = _check_elpa_matches_eigh(preconditioner)
+    if rank == 0 and elpa_l2_log is not None:
+        with elpa_l2_log.open("a") as stream:
+            rows, columns = preconditioner.shape
+            stream.write(
+                f"{rows}x{columns} {relative_l2_error:.6e}\n"
+            )
 
 
 @pytest.mark.parametrize(
@@ -557,8 +580,18 @@ def test_left_preconditioner_eigendecomposition(shape, mpi_world):
     GRADIENT_SHAPES,
     ids=lambda shape: f"{shape[0]}x{shape[1]}",
 )
-def test_right_preconditioner_eigendecomposition(shape, mpi_world):
-    _rank, _world_size, _backend, device = mpi_world
+def test_right_preconditioner_eigendecomposition(
+    shape,
+    mpi_world,
+    elpa_l2_log,
+):
+    rank, _world_size, _backend, device = mpi_world
     gradient = _make_gradient(*shape).to(device)
     preconditioner = _make_right_preconditioner(gradient)
-    _check_elpa_matches_eigh(preconditioner)
+    relative_l2_error = _check_elpa_matches_eigh(preconditioner)
+    if rank == 0 and elpa_l2_log is not None:
+        with elpa_l2_log.open("a") as stream:
+            rows, columns = preconditioner.shape
+            stream.write(
+                f"{rows}x{columns} {relative_l2_error:.6e}\n"
+            )

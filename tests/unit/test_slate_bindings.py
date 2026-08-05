@@ -9,958 +9,388 @@ import shutil
 import socket
 import subprocess
 import sys
-import unittest
+import pytest
 
 from mpi4py import MPI
 import torch
 import torch.distributed as dist
 from torch.utils.cpp_extension import load
 
-from soap_tp.ops._utils import allocate_2d_block_cyclic
-from soap_tp.ops.factorizations import (
-    power_iteration_qr_2d_block_cyclic_,
-    rotate_2d_block_cyclic_,
+from soap_tp.ops._utils import (
+    allocate_2d_block_cyclic,
+    block_cyclic_tile_views,
 )
-from soap_tp.ops.optimizer import (
-    adam_update,
-    redistribute_2d_block_cyclic_to_tp_shard,
-    redistribute_tp_shard_to_2d_block_cyclic,
-)
-from soap_tp.ops.preconditioners import (
-    update_left_preconditioner_2d_block_cyclic_,
-    update_right_preconditioner_2d_block_cyclic_,
-)
+from soap_tp.ops.factorizations import power_iteration_qr_2d_block_cyclic_
 
 
-ROOT = Path(__file__).resolve().parents[2]
-PROFILE = os.environ.get("SLATE_PROFILE", "cpu")
-PREFIX = Path(
-    os.environ.get(
-        "SLATE_PREFIX",
-        ROOT / "build" / "slate-install" / PROFILE,
+SEED = 42
+BLOCK_SIZE = 2
+RELATIVE_L2_RTOL = 1e-5
+MATRIX_SIZES = (8, 9, 12, 13)
+
+
+def _make_preconditioner(size, dtype=torch.float32, seed=SEED):
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+
+    values = torch.normal(
+        mean=0,
+        std=2,
+        size=(size, size),
+        generator=generator,
+        dtype=dtype,
     )
-)
-MULTIRANK_WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "8"))
 
-WORKER_MODE = "SOAP_TP_SLATE_WORKER_MODE"
-WORKER_BINDING = "SOAP_TP_SLATE_WORKER_BINDING"
-WORKER_WORLD_SIZE = "SOAP_TP_SLATE_WORKER_WORLD_SIZE"
+    off_diagonal = torch.tril(values, diagonal=-1)
+    preconditioner = off_diagonal + off_diagonal.T
 
-# These cases exercise block size 1, n < block, n == block, n == block + 1,
-# exact block multiples, partial boundary blocks, and padded local leading
-# dimensions without adding MPI ownership as a second variable.
-SINGLE_RANK_CASES = (
-    ("singleton", 1, 1, 0),
-    ("unit_tiles", 3, 1, 0),
-    ("block_larger_than_matrix", 2, 3, 0),
-    ("block_equals_matrix", 3, 3, 0),
-    ("one_past_block", 4, 3, 0),
-    ("exact_block_multiple", 6, 3, 0),
-    ("partial_block_and_padded_lda", 5, 2, 2),
-)
+    row_sums = preconditioner.abs().sum(dim=1)
+    preconditioner.diagonal().copy_(row_sums + 1)
+
+    return preconditioner
 
 
-def _free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+def _make_orthogonal(size, device, seed):
+    generator = torch.Generator()
+    generator.manual_seed(seed)
 
-
-def _load_extension(path):
-    name = Path(path).name.split(".", 1)[0]
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _device_for_profile():
-    if PROFILE == "cpu":
-        return torch.device("cpu")
-    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
-        raise RuntimeError(
-            f"{PROFILE} requires exactly one visible GPU per MPI rank"
-        )
-    return torch.device("cuda:0")
-
-
-def _owned_indices(size, block_size, process, process_count):
-    # This is the row-major 2D block-cyclic ownership definition used by the
-    # caller, independent of SLATE's internal column-major rank convention.
-    return [
-        index
-        for index in range(size)
-        if (index // block_size) % process_count == process
-    ]
-
-
-def _pack_column_major(matrix, rows, columns, lda_padding):
-    # A transposed allocation has stride (1, lda), matching the documented
-    # ScaLAPACK-style local buffer without copying data between ranks.
-    lda = max(1, len(rows) + lda_padding)
-    local = torch.full(
-        (max(1, len(columns)), lda),
-        torch.nan,
+    matrix = torch.randn(
+        size,
+        size,
         dtype=torch.float32,
-        device=matrix.device,
-    ).T
-    if rows and columns:
-        row_index = torch.tensor(rows, device=matrix.device)
-        column_index = torch.tensor(columns, device=matrix.device)
-        local[: len(rows), : len(columns)].copy_(
-            matrix.index_select(0, row_index).index_select(1, column_index)
-        )
-    return local
+        generator=generator,
+    ).to(device)
+    Q, _ = torch.linalg.qr(matrix)
+    return Q
 
 
-def _reference_problem(size, device):
-    # Increasing diagonal values make the estimated-eigenvalue ordering
-    # nontrivial, while the positive diagonal dominance keeps QR full rank.
-    index = torch.arange(size, dtype=torch.float32, device=device)
-    distance = (index[:, None] - index[None, :]).abs()
-    matrix = 0.25 / (distance + 1.0)
-    matrix.diagonal().add_(size + index)
-
-    # Adjacent Givens rotations provide a deterministic non-identity old basis
-    # without using the QR routine that serves as the numerical oracle.
-    orthogonal = torch.eye(size, dtype=torch.float32, device=device)
-    for column in range(size - 1):
-        angle = 0.19 * (column + 1)
-        cosine = math.cos(angle)
-        sine = math.sin(angle)
-        rotation = torch.eye(size, dtype=torch.float32, device=device)
-        rotation[column, column] = cosine
-        rotation[column, column + 1] = -sine
-        rotation[column + 1, column] = sine
-        rotation[column + 1, column + 1] = cosine
-        orthogonal = orthogonal @ rotation
-    return matrix, orthogonal
-
-
-def _torch_reference(matrix, orthogonal):
-    # This is the independent Torch behavior required by
-    # get_orthogonal_matrix_QR: sort the old basis, take one power iteration,
-    # then compute the reduced QR factor.
-    estimated = torch.diag(orthogonal.T @ matrix @ orthogonal)
-    order = torch.argsort(estimated, descending=True)
-    sorted_orthogonal = orthogonal[:, order]
-    expected, _ = torch.linalg.qr(matrix @ sorted_orthogonal)
-    return sorted_orthogonal, expected
-
-
-def _assert_same_q(actual, expected, case_name):
-    # A full-rank real QR factor is unique up to independent column signs.
-    # Align only those signs; permutations and arbitrary rotations still fail.
-    assert torch.isfinite(actual).all(), f"{case_name}: Q is not finite"
-    alignment = torch.diag(expected.T @ actual)
-    assert torch.all(alignment.abs() > 0.9), (
-        f"{case_name}: SLATE returned different QR columns"
-    )
-    signs = torch.where(alignment < 0, -1.0, 1.0)
-    torch.testing.assert_close(
-        actual * signs,
-        expected,
-        atol=3e-3,
-        rtol=3e-3,
-        msg=case_name,
-    )
-    torch.testing.assert_close(
-        actual.T @ actual,
-        torch.eye(actual.size(0)),
-        atol=2e-3,
-        rtol=2e-3,
-        msg=f"{case_name}: Q is not orthogonal",
-    )
-
-
-def _gather_block_cyclic(local, shape, rows, columns):
-    # Gathering is only for the test oracle; the binding keeps the operation
-    # distributed.
-    actual = torch.zeros(shape, dtype=torch.float32, device=local.device)
-    owners = torch.zeros_like(actual)
-    if rows and columns:
-        row_index = torch.tensor(rows, device=local.device)
-        column_index = torch.tensor(columns, device=local.device)
-        actual[row_index[:, None], column_index] = local[
-            : len(rows), : len(columns)
-        ]
-        owners[row_index[:, None], column_index] = 1
-
-    actual = actual.cpu()
-    owners = owners.cpu()
-    MPI.COMM_WORLD.Allreduce(MPI.IN_PLACE, actual.numpy(), op=MPI.SUM)
-    MPI.COMM_WORLD.Allreduce(MPI.IN_PLACE, owners.numpy(), op=MPI.SUM)
-    torch.testing.assert_close(owners, torch.ones_like(owners))
-    return actual
-
-
-def _run_rotation_case(binding, rank, process_grid, case, device):
-    rows, columns, block_size, lda_padding = case
-    process_rows, process_columns = process_grid
-    process_row = rank // process_columns
-    process_column = rank % process_columns
-
-    local_rows = _owned_indices(
-        rows, block_size, process_row, process_rows
-    )
-    local_columns = _owned_indices(
-        columns, block_size, process_column, process_columns
-    )
-    left_columns = _owned_indices(
-        rows, block_size, process_column, process_columns
-    )
-    right_rows = _owned_indices(
-        columns, block_size, process_row, process_rows
-    )
-
-    _, q_left_global = _reference_problem(rows, device)
-    _, q_right_global = _reference_problem(columns, device)
-    values = torch.arange(
-        rows * columns, dtype=torch.float32, device=device
-    ).reshape(rows, columns)
-    gradient_global = (values + 1) / (rows * columns)
-    momentum_global = torch.cos(0.37 * values)
-
-    q_left = _pack_column_major(
-        q_left_global, local_rows, left_columns, lda_padding
-    )
-    q_right = _pack_column_major(
-        q_right_global, right_rows, local_columns, lda_padding
-    )
-    gradient = _pack_column_major(
-        gradient_global, local_rows, local_columns, lda_padding
-    )
-    momentum = _pack_column_major(
-        momentum_global, local_rows, local_columns, lda_padding
-    )
-
-    def rotate(function, local):
-        function(
-            q_left.data_ptr(),
-            local.data_ptr(),
-            q_right.data_ptr(),
-            rows,
-            columns,
-            q_left.stride(1),
-            local.stride(1),
-            q_right.stride(1),
-            block_size,
-            process_rows,
-            process_columns,
-        )
-
-    case_name = (
-        f"rotation: shape={rows}x{columns}, block={block_size}, "
-        f"grid={process_rows}x{process_columns}"
-    )
-    if rank == 0:
-        print(f"start {case_name}", flush=True)
-    for direction, function, local in (
-        ("forward", binding.slate_forward_rotation_float, gradient),
-        ("backward", binding.slate_backward_rotation_float, momentum),
-    ):
-        rotate(function, local)
-        if rank == 0:
-            print(f"{direction} done {case_name}", flush=True)
-
-    actual_gradient = _gather_block_cyclic(
-        gradient, (rows, columns), local_rows, local_columns
-    )
-    actual_momentum = _gather_block_cyclic(
-        momentum, (rows, columns), local_rows, local_columns
-    )
-    torch.testing.assert_close(
-        actual_gradient,
-        (q_left_global.T @ gradient_global @ q_right_global).cpu(),
-        atol=2e-4,
-        rtol=2e-4,
-    )
-    torch.testing.assert_close(
-        actual_momentum,
-        (q_left_global @ momentum_global @ q_right_global.T).cpu(),
-        atol=2e-4,
-        rtol=2e-4,
-    )
-    if rank == 0:
-        print(f"pass {case_name}", flush=True)
-
-
-def _run_fixed_basis_pipeline_case(binding, rank, world_size, device):
-    rows, columns = 2 * world_size, 3 * world_size
-    block_size = 4
-    process_grid = (2, world_size // 2)
-    process_rows, process_columns = process_grid
-    process_row = rank // process_columns
-    process_column = rank % process_columns
-
-    generator = torch.Generator().manual_seed(90210)
-    gradient_global = (
-        torch.randn(
-            rows,
-            columns,
-            generator=generator,
-            dtype=torch.float32,
-        ).to(device)
-        / 3.0
-    )
-    _, Q_left_global = _reference_problem(rows, device)
-    _, Q_right_global = _reference_problem(columns, device)
-
-    local_matrix_rows = _owned_indices(
-        rows,
+# Convert the full PyTorch tensor into local 2D block cyclic storage
+def _pack_full_matrix_2d_block_cyclic(
+    full_matrix,
+    local_matrix,
+    block_size,
+    process_grid_shape,
+    rank,
+):
+    views = block_cyclic_tile_views(
+        local_matrix,
+        tuple(full_matrix.shape),
         block_size,
-        process_row,
-        process_rows,
+        process_grid_shape,
+        rank,
+        mode="full",
     )
-    local_matrix_columns = _owned_indices(
-        columns,
+
+    for (block_row, block_column), local_view in views.items():
+        global_row_start = block_row * block_size
+        global_row_end = min(global_row_start + block_size, full_matrix.size(0))
+        global_column_start = block_column * block_size
+        global_column_end = min(global_column_start + block_size, full_matrix.size(1))
+
+        local_view.copy_(
+            full_matrix[
+                global_row_start:global_row_end, global_column_start:global_column_end
+            ]
+        )
+
+
+# Convert the local 2D block cyclic storage into a full PyTorch tensor
+def _unpack_matrix_2d_block_cyclic(
+    local_matrix,
+    global_shape,
+    block_size,
+    process_grid_shape,
+    rank,
+):
+    full_matrix = local_matrix.new_zeros(global_shape)
+    for (block_row, block_column), local_view in block_cyclic_tile_views(
+        local_matrix,
+        global_shape,
         block_size,
-        process_column,
-        process_columns,
-    )
-    local_left_columns = _owned_indices(
-        rows,
-        block_size,
-        process_column,
-        process_columns,
-    )
-    local_right_rows = _owned_indices(
-        columns,
-        block_size,
-        process_row,
-        process_rows,
-    )
-    Q_left = _pack_column_major(
-        Q_left_global,
-        local_matrix_rows,
-        local_left_columns,
-        0,
-    )
-    Q_right = _pack_column_major(
-        Q_right_global,
-        local_right_rows,
-        local_matrix_columns,
-        0,
-    )
+        process_grid_shape,
+        rank,
+        mode="full",
+    ).items():
+        global_row_start = block_row * block_size
+        global_column_start = block_column * block_size
+        full_matrix[
+            global_row_start : global_row_start + local_view.size(0),
+            global_column_start : global_column_start + local_view.size(1),
+        ].copy_(local_view)
 
-    beta1 = 0.8
-    beta2 = 0.9
-    eps = 1e-6
-    rotated_global = (
-        Q_left_global.T @ gradient_global @ Q_right_global
-    )
-    expected_momentum = rotated_global * (1.0 - beta1)
-    expected_variance = rotated_global.square() * (1.0 - beta2)
-    expected_rotated_update = (expected_momentum / (1.0 - beta1)) / (
-        (expected_variance / (1.0 - beta2)).sqrt() + eps
-    )
-    expected_global_update = (
-        Q_left_global
-        @ expected_rotated_update
-        @ Q_right_global.T
-    )
-
-    if rank == 0:
-        print(
-            f"start fixed_basis_pipeline: shape={rows}x{columns}, "
-            f"grid={process_rows}x{process_columns}",
-            flush=True,
-        )
-    for shard_dim in (0, 1):
-        if rank == 0:
-            print(
-                f"start fixed_basis_pipeline shard_dim={shard_dim}",
-                flush=True,
-            )
-        shard_size = gradient_global.size(shard_dim) // world_size
-        shard_start = rank * shard_size
-        gradient_shard = gradient_global.narrow(
-            shard_dim,
-            shard_start,
-            shard_size,
-        ).contiguous()
-
-        left_preconditioner = allocate_2d_block_cyclic(
-            (rows, rows),
-            block_size,
-            process_grid,
-            device=device,
-        )
-        right_preconditioner = allocate_2d_block_cyclic(
-            (columns, columns),
-            block_size,
-            process_grid,
-            device=device,
-        )
-        update_left_preconditioner_2d_block_cyclic_(
-            gradient_shard,
-            left_preconditioner,
-            0.0,
-            block_size,
-            process_grid,
-            shard_dim=shard_dim,
-        )
-        update_right_preconditioner_2d_block_cyclic_(
-            gradient_shard,
-            right_preconditioner,
-            0.0,
-            block_size,
-            process_grid,
-            shard_dim=shard_dim,
-        )
-
-        actual_left = _gather_block_cyclic(
-            left_preconditioner,
-            (rows, rows),
-            local_matrix_rows,
-            local_left_columns,
-        )
-        actual_right = _gather_block_cyclic(
-            right_preconditioner,
-            (columns, columns),
-            local_right_rows,
-            local_matrix_columns,
-        )
-        torch.testing.assert_close(
-            actual_left,
-            (gradient_global @ gradient_global.T).cpu(),
-            atol=5e-4,
-            rtol=5e-4,
-        )
-        torch.testing.assert_close(
-            actual_right,
-            (gradient_global.T @ gradient_global).cpu(),
-            atol=5e-4,
-            rtol=5e-4,
-        )
-        if rank == 0:
-            print(
-                f"preconditioners done shard_dim={shard_dim}",
-                flush=True,
-            )
-
-        packed_gradient = redistribute_tp_shard_to_2d_block_cyclic(
-            gradient_shard,
-            (rows, columns),
-            block_size,
-            process_grid,
-            shard_dim=shard_dim,
-        )
-        rotate_2d_block_cyclic_(
-            packed_gradient,
-            Q_left,
-            Q_right,
-            (rows, columns),
-            block_size,
-            process_grid,
-            direction="forward",
-            slate_binding=binding,
-        )
-        if rank == 0:
-            print(
-                f"forward rotation done shard_dim={shard_dim}",
-                flush=True,
-            )
-        momentum = torch.zeros_like(
-            packed_gradient,
-            memory_format=torch.preserve_format,
-        )
-        variance = torch.zeros_like(
-            packed_gradient,
-            memory_format=torch.preserve_format,
-        )
-        packed_update = adam_update(
-            packed_gradient,
-            momentum,
-            variance,
-            step=1,
-            beta1=beta1,
-            beta2=beta2,
-            eps=eps,
-        )
-        rotate_2d_block_cyclic_(
-            packed_update,
-            Q_left,
-            Q_right,
-            (rows, columns),
-            block_size,
-            process_grid,
-            direction="backward",
-            slate_binding=binding,
-        )
-        if rank == 0:
-            print(
-                f"backward rotation done shard_dim={shard_dim}",
-                flush=True,
-            )
-        update_shard = redistribute_2d_block_cyclic_to_tp_shard(
-            packed_update,
-            (rows, columns),
-            block_size,
-            process_grid,
-            shard_dim=shard_dim,
-        )
-        expected_shard = expected_global_update.narrow(
-            shard_dim,
-            shard_start,
-            shard_size,
-        )
-        torch.testing.assert_close(
-            update_shard,
-            expected_shard,
-            atol=8e-4,
-            rtol=8e-4,
-            msg=f"fixed-basis pipeline shard_dim={shard_dim}",
-        )
-        if rank == 0:
-            print(
-                f"pass fixed_basis_pipeline shard_dim={shard_dim}",
-                flush=True,
-            )
-
-    left_global = gradient_global @ gradient_global.T
-    expected_order = torch.argsort(
-        torch.diag(Q_left_global.T @ left_global @ Q_left_global),
-        descending=True,
-    )
-    _, expected_Q_left = _torch_reference(
-        left_global,
-        Q_left_global,
-    )
-    left_work = allocate_2d_block_cyclic(
-        (rows, rows),
-        block_size,
-        process_grid,
-        device=device,
-    )
-    if rank == 0:
-        print("start fixed_basis_pipeline power_iteration", flush=True)
-    actual_order = power_iteration_qr_2d_block_cyclic_(
-        left_preconditioner,
-        Q_left,
-        left_work,
-        rows,
-        block_size,
-        process_grid,
-        slate_binding=binding,
-    )
-    torch.testing.assert_close(actual_order.cpu(), expected_order.cpu())
-    actual_Q_left = _gather_block_cyclic(
-        Q_left,
-        (rows, rows),
-        local_matrix_rows,
-        local_left_columns,
-    )
-    _assert_same_q(
-        actual_Q_left,
-        expected_Q_left.cpu(),
-        "production power iteration",
-    )
-    if rank == 0:
-        print("pass fixed_basis_pipeline power_iteration", flush=True)
+    dist.all_reduce(full_matrix)
+    return full_matrix
 
 
-def _run_case(binding, rank, process_grid, case, device):
-    name, size, block_size, lda_padding = case
-    process_rows, process_columns = process_grid
-    process_row = rank // process_columns
-    process_column = rank % process_columns
-    rows = _owned_indices(size, block_size, process_row, process_rows)
-    columns = _owned_indices(
-        size,
-        block_size,
-        process_column,
-        process_columns,
-    )
-    case_name = (
-        f"{name}: n={size}, block={block_size}, "
-        f"grid={process_rows}x{process_columns}"
-    )
-
-    matrix, orthogonal = _reference_problem(size, device)
-    sorted_orthogonal, expected = _torch_reference(matrix, orthogonal)
-
-    # Only the lower triangle belongs to the symmetric input contract. NaNs in
-    # the upper triangle turn any accidental upper-triangle read into a failure.
-    stored_matrix = matrix.clone()
-    upper = torch.triu(
-        torch.ones_like(stored_matrix, dtype=torch.bool),
-        diagonal=1,
-    )
-    stored_matrix.masked_fill_(upper, torch.nan)
-
-    a = _pack_column_major(stored_matrix, rows, columns, lda_padding)
-    q = _pack_column_major(sorted_orthogonal, rows, columns, lda_padding)
-    work = torch.full_like(q, torch.nan, memory_format=torch.preserve_format)
-    a_before = a.clone(memory_format=torch.preserve_format)
-
-    logical_q = torch.zeros_like(q, dtype=torch.bool)
-    if rows and columns:
-        logical_q[: len(rows), : len(columns)] = True
-
-    if rank == 0:
-        print(f"start {case_name}", flush=True)
-    binding.slate_symmetric_multiply_float(
-        a.data_ptr(),
-        q.data_ptr(),
-        work.data_ptr(),
-        size,
-        a.stride(1),
-        block_size,
-        process_rows,
-        process_columns,
-    )
-    if rank == 0:
-        print(f"symmetric multiply done {case_name}", flush=True)
-    binding.slate_qr_float(
-        work.data_ptr(),
-        q.data_ptr(),
-        size,
-        work.stride(1),
-        q.stride(1),
-        block_size,
-        process_rows,
-        process_columns,
-    )
-    if rank == 0:
-        print(f"QR done {case_name}", flush=True)
-
-    # Reconstruct Q according to row-major ownership. A rank transposition,
-    # omitted shard, or duplicated shard changes either Q or the owner counts.
-    actual = torch.zeros((size, size), dtype=torch.float32, device=device)
-    owners = torch.zeros_like(actual)
-    if rows and columns:
-        row_index = torch.tensor(rows, device=device)
-        column_index = torch.tensor(columns, device=device)
-        actual[row_index[:, None], column_index] = q[
-            : len(rows), : len(columns)
-        ]
-        owners[row_index[:, None], column_index] = 1
-
-    # Verification uses portable host MPI buffers, so GPU tests do not require
-    # a CUDA-aware MPI installation. The binding itself still receives and
-    # operates on the original device pointers.
-    actual = actual.cpu()
-    owners = owners.cpu()
-    a_unchanged = torch.tensor(
-        [
-            torch.all(
-                (a == a_before)
-                | (torch.isnan(a) & torch.isnan(a_before))
-            ).item()
-        ],
-        dtype=torch.int32,
-    )
-    q_padding_unchanged = torch.tensor(
-        [torch.isnan(q[~logical_q]).all().item()],
-        dtype=torch.int32,
-    )
-    MPI.COMM_WORLD.Allreduce(MPI.IN_PLACE, actual.numpy(), op=MPI.SUM)
-    MPI.COMM_WORLD.Allreduce(MPI.IN_PLACE, owners.numpy(), op=MPI.SUM)
-    MPI.COMM_WORLD.Allreduce(
-        MPI.IN_PLACE,
-        a_unchanged.numpy(),
-        op=MPI.MIN,
-    )
-    MPI.COMM_WORLD.Allreduce(
-        MPI.IN_PLACE,
-        q_padding_unchanged.numpy(),
-        op=MPI.MIN,
-    )
-
-    assert a_unchanged.item() == 1, f"{case_name}: A was modified"
-    assert q_padding_unchanged.item() == 1, (
-        f"{case_name}: Q padding was modified"
-    )
-    torch.testing.assert_close(
-        owners,
-        torch.ones_like(owners),
-        msg=f"{case_name}: each entry must have exactly one owner",
-    )
-    _assert_same_q(actual, expected.cpu(), case_name)
-    if rank == 0:
-        print(f"pass {case_name}", flush=True)
-
-
-def _worker():
+def _setup_mpi(device):
     rank = MPI.COMM_WORLD.Get_rank()
     world_size = MPI.COMM_WORLD.Get_size()
-    expected_world_size = int(os.environ[WORKER_WORLD_SIZE])
-    assert world_size == expected_world_size
 
-    device = _device_for_profile()
-    if device.type == "cuda":
-        torch.cuda.set_device(device)
-    binding = _load_extension(os.environ[WORKER_BINDING])
-    mode = os.environ[WORKER_MODE]
-    if mode == "rotation_single":
-        assert world_size == 1
-        _run_rotation_case(binding, rank, (1, 1), (5, 3, 2, 1), device)
-        return
-    if mode == "rotation_multirank":
-        assert world_size > 1
-        _run_rotation_case(
-            binding,
-            rank,
-            (2, world_size // 2),
-            (2 * world_size + 1, world_size + 3, 2, 1),
-            device,
-        )
-        return
-    if mode == "pipeline_multirank":
-        assert world_size > 1
-        backend = "gloo" if device.type == "cpu" else "nccl"
-        dist.init_process_group(
-            backend,
-            rank=rank,
-            world_size=world_size,
-        )
-        try:
-            _run_fixed_basis_pipeline_case(
-                binding,
-                rank,
-                world_size,
-                device,
-            )
-        finally:
-            dist.destroy_process_group()
-        return
-    if mode == "single":
-        assert world_size == 1
-        for case in SINGLE_RANK_CASES:
-            _run_case(binding, rank, (1, 1), case, device)
-        return
-
-    assert mode == "multirank"
-    assert world_size > 1
-    process_grids = [
-        (process_rows, world_size // process_rows)
-        for process_rows in range(1, world_size + 1)
-        if world_size % process_rows == 0
-    ]
-    cases = (
-        # A single tile leaves most ranks with no local rows or columns.
-        ("empty_local_shards", 1, 1, 0),
-        # One tile row and column per rank divides evenly over every grid.
-        ("equal_shards", 2 * world_size, 2, 0),
-        # One additional partial tile creates uneven ownership and padded LDAs.
-        ("uneven_partial_shards", 2 * world_size + 1, 2, 1),
-    )
-    for case in cases:
-        for process_grid in process_grids:
-            _run_case(binding, rank, process_grid, case, device)
-
-    # Repeating a prior decomposition after all communicator reorderings
-    # catches stale SLATE state and premature communicator cleanup.
-    repeat_grid = process_grids[len(process_grids) // 2]
-    _run_case(
-        binding,
-        rank,
-        repeat_grid,
-        ("repeated_after_grid_changes", 2 * world_size, 2, 0),
-        device,
-    )
-
-
-class TestSlateBindings(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        if PROFILE not in {"cpu", "cuda", "rocm"}:
-            raise RuntimeError("SLATE_PROFILE must be cpu, cuda, or rocm")
-
-        include_directory = PREFIX / "include"
-        library_directory = next(
-            (
-                path
-                for path in (PREFIX / "lib", PREFIX / "lib64")
-                if path.is_dir()
-            ),
-            None,
-        )
-        if (
-            not (include_directory / "slate/slate.hh").is_file()
-            or library_directory is None
-        ):
-            raise RuntimeError(f"SLATE is not installed under {PREFIX}")
-
-        os.environ["CXX"] = "mpicxx"
-        os.environ["PATH"] = (
-            f"{Path(sys.executable).parent}:{os.environ['PATH']}"
-        )
-        os.environ["TORCH_EXTENSIONS_DIR"] = str(
-            ROOT / "build/torch-extensions"
-        )
-
-        compile_flags = ["-O0"]
-        if PROFILE == "cuda":
-            compile_flags.append("-DSOAP_TP_SLATE_WITH_CUDA=1")
-        elif PROFILE == "rocm":
-            compile_flags.append("-DSOAP_TP_SLATE_WITH_ROCM=1")
-
-        cls.binding = load(
-            name=f"_soap_tp_slate_{PROFILE}_test",
-            sources=[str(ROOT / "src/soap_tp/csrc/slate_bindings.cpp")],
-            extra_include_paths=[str(include_directory)],
-            extra_cflags=compile_flags,
-            extra_ldflags=[
-                f"-L{library_directory}",
-                "-lslate",
-                "-llapackpp",
-                "-lblaspp",
-                f"-Wl,-rpath,{library_directory}",
-            ],
-        )
-
-    def _run_worker(self, mode, world_size):
-        mpiexec = shutil.which("mpiexec")
-        self.assertIsNotNone(mpiexec, "mpiexec is required")
-
-        environment = os.environ.copy()
-        environment.update(
-            {
-                WORKER_MODE: mode,
-                WORKER_BINDING: self.binding.__file__,
-                WORKER_WORLD_SIZE: str(world_size),
-                "MKL_NUM_THREADS": "1",
-                "OMP_NUM_THREADS": "4",
-                "OPENBLAS_NUM_THREADS": "1",
-                "PYTHONUNBUFFERED": "1",
-                "MASTER_ADDR": "127.0.0.1",
-                "MASTER_PORT": str(_free_port()),
-            }
-        )
-        command = [
-            mpiexec,
-            "--oversubscribe",
-            "--bind-to",
-            "none",
-            "-n",
-            str(world_size),
-            sys.executable,
-            str(Path(__file__).resolve()),
-        ]
-        print(
-            f"launch MPI worker: mode={mode}, ranks={world_size}",
-            flush=True,
-        )
-        process = subprocess.Popen(
-            command,
-            cwd=ROOT,
-            env=environment,
-            start_new_session=True,
-        )
-        try:
-            returncode = process.wait(timeout=240)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait()
-            self.fail(
-                f"{mode} MPI worker with {world_size} ranks timed out "
-                "after 240 seconds; worker output was streamed above"
-            )
-        self.assertEqual(
-            returncode,
-            0,
-            msg=f"{mode} MPI worker failed with exit code {returncode}",
-        )
-
-    def _validated_multirank_world_size(self):
-        self.assertGreaterEqual(
-            MULTIRANK_WORLD_SIZE,
-            4,
-            "WORLD_SIZE must be an even integer of at least four",
-        )
-        self.assertEqual(
-            MULTIRANK_WORLD_SIZE % 2,
-            0,
-            "WORLD_SIZE must be an even integer of at least four",
-        )
-        return MULTIRANK_WORLD_SIZE
-
-    def test_compiled_backend_matches_requested_profile(self):
-        # This catches an extension compiled for host memory while the test
-        # expects device pointers, or vice versa.
-        expected = {"cpu": "none", "cuda": "cuda", "rocm": "rocm"}[PROFILE]
-        self.assertEqual(self.binding.compiled_gpu_backend(), expected)
-        self.assertEqual(
-            self.binding.mpi_world_rank_and_size(),
-            (MPI.COMM_WORLD.Get_rank(), MPI.COMM_WORLD.Get_size()),
-        )
-
-    def test_rejects_non_integer_pointer_arguments(self):
-        # The public pybind API accepts raw addresses as integers. A Python
-        # object must fail conversion before native code can dereference it.
-        valid = {
-            "a": 1,
-            "q": 1,
-            "work": 1,
-            "n": 1,
-            "lda": 1,
-            "block_size": 1,
-            "process_rows": 1,
-            "process_cols": 1,
-        }
-        for pointer in ("a", "q", "work"):
-            with self.subTest(pointer=pointer):
-                arguments = valid.copy()
-                arguments[pointer] = object()
-                with self.assertRaises(TypeError):
-                    self.binding.slate_symmetric_multiply_float(**arguments)
-
-    def test_rejects_invalid_numeric_arguments(self):
-        arguments = {
-            "a": 1,
-            "q": 1,
-            "work": 1,
-            "n": 1,
-            "lda": 1,
-            "block_size": 1,
-            "process_rows": 1,
-            "process_cols": MPI.COMM_WORLD.Get_size(),
-        }
-        for name in ("a", "q", "work", "n", "lda", "block_size"):
-            with self.subTest(name=name):
-                invalid = arguments.copy()
-                invalid[name] = 0
-                with self.assertRaises(ValueError):
-                    self.binding.slate_symmetric_multiply_float(**invalid)
-
-    def test_single_rank_matches_torch_across_block_boundaries(self):
-        # One rank isolates numerical behavior and covers unit, oversized,
-        # exact, partial, and padded block-storage boundaries.
-        self._run_worker("single", 1)
-
-    def test_multiple_ranks_match_torch_for_every_row_major_grid(self):
-        # The default eight ranks exercise 1x8, 2x4, 4x2, and 8x1 grids.
-        # CI uses four ranks to retain rectangular and square grid coverage
-        # without oversubscribing a hosted runner with 32 OpenMP threads.
-        world_size = self._validated_multirank_world_size()
-        self._run_worker("multirank", world_size)
-
-    def test_forward_and_backward_rotation_single_rank(self):
-        self._run_worker("rotation_single", 1)
-
-    def test_forward_and_backward_rotation_multiple_ranks(self):
-        world_size = self._validated_multirank_world_size()
-        self._run_worker("rotation_multirank", world_size)
-
-    def test_fixed_basis_pipeline_for_row_and_column_shards(self):
-        world_size = self._validated_multirank_world_size()
-        self._run_worker("pipeline_multirank", world_size)
-
-
-if __name__ == "__main__":
-    if WORKER_MODE in os.environ:
-        _worker()
+    if rank == 0:
+        address = os.environ.get("MASTER_ADDR", "127.0.0.1")
+        if "MASTER_PORT" in os.environ:
+            port = int(os.environ["MASTER_PORT"])
+        else:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind((address, 0))
+                port = sock.getsockname()[1]
+        rendezvous = address, port
     else:
-        unittest.main()
+        rendezvous = None
+
+    address, port = MPI.COMM_WORLD.bcast(rendezvous, root=0)
+    os.environ["MASTER_ADDR"] = address
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group(
+        "nccl" if device.type == "cuda" else "gloo",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    return rank, world_size
+
+
+@torch.no_grad()
+def _reference_power_iteration_qr(preconditioner, orthogonal):
+    matrix = preconditioner.float()
+    basis = orthogonal.float()
+
+    estimated_eigenvalues = torch.diag(basis.T @ matrix @ basis)
+    order = torch.argsort(estimated_eigenvalues, descending=True)
+
+    Q, _ = torch.linalg.qr(matrix @ basis[:, order])
+
+    return order, Q
+
+
+def _run_soaptp_power_iteration_qr_2d_block_cyclic(
+    preconditioner, orthogonal, rank, world_size
+):
+    if not dist.is_initialized():
+        raise RuntimeError("torch.distributed must be initialized first")
+    if (rank, world_size) != (dist.get_rank(), dist.get_world_size()):
+        raise ValueError("rank and world_size must match torch.distributed")
+    if preconditioner.ndim != 2 or preconditioner.size(0) != preconditioner.size(1):
+        raise ValueError("preconditioner must be a square matrix")
+    if orthogonal.shape != preconditioner.shape:
+        raise ValueError("orthogonal must have the same shape as preconditioner")
+    if preconditioner.dtype != torch.float32 or orthogonal.dtype != torch.float32:
+        raise ValueError("preconditioner and orthogonal must use float32")
+    if preconditioner.device != orthogonal.device:
+        raise ValueError("preconditioner and orthogonal must share a device")
+
+    process_rows = math.isqrt(world_size)
+    while world_size % process_rows:
+        process_rows -= 1
+    process_grid_shape = (process_rows, world_size // process_rows)
+    global_shape = tuple(preconditioner.shape)
+    size = preconditioner.size(0)
+
+    local_preconditioner = allocate_2d_block_cyclic(
+        global_shape,
+        BLOCK_SIZE,
+        process_grid_shape,
+        dtype=preconditioner.dtype,
+        device=preconditioner.device,
+    )
+    local_orthogonal = allocate_2d_block_cyclic(
+        global_shape,
+        BLOCK_SIZE,
+        process_grid_shape,
+        dtype=orthogonal.dtype,
+        device=orthogonal.device,
+    )
+    work = allocate_2d_block_cyclic(
+        global_shape,
+        BLOCK_SIZE,
+        process_grid_shape,
+        dtype=preconditioner.dtype,
+        device=preconditioner.device,
+    )
+
+    _pack_full_matrix_2d_block_cyclic(
+        preconditioner,
+        local_preconditioner,
+        BLOCK_SIZE,
+        process_grid_shape,
+        rank,
+    )
+    _pack_full_matrix_2d_block_cyclic(
+        orthogonal,
+        local_orthogonal,
+        BLOCK_SIZE,
+        process_grid_shape,
+        rank,
+    )
+
+    order = power_iteration_qr_2d_block_cyclic_(
+        local_preconditioner,
+        local_orthogonal,
+        work,
+        size,
+        BLOCK_SIZE,
+        process_grid_shape,
+    )
+    Q = _unpack_matrix_2d_block_cyclic(
+        local_orthogonal,
+        global_shape,
+        BLOCK_SIZE,
+        process_grid_shape,
+        rank,
+    )
+    return order, Q
+
+
+def _test_power_iteration_qr(preconditioner, orthogonal):
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    if rank == 0:
+        order_reference, Q_reference = _reference_power_iteration_qr(
+            preconditioner,
+            orthogonal,
+        )
+        Q_reference = Q_reference.contiguous()
+    else:
+        order_reference = torch.empty(
+            preconditioner.size(0),
+            dtype=torch.long,
+            device=preconditioner.device,
+        )
+        Q_reference = torch.empty_like(preconditioner)
+
+    # Every rank needs the oracle values for the same local assertions, but
+    # only rank zero performs the reference power iteration and QR.
+    dist.broadcast(order_reference, src=0)
+    dist.broadcast(Q_reference, src=0)
+
+    order_distributed, Q_distributed = _run_soaptp_power_iteration_qr_2d_block_cyclic(
+        preconditioner,
+        orthogonal,
+        rank,
+        world_size,
+    )
+
+    torch.testing.assert_close(order_distributed, order_reference)
+
+    # A real QR factor is unique only up to an independent sign per column.
+    signs = torch.sign(torch.sum(Q_reference * Q_distributed, dim=0))
+    signs[signs == 0] = 1
+    Q_distributed_aligned = Q_distributed * signs
+
+    distributed_flat = Q_distributed_aligned.to(torch.float64).reshape(-1)
+    reference_flat = Q_reference.to(torch.float64).reshape(-1)
+    difference_norm = float(torch.linalg.vector_norm(distributed_flat - reference_flat))
+    reference_norm = float(torch.linalg.vector_norm(reference_flat))
+    tensors_are_finite = bool(
+        torch.isfinite(distributed_flat).all() and torch.isfinite(reference_flat).all()
+    )
+    if not tensors_are_finite:
+        relative_l2_error = math.inf
+    elif reference_norm == 0:
+        relative_l2_error = 0.0 if difference_norm == 0 else math.inf
+    else:
+        relative_l2_error = difference_norm / reference_norm
+    if relative_l2_error > RELATIVE_L2_RTOL:
+        raise AssertionError(
+            "distributed Q does not match the reference Q: "
+            f"relative L2 error {relative_l2_error:.6e} exceeds "
+            f"rtol={RELATIVE_L2_RTOL:.6e} "
+            f"(||distributed-reference||₂={difference_norm:.6e}, "
+            f"||reference||₂={reference_norm:.6e})."
+        )
+
+    torch.testing.assert_close(
+        Q_distributed_aligned,
+        Q_reference,
+        rtol=3e-3,
+        atol=3e-3,
+    )
+
+    # Verify that the distributed QR output is orthogonal.
+    identity = torch.eye(
+        Q_distributed.size(0),
+        dtype=Q_distributed.dtype,
+        device=Q_distributed.device,
+    )
+
+    torch.testing.assert_close(
+        Q_distributed.T @ Q_distributed,
+        identity,
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    return relative_l2_error
+
+
+@pytest.fixture(scope="module")
+def mpi_world():
+    from soap_tp import slate_bindings
+
+    backend = slate_bindings.compiled_gpu_backend()
+    if backend == "none":
+        device = torch.device("cpu")
+    elif backend in {"cuda", "rocm"}:
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"SLATE uses {backend}, but PyTorch cannot see a GPU")
+
+        shared_world = MPI.COMM_WORLD.Split_type(MPI.COMM_TYPE_SHARED)
+        try:
+            local_rank = shared_world.Get_rank()
+        finally:
+            shared_world.Free()
+
+        device_count = torch.cuda.device_count()
+        device_index = 0 if device_count == 1 else local_rank
+        if device_index >= device_count:
+            raise RuntimeError(f"local MPI rank {local_rank} has no visible GPU")
+        device = torch.device("cuda", device_index)
+        torch.cuda.set_device(device)
+    else:
+        raise RuntimeError(f"unsupported SLATE backend {backend!r}")
+
+    rank, world_size = _setup_mpi(device)
+    try:
+        yield rank, world_size, device
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.fixture(scope="module")
+def slate_l2_log(mpi_world, output_folder):
+    rank, _world_size, _device = mpi_world
+    if output_folder is None:
+        return None
+
+    path = output_folder / "slate_l2.log"
+    if rank == 0:
+        path.write_text("matrix_shape relative_l2_error\n")
+    return path
+
+
+@pytest.mark.parametrize("size", MATRIX_SIZES)
+def test_power_iteration_qr(size, mpi_world, slate_l2_log):
+    rank, _world_size, device = mpi_world
+
+    preconditioner = _make_preconditioner(
+        size,
+        dtype=torch.float32,
+        seed=SEED + size,
+    ).to(device)
+
+    orthogonal = _make_orthogonal(
+        size,
+        device,
+        seed=SEED + 1000 + size,
+    )
+
+    relative_l2_error = _test_power_iteration_qr(
+        preconditioner,
+        orthogonal,
+    )
+    if rank == 0 and slate_l2_log is not None:
+        with slate_l2_log.open("a") as stream:
+            stream.write(
+                f"{size}x{size} {relative_l2_error:.6e}\n"
+            )
