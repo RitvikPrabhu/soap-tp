@@ -208,15 +208,6 @@ template<class T> void bulk_gemm(rocblas_handle h, bool trans, int m, int n, int
     }
 }
 
-template<class T> __global__ void rank2(T* a, const T* v, const T* w,
-    const int* rows, const int* cols, int nr, int mr, int mc, int r0, int c0) {
-    size_t z=blockIdx.x*size_t(blockDim.x)+threadIdx.x;
-    if (z>=size_t(mr)*mc) return;
-    int ri=r0+z%mr, cj=c0+z/mr;
-    int i=rows[ri], j=cols[cj];
-    a[ri+size_t(cj)*nr] -= v[i]*w[j] + w[i]*v[j];
-}
-
 template<class T> __global__ void rank1(T* q, const T* v, const T* y,
     const int* rows, int nr, int nc, T tau) {
     size_t z=blockIdx.x*size_t(blockDim.x)+threadIdx.x;
@@ -373,10 +364,10 @@ template<class T> __global__ void unpack_vector(T* out, const T* packed,
 }
 
 template<class T> __global__ void local_rank2(T* a, const T* v, const T* w,
-    const T* vc, const T* wc, int nr, int mr, int mc, int r0, int c0) {
-    size_t z=blockIdx.x*size_t(blockDim.x)+threadIdx.x;
-    if (z<size_t(mr)*mc) {
-        int i=r0+z%mr, j=c0+z/mr;
+    const T* vc, const T* wc, int nr, int nc, int r0, int c0) {
+    int i=r0+blockIdx.x*blockDim.x+threadIdx.x;
+    int j=c0+blockIdx.y*blockDim.y+threadIdx.y;
+    if (i<nr && j<nc) {
         a[i+size_t(j)*nr]-=v[i]*wc[j]+w[i]*vc[j];
     }
 }
@@ -422,7 +413,7 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
         correct_w<<<(padded+255)/256,256>>>(w.p,v.p,padded,scalars.p,tt.p,k);
         transpose(w,wc);
         int mr=g.nr-r0, mc=g.nc-c0;
-        if (mr && mc) local_rank2<<<(size_t(mr)*mc+255)/256,256>>>(a.p,v.p,w.p,vc.p,wc.p,g.nr,mr,mc,r0,c0);
+        if (mr && mc) local_rank2<<<dim3((mr+127)/128,(mc+1)/2),dim3(128,2)>>>(a.p,v.p,w.p,vc.p,wc.p,g.nr,g.nc,r0,c0);
         if (g.c==owner) HIP(hipMemcpyAsync(a.p+size_t(g.li(k,g.pc))*g.nr,v.p,g.nr*sizeof(T),hipMemcpyDeviceToDevice));
         HIP(hipGetLastError());
     }
@@ -502,8 +493,8 @@ template<class T> Phases custom(Grid& g, rocblas_handle h, Device<T>& a,
                 for (int i=0;i<g.nr;++i) packedw[i]=w[g.rows[i]];
                 for (int j=0;j<g.nc;++j) packedw[g.nr+j]=w[g.cols[j]];
                 localw.put(packedw);
-                if (mr && mc) local_rank2<<<(size_t(mr)*mc+255)/256,256>>>(a.p,localv.p,localw.p,
-                    localv.p+g.nr,localw.p+g.nr,g.nr,mr,mc,r0,c0);
+                if (mr && mc) local_rank2<<<dim3((mr+127)/128,(mc+1)/2),dim3(128,2)>>>(a.p,localv.p,localw.p,
+                    localv.p+g.nr,localw.p+g.nr,g.nr,g.nc,r0,c0);
             }
             HIP(hipGetLastError());
         }

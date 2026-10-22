@@ -246,6 +246,15 @@ Hypothesis: the faster CPU-vector baseline still uploads full replicated V/W to 
 
 - Snapshot `packed-eigh` SHA530960a08f7aa43481ecf5f6158371ecc2a141e9f35f92aa63564f6ab0f4dc5d. Tiny31 random/lowrank/indefinite/diagonal in both precisions and delayed-panel/unblocked control pass. FP64 random residual7.58e-16/orth6.16e-15; FP32 random1.71e-7/2.12e-6. These are login correctness checks, not performance evidence.
 - Prepared `packed` batch suite gates97 grids1/2/4/8G and all transports/backtransform controls; then pairs `retile-eigh` versus `packed-eigh` at8192 on1x8/2x4/4x2 with tri8x1. Separate rank0-only rocprofv3 kernel/copy traces compare CPU/GPU vector paths. Instrumented totals must not be used as competitive measurements.
+- Job5736545 completed6m48s onfrontier00194; all34 cases passed, including two instrumented cases. Keep packing: paired8192 warm medians below use tri8x1 for both binaries. Main4x2's extra redistribution is not profitable; do not infer this is the best4x2 total.
+
+| Main grid | FP64 before→after (s) | FP32 before→after (s) |
+|---|---:|---:|
+|1x8|2.855→2.811|2.175→2.060|
+|2x4|3.078→2.930|2.308→2.179|
+|4x2|3.121→3.060|2.291→2.163|
+
+- Rank0-only rocprofv3 trace at8192/4x2/FP64, whole run including validation/reference work: CPU-vector GEMV.599s, rank2.407s, RCCL kernels.141s; GPU-vector GEMV.631s, rank2.370s, RCCL kernels**1.426s**, scalar kernels.291s. There are8,446 versus57,593 RCCL kernels. Kernel durations are instrumented GPU intervals, include waiting, and are not isolated network time or an additive decomposition of uninstrumented solver wall time. Raw ROCpd databases: `output/custom-eigh/profile-5736545-v{0,1}/rank0_results.db`. GPU collective latency, not just host copies, is material.
 
 ### E17: use the custom GPU solver's bases in SOAP-style updates (prepared)
 
@@ -253,3 +262,11 @@ Hypothesis: low solver residual alone does not establish acceptable SOAP updates
 
 - Tiny binary input/export paths are explicitly limited to2≤n≤512. Normal-size A/Q stay distributed. FP64 andFP32 independent3×3 roundtrip tests compare exported AQ−QΛ, QᵀQ and eigenvalues to NumPy: residual4.10e-16/2.30e-7, orth8.85e-16/2.08e-7. Existing45-row CPU study reproduces exactly after adding the optional GPU backend.
 - Snapshot `basis-eigh` SHA57ae5f1dfef02daddb9afaaea42780942beb733d0eb17f511d02e0213e06c8ae; `soap` suite prepared for one compute-node GCD, not yet submitted. Six variants yield54 rows. This remains a frozen-basis update experiment, not training-loss validation or a distributed SOAP backend.
+- First attempt job5736707 TIMEOUT5m20s onfrontier09032, **no GPU solves/results**: PyTorch import was still reading modules over the shared home filesystem. Process/strace inspection showed repeated filesystem metadata reads under `torch/distributed`, not an eigensolver deadlock. Increasing the running time limit was denied by Slurm; no allocation change occurred. Removed the compute-node Python orchestrator. New workflow: login-CPU `--prepare` writes18 tiny covariance inputs (~1MiB); a pure-shell batch runs90 compiled GPU solves; login-CPU `--bases` computes54 update-study rows, reusing FP64 bases for the sign/permutation control. Prepared corpus in `output/custom-eigh/soap-input`; new job not yet submitted.
+
+### E18: remove rank2 index division (candidate)
+
+Hypothesis: rank2 is the second-largest custom compute kernel in the trace. Its flattened64-bit runtime quotient/remainder can be replaced by a128×2 thread block and a2D row/column launch. This preserves numerical operations and rectangular ownership; tail masks independently bound rows and columns. It also removes the obsolete global-vector rank2 kernel superseded by E16.
+
+- Snapshot `twod-eigh` SHAe7984d83d8509a4ec0601a0c3cb8d250306e533c1bbf6bb78868b6528f2428b6. Tiny2/31, FP64/32, CPU/GPU vectors all pass; FP32 random residual1.71e-7/orth2.12e-6. No performance claim yet.
+- Job5736758 submitted12min, suite `twod`:16 uneven rectangular checks, paired8192 CPU4x2/GPU1x8→tri8x1 against `basis-eigh`, then16384 updated candidates in both precisions with full ELPA2 reference. Latest source changes affect only rank2 indexing; frozen precision-study binary remains unchanged.

@@ -69,6 +69,13 @@ The existing SOAP initializer consumes eigenvectors and discards eigenvalues; it
 
 `soap_precision.py` isolates basis sensitivity on tiny96×64 CPU examples using the actual `adam_update` primitive, SOAP's adjusted epsilon, and dense forward/back projections. It compares frozen FP64, FP32, FP16-rounded-input and BF16-rounded-input bases over20 updates at three condition numbers/seeds. All update arithmetic is FP64, deliberately isolating basis changes. A signed/permuted-basis control must return the same update. This is **not** an end-to-end distributed SOAP or training experiment, and does not use the custom solver's eigenvectors.
 
-The optional `soap_precision.py --solver build/custom-eigh/eigh` instead obtains every basis from this custom GPU solver, including the three-product split-half backtransform. The `soap` batch suite runs these tiny singleton MPI solves on one compute-node GCD and writes `output/custom-eigh/soap-JOBID.csv`. This tests the actual solver basis in the same frozen-basis update experiment, still not training or a distributed SOAP backend. It uses temporary files under `.amp/in/` and removes them after each solve.
+To use actual custom GPU bases, first generate the tiny input corpus on a login CPU, run only compiled singleton MPI solves on one compute-node GCD, then analyze the exported bases on the login CPU. This avoids expensive shared-filesystem PyTorch imports on compute nodes. It includes the three-product split-half backtransform, still not training or a distributed SOAP backend:
+
+```bash
+PYTHONPATH=src .venv/bin/python research/frontier_eigh/soap_precision.py --prepare output/custom-eigh/soap-input
+EIGH_BIN=build/custom-eigh/eigh sbatch --time=00:08:00 research/frontier_eigh/run.slurm soap
+# After JOBID completes:
+PYTHONPATH=src .venv/bin/python research/frontier_eigh/soap_precision.py --bases output/custom-eigh/soap-JOBID
+```
 
 Tiny test I/O is explicitly restricted to2≤n≤512: `--input path` reads exactly n² native FP64 column-major values; `--export-basis path` writes n ascending FP64 eigenvalues followed by n² FP64 column-major eigenvectors **after** numerical validation. Dense input replication and full-Q export are prohibited for larger problems. Normal distributed solves do not use these paths.

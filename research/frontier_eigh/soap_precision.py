@@ -3,15 +3,13 @@
 PYTHONPATH=src OPENBLAS_NUM_THREADS=1 .venv/bin/python research/frontier_eigh/soap_precision.py
 Uses the real Adam primitive and SOAP projection/epsilon conventions. All update
 arithmetic is FP64 to isolate basis error; FP16/BF16 modes round inputs only.
-Add --solver build/custom-eigh/eigh to use our GPU solver's exported tiny bases.
+Use --prepare DIR before the soap batch suite, then --bases DIR to analyze its exports.
 """
 import argparse
 import csv
 import math
 from pathlib import Path
-import subprocess
 import sys
-import tempfile
 
 import numpy as np
 import torch
@@ -19,41 +17,32 @@ import torch
 from soap_tp.ops.optimizer import adam_update
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--solver", help="custom eigh executable, one rank/GCD per tiny solve")
+mode = parser.add_mutually_exclusive_group()
+mode.add_argument("--prepare", type=Path, help="write tiny column-major matrices for the GPU batch job")
+mode.add_argument("--bases", type=Path, help="read the custom GPU batch job's exported eigenbases")
 args = parser.parse_args()
+if args.prepare:
+    args.prepare.mkdir(parents=True, exist_ok=True)
 torch.set_num_threads(1)
 writer = csv.DictWriter(sys.stdout, [
     "seed", "condition", "variant", "steps", "residual_max", "orthogonality_max",
     "negative_eigenvalues", "update_first_rel", "update_last_rel", "update_max_rel",
     "update_last_cosine",
 ], lineterminator="\n")
-writer.writeheader()
+if not args.prepare:
+    writer.writeheader()
 
 
 def eigenbasis(a, variant):
-    if args.solver:
+    if args.bases:
         if variant == "signed_permuted":
             w, q = eigenbasis(a, "fp64")
             return w.flip(0), q.flip(1) * (1 - 2 * (torch.arange(len(w)) % 2))
-        with tempfile.TemporaryDirectory(dir=".amp/in") as directory:
-            source, output = Path(directory) / "input.bin", Path(directory) / "basis.bin"
-            a.T.contiguous().numpy().tofile(source)
-            precision = "fp64" if variant == "fp64" else "fp32"
-            command = [args.solver, "--n", str(len(a)), "--block", "16", "--back-block", "32",
-                       "--input", str(source), "--export-basis", str(output), "--matrix", "supplied",
-                       "--precision", precision, "--tridiag", "elpa" if precision == "fp64" else "elpa32"]
-            if variant in ("fp16_input", "bf16_input"):
-                command += ["--quant", variant.split("_")[0]]
-            if variant == "split_half":
-                command += ["--half-bulk", "2"]
-            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            if result.returncode:
-                raise RuntimeError(result.stdout)
-            values = np.fromfile(output, dtype=np.float64)
-            n = len(a)
-            w = torch.from_numpy(values[:n].copy()).flip(0)
-            q = torch.from_numpy(values[n:].reshape(n, n, order="F").copy()).flip(1)
-            return w, q
+        n = len(a)
+        values = np.fromfile(args.bases / f"{case_name}-n{n}-{variant}.bin", dtype=np.float64)
+        w = torch.from_numpy(values[:n].copy()).flip(0)
+        q = torch.from_numpy(values[n:].reshape(n, n, order="F").copy()).flip(1)
+        return w, q
     if variant == "fp16_input":
         a = a.half().float()
     elif variant == "bf16_input":
@@ -69,6 +58,7 @@ def eigenbasis(a, variant):
 
 for seed in (42, 43, 44):
     for condition in (1e2, 1e6, 1e9):
+        case_name = f"s{seed}-c{int(condition)}"
         generator = torch.Generator().manual_seed(seed)
         matrices, factors = [], []
         for n in (96, 64):
@@ -78,6 +68,10 @@ for seed in (42, 43, 44):
             # Existing SOAP preconditioners are FP32, even when ELPA solves FP64.
             matrices.append(((a + a.T) * 0.5).float().double())
             factors.append(u * spectrum.sqrt())
+        if args.prepare:
+            for a in matrices:
+                a.T.contiguous().numpy().tofile(args.prepare / f"{case_name}-n{len(a)}.bin")
+            continue
         gradients = [
             (factors[0] @ torch.randn(96, 64, generator=generator, dtype=torch.float64)
              @ factors[1].T).float().double()
@@ -85,7 +79,7 @@ for seed in (42, 43, 44):
         ]
         reference = []
         variants = ["fp64", "signed_permuted", "fp32", "fp16_input", "bf16_input"]
-        if args.solver:
+        if args.bases:
             variants.append("split_half")
         for variant in variants:
             pairs = [eigenbasis(a, variant) for a in matrices]

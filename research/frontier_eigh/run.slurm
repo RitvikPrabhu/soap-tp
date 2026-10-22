@@ -342,14 +342,50 @@ elif [[ $1 == packed ]]; then
             bash -c 'if [[ $SLURM_PROCID == 0 ]]; then exec rocprofv3 --kernel-trace --memory-copy-trace --stats -d "$PROFILE_OUT" -o rank0 -- "$@"; else exec "$@"; fi' \
             _ "${EIGH_BIN:-build/custom-eigh/eigh}" --n 8192 --block 64 --pr 4 --pc 2 --tridiag elpa --back-block 128 --gpu-mpi 1 --rccl 1 --device-vectors "$vectors"
     done
+elif [[ $1 == twod ]]; then
+    for grid in '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            for vectors in 0 1; do
+                run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --precision "$precision" --back-block 13 --device-vectors "$vectors" --gpu-mpi 1 --rccl 1
+            done
+        done
+    done
+    for precision in fp64 fp32; do
+        tridiag=elpa
+        [[ $precision == fp32 ]] && tridiag=elpa32
+        for vectors in 0 1; do
+            pr=4; pc=2; tri_pr=4
+            if [[ $vectors == 1 ]]; then pr=1; pc=8; tri_pr=8; fi
+            for binary in basis-eigh twod-eigh; do
+                EIGH_BIN=build/custom-eigh/$binary run 8 --n 8192 --block 64 --pr "$pr" --pc "$pc" --tri-pr "$tri_pr" --precision "$precision" --tridiag "$tridiag" --back-block 128 --gpu-mpi 1 --rccl 1 --device-vectors "$vectors" --repeat 3 --reference 1
+            done
+            run 8 --n 16384 --block 64 --pr "$pr" --pc "$pc" --tri-pr "$tri_pr" --precision "$precision" --tridiag "$tridiag" --back-block 128 --gpu-mpi 1 --rccl 1 --device-vectors "$vectors" --repeat 3 --reference 1
+        done
+    done
 elif [[ $1 == soap ]]; then
     # Independent singleton MPI solves, restricted to tiny correctness examples on one GCD.
-    export ROCR_VISIBLE_DEVICES=0 PYTHONPATH=src
-    mkdir -p .amp/in
-    sha256sum "${EIGH_BIN:-build/custom-eigh/eigh}"
-    .venv/bin/python research/frontier_eigh/soap_precision.py --solver "${EIGH_BIN:-build/custom-eigh/eigh}" \
-        > "output/custom-eigh/soap-$SLURM_JOB_ID.csv"
-    cat "output/custom-eigh/soap-$SLURM_JOB_ID.csv"
+    export ROCR_VISIBLE_DEVICES=0
+    destination="output/custom-eigh/soap-$SLURM_JOB_ID"
+    mkdir -p "$destination"
+    for seed in 42 43 44; do
+        for condition in 100 1000000 1000000000; do
+            for n in 96 64; do
+                stem="s$seed-c$condition-n$n"
+                for variant in fp64 fp32 fp16_input bf16_input split_half; do
+                    precision=fp32; tridiag=elpa32; extra=()
+                    [[ $variant == fp64 ]] && precision=fp64 && tridiag=elpa
+                    [[ $variant == fp16_input || $variant == bf16_input ]] && extra=(--quant "${variant%_input}")
+                    [[ $variant == split_half ]] && extra=(--half-bulk 2)
+                    echo "COMMAND ranks=1 basis_case=$stem variant=$variant --n $n --block 16 --back-block 32 --input output/custom-eigh/soap-input/$stem.bin --export-basis $destination/$stem-$variant.bin --precision $precision --tridiag $tridiag ${extra[*]}"
+                    sha256sum "${EIGH_BIN:-build/custom-eigh/eigh}"
+                    "${EIGH_BIN:-build/custom-eigh/eigh}" --n "$n" --block 16 --back-block 32 \
+                        --input "output/custom-eigh/soap-input/$stem.bin" --export-basis "$destination/$stem-$variant.bin" \
+                        --matrix supplied --precision "$precision" --tridiag "$tridiag" "${extra[@]}"
+                done
+            done
+        done
+    done
 elif [[ $1 == case ]]; then
     shift
     ranks=$1; shift
