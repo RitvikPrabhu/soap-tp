@@ -91,26 +91,51 @@ struct Grid {
     double maximum(double x) { double y; MPI(MPI_Allreduce(&x,&y,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD)); return y; }
 };
 
-template<class T> void gemv(rocblas_handle h, bool trans, int m, int n,
-                            T* a, T* x, T* y) {
-    T one=1, zero=0;
+template<class T> void gemv(rocblas_handle h, bool trans, int m, int n, int lda,
+                            T* a, T* x, T* y, T alpha=T(1), T beta=T(0)) {
     auto op=trans?rocblas_operation_transpose:rocblas_operation_none;
-    if constexpr(std::is_same_v<T,double>) BLAS(rocblas_dgemv(h,op,m,n,&one,a,m,x,1,&zero,y,1));
-    else BLAS(rocblas_sgemv(h,op,m,n,&one,a,m,x,1,&zero,y,1));
+    if constexpr(std::is_same_v<T,double>) BLAS(rocblas_dgemv(h,op,m,n,&alpha,a,lda,x,1,&beta,y,1));
+    else BLAS(rocblas_sgemv(h,op,m,n,&alpha,a,lda,x,1,&beta,y,1));
+}
+
+template<class T> void gemm(rocblas_handle h, bool trans, int m, int n, int k,
+    T alpha, T* a, int lda, T* b, int ldb, T beta, T* c, int ldc, bool transb=false) {
+    auto op=trans?rocblas_operation_transpose:rocblas_operation_none;
+    auto opb=transb?rocblas_operation_transpose:rocblas_operation_none;
+    if constexpr(std::is_same_v<T,double>) BLAS(rocblas_dgemm(h,op,opb,
+        m,n,k,&alpha,a,lda,b,ldb,&beta,c,ldc));
+    else BLAS(rocblas_sgemm(h,op,opb,m,n,k,&alpha,a,lda,b,ldb,&beta,c,ldc));
 }
 
 template<class T> __global__ void rank2(T* a, const T* v, const T* w,
-    const int* rows, const int* cols, int nr, int nc, int k) {
+    const int* rows, const int* cols, int nr, int mr, int mc, int r0, int c0) {
     size_t z=blockIdx.x*size_t(blockDim.x)+threadIdx.x;
-    if (z>=size_t(nr)*nc) return;
-    int i=rows[z%nr], j=cols[z/nr];
-    if (i>k && j>k) a[z] -= v[i]*w[j] + w[i]*v[j];
+    if (z>=size_t(mr)*mc) return;
+    int ri=r0+z%mr, cj=c0+z/mr;
+    int i=rows[ri], j=cols[cj];
+    a[ri+size_t(cj)*nr] -= v[i]*w[j] + w[i]*v[j];
 }
 
 template<class T> __global__ void rank1(T* q, const T* v, const T* y,
     const int* rows, int nr, int nc, T tau) {
     size_t z=blockIdx.x*size_t(blockDim.x)+threadIdx.x;
     if (z<size_t(nr)*nc) q[z] -= tau*v[rows[z%nr]]*y[z/nr];
+}
+
+template<class T> __global__ void pack_panel(T* u, T* d, const T* v, const T* w,
+    const int* rows, const int* cols, int nr, int nc, int pos, int block) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if (i<nr) { u[i+size_t(pos)*nr]=v[rows[i]]; u[i+size_t(pos+block)*nr]=w[rows[i]]; }
+    if (i<nc) { d[i+size_t(pos)*nc]=w[cols[i]]; d[i+size_t(pos+block)*nc]=v[cols[i]]; }
+}
+
+template<class T> __global__ void correct_column(T* a, const T* u, const T* d,
+    int nr, int nc, int localcol, int block) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if (i>=nr) return;
+    T x=0;
+    for (int p=0;p<2*block;++p) x+=u[i+size_t(p)*nr]*d[localcol+size_t(p)*nc];
+    a[i+size_t(localcol)*nr]-=x;
 }
 
 template<class T> std::vector<T> column(Grid& g, Device<T>& a, int k) {
@@ -133,14 +158,62 @@ template<class T> void store_column(Grid& g, Device<T>& a, int k, const std::vec
 
 struct Phases { double reduction=0, tridiag=0, back=0; };
 
+template<class T> void backtransform(Grid& g, rocblas_handle h, Device<T>& a,
+    Device<T>& q, const std::vector<double>& tau, int block) {
+    // H_start ... H_end = I - V T V^T. V is row-distributed, replicated over process columns.
+    for (int end=g.n-1;end>0;) {
+        int start=((end-1)/block)*block, width=end-start;
+        Device<T> v(size_t(g.nr)*width), gram(size_t(width)*width), dt(size_t(width)*width);
+        Device<T> y(size_t(width)*g.nc), ty(size_t(width)*g.nc);
+        std::vector<T> hostv(v.n);
+        for (int k=start;k<end;) {
+            int take=std::min(end-k,g.b-k%g.b), owner=(k/g.b)%g.pc;
+            size_t offset=size_t(k-start)*g.nr, count=size_t(take)*g.nr;
+            T* buf=g.gpu_mpi?v.p+offset:hostv.data()+offset;
+            if (g.c==owner) HIP(hipMemcpy(buf,a.p+size_t(g.li(k,g.pc))*g.nr,count*sizeof(T),
+                g.gpu_mpi?hipMemcpyDeviceToDevice:hipMemcpyDeviceToHost));
+            if (g.gpu_mpi) HIP(hipDeviceSynchronize());
+            g.bcast(buf,count,owner,g.row);
+            k+=take;
+        }
+        if (!g.gpu_mpi) v.put(hostv);
+        gemm(h,true,width,width,g.nr,T(1),v.p,g.nr,v.p,g.nr,T(0),gram.p,width);
+        g.device_sum(gram,g.col);
+        auto gv=gram.get();
+        std::vector<double> t(size_t(width)*width,0), x(width);
+        for (int i=0;i<width;++i) {
+            for (int j=0;j<i;++j) x[j]=-tau[start+i]*gv[j+size_t(i)*width];
+            for (int j=0;j<i;++j) for (int l=j;l<i;++l)
+                t[j+size_t(i)*width]+=t[j+size_t(l)*width]*x[l];
+            t[i+size_t(i)*width]=tau[start+i];
+        }
+        std::vector<T> tt(t.begin(),t.end()); dt.put(tt);
+        gemm(h,true,width,g.nc,g.nr,T(1),v.p,g.nr,q.p,g.nr,T(0),y.p,width);
+        g.device_sum(y,g.col);
+        gemm(h,false,width,g.nc,width,T(1),dt.p,width,y.p,width,T(0),ty.p,width);
+        gemm(h,false,g.nr,g.nc,width,T(-1),v.p,g.nr,ty.p,width,T(1),q.p,g.nr);
+        end=start;
+    }
+}
+
 template<class T> Phases custom(Grid& g, rocblas_handle h, Device<T>& a,
-                               Device<T>& q, std::vector<double>& eval) {
+                               Device<T>& q, std::vector<double>& eval, int back_block, int panel) {
     Phases times;
     Device<int> dr(g.nr), dc(g.nc); dr.put(g.rows); dc.put(g.cols);
     Device<T> dv(g.n), dw(g.n), vx(g.nc), vy(g.nr), y(g.nc), vr(g.nr);
+    Device<T> u(size_t(g.nr)*2*panel), dcross(size_t(g.nc)*2*panel), coeff(2*panel);
+    HIP(hipMemset(vy.p,0,vy.n*sizeof(T)));
     std::vector<double> d(g.n), e(g.n,0), tau(g.n-1);
     double start=g.tick();
     for (int k=0;k<g.n-1;++k) {
+        if (panel>1) {
+            if (k%panel==0) {
+                HIP(hipMemset(u.p,0,u.n*sizeof(T))); HIP(hipMemset(dcross.p,0,dcross.n*sizeof(T)));
+            } else if (g.c==(k/g.b)%g.pc) {
+                correct_column<<<(g.nr+255)/256,256>>>(a.p,u.p,dcross.p,g.nr,g.nc,g.li(k,g.pc),panel);
+                HIP(hipGetLastError());
+            }
+        }
         auto v=column(g,a,k);
         d[k]=v[k];
         double norm=0;
@@ -158,8 +231,17 @@ template<class T> Phases custom(Grid& g, rocblas_handle h, Device<T>& a,
             std::vector<T> vc(g.nc);
             for (int j=0;j<g.nc;++j) vc[j]=v[g.cols[j]];
             vx.put(vc);
-            gemv(h,false,g.nr,g.nc,a.p,vx.p,vy.p);
+            int r0=std::upper_bound(g.rows.begin(),g.rows.end(),k)-g.rows.begin();
+            int c0=std::upper_bound(g.cols.begin(),g.cols.end(),k)-g.cols.begin();
+            int mr=g.nr-r0, mc=g.nc-c0;
+            if (mr && mc) gemv(h,false,mr,mc,g.nr,a.p+r0+size_t(c0)*g.nr,vx.p+c0,vy.p+r0);
+            else HIP(hipMemset(vy.p,0,vy.n*sizeof(T)));
             g.device_sum(vy,g.row);
+            if (panel>1 && k%panel!=0) {
+                gemv(h,true,g.nc,2*panel,g.nc,dcross.p,vx.p,coeff.p);
+                g.device_sum(coeff,g.row);
+                gemv(h,false,g.nr,2*panel,g.nr,u.p,coeff.p,vy.p,T(-1),T(1));
+            }
             auto local=vy.get();
             std::vector<T> w(g.n,0);
             for (int i=0;i<g.nr;++i) if (g.rows[i]>k) w[g.rows[i]]=T(tau[k]*local[i]);
@@ -168,10 +250,17 @@ template<class T> Phases custom(Grid& g, rocblas_handle h, Device<T>& a,
             for (int i=k+1;i<g.n;++i) dot+=double(v[i])*w[i];
             for (int i=k+1;i<g.n;++i) w[i]-=T(0.5*tau[k]*dot*v[i]);
             dw.put(w);
-            rank2<<<(size_t(g.nr)*g.nc+255)/256,256>>>(a.p,dv.p,dw.p,dr.p,dc.p,g.nr,g.nc,k);
+            if (panel>1) pack_panel<<<(std::max(g.nr,g.nc)+255)/256,256>>>(u.p,dcross.p,dv.p,dw.p,dr.p,dc.p,g.nr,g.nc,k%panel,panel);
+            else if (mr && mc) rank2<<<(size_t(mr)*mc+255)/256,256>>>(a.p,dv.p,dw.p,dr.p,dc.p,g.nr,mr,mc,r0,c0);
             HIP(hipGetLastError());
         }
         store_column(g,a,k,v);
+        if (panel>1 && ((k+1)%panel==0 || k==g.n-2)) {
+            int r0=std::upper_bound(g.rows.begin(),g.rows.end(),k)-g.rows.begin();
+            int c0=std::upper_bound(g.cols.begin(),g.cols.end(),k)-g.cols.begin();
+            if (r0<g.nr && c0<g.nc) gemm(h,false,g.nr-r0,g.nc-c0,2*panel,T(-1),
+                u.p+r0,g.nr,dcross.p+c0,g.nc,T(1),a.p+r0+size_t(c0)*g.nr,g.nr,true);
+        }
     }
     d.back()=column(g,a,g.n-1).back();
     times.reduction=g.tick()-start;
@@ -188,12 +277,13 @@ template<class T> Phases custom(Grid& g, rocblas_handle h, Device<T>& a,
     std::vector<T> zt(z.begin(),z.end()); q.put(zt);
     double middle=g.tick(); times.tridiag=middle-start-times.reduction;
     // Q = H_0 H_1 ... H_(n-2) Z: left multiplication in reverse order.
-    for (int k=g.n-2;k>=0;--k) if (tau[k]!=0) {
+    if (back_block>1) backtransform(g,h,a,q,tau,back_block);
+    else for (int k=g.n-2;k>=0;--k) if (tau[k]!=0) {
         auto v=column(g,a,k); dv.put(v);
         std::vector<T> local(g.nr);
         for (int i=0;i<g.nr;++i) local[i]=v[g.rows[i]];
         vr.put(local);
-        gemv(h,true,g.nr,g.nc,q.p,vr.p,y.p);
+        gemv(h,true,g.nr,g.nc,g.nr,q.p,vr.p,y.p);
         g.device_sum(y,g.col);
         rank1<<<(size_t(g.nr)*g.nc+255)/256,256>>>(q.p,dv.p,y.p,dr.p,g.nr,g.nc,T(tau[k]));
         HIP(hipGetLastError());
@@ -214,6 +304,8 @@ double entry(int i, int j, int n, const std::string& matrix) {
     unsigned long long x=lo*0x9e3779b97f4a7c15ULL+hi*0xbf58476d1ce4e5b9ULL;
     x=(x^(x>>30))*0xbf58476d1ce4e5b9ULL; x=(x^(x>>27))*0x94d049bb133111ebULL; x^=x>>31;
     double val=(double(x>>11)*0x1.0p-53-.5)/std::sqrt(double(n));
+    if (matrix=="indefinite") return val;
+    if (matrix!="random") throw std::runtime_error("unknown matrix family");
     return val+(i==j ? 3.+double(i)/n : 0);
 }
 
@@ -223,6 +315,7 @@ double quantize(double x, const std::string& quant) {
         float f=x; unsigned u; std::memcpy(&u,&f,4);
         u+=0x7fff+((u>>16)&1); u&=0xffff0000; std::memcpy(&f,&u,4); return f;
     }
+    if (quant!="none") throw std::runtime_error("quant must be none, fp16, or bf16");
     return x;
 }
 
@@ -275,7 +368,8 @@ template<class T> void elpa_solve(Grid& g, Device<T>& a, Device<T>& q,
 }
 
 template<class T> void run(Grid& g, const std::string& solver, const std::string& name,
-    const std::string& quant, bool reference, int repeat) {
+    const std::string& quant, bool reference, int repeat, int back_block, int panel) {
+    if (repeat<1 || back_block<1 || panel<1) throw std::runtime_error("repeat and block widths must be positive");
     rocblas_handle h; BLAS(rocblas_create_handle(&h));
     double begin=g.tick();
     auto original=matrix(g,name,"none"), input=matrix(g,name,quant);
@@ -286,8 +380,8 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
     Phases phases;
     double total=0;
     for (int trial=0;trial<repeat;++trial) {
-        a.put(at); double start=g.tick();
-        if (solver=="custom") phases=custom(g,h,a,q,eval);
+        a.put(at); g.comm=0; double start=g.tick();
+        if (solver=="custom") phases=custom(g,h,a,q,eval,back_block,panel);
         else if (solver=="elpa1" || solver=="elpa2")
             elpa_solve(g,a,q,eval,solver=="elpa1"?ELPA_SOLVER_1STAGE:ELPA_SOLVER_2STAGE);
         else if (solver=="rocsolver") {
@@ -302,13 +396,14 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
             HIP(hipMemcpy(q.p,a.p,a.n*sizeof(T),hipMemcpyDeviceToDevice));
         } else throw std::runtime_error("unknown solver");
         total=g.maximum(g.tick()-start);
-        if (g.rank==0) std::printf("TIMING solver=%s trial=%d n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s total=%.9g reduction=%.9g tridiag=%.9g back=%.9g\n",
+        if (g.rank==0) std::printf("TIMING solver=%s trial=%d n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s total=%.9g reduction=%.9g tridiag=%.9g back=%.9g back_block=%d gpu_mpi=%d panel=%d\n",
             solver.c_str(),trial,g.n,g.pr,g.pc,g.b,std::is_same_v<T,double>?"fp64":"fp32",name.c_str(),quant.c_str(),total,
-            phases.reduction,phases.tridiag,phases.back);
+            phases.reduction,phases.tridiag,phases.back,back_block,int(g.gpu_mpi),panel);
     }
     double comm=g.maximum(g.comm); g.comm=0;
     auto qt=q.get(); std::vector<double> qd(qt.begin(),qt.end());
     auto aq=product(g,h,original,qd);
+    auto aiq=quant=="none" ? aq : product(g,h,input,qd);
     std::vector<double> trans(qd.size());
     int one=1; double alpha=1, beta=0;
     pdtran_(&g.n,&g.n,&alpha,qd.data(),&one,&one,g.desc,&beta,trans.data(),&one,&one,g.desc);
@@ -320,11 +415,11 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
         double orth=gram[z]-(g.rows[i]==g.cols[j]?1.:0.);
         sums[0]+=diff*diff; sums[1]+=original[z]*original[z]; sums[2]+=orth*orth;
         sums[3]+=(input[z]-original[z])*(input[z]-original[z]);
-        double di=aq[z]-qd[z]*eval[g.cols[j]];
-        (void)di;
+        double di=aiq[z]-qd[z]*eval[g.cols[j]];
+        sums[4]+=di*di;
     }
     g.sum(sums,5,MPI_COMM_WORLD);
-    double eigerr=-1;
+    double eigerr=-1, smallerr=-1;
     if (g.n<=512) {
         std::vector<double> ref(g.n);
         if (!g.rank) {
@@ -338,22 +433,24 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
         double diff=0,scale=0;
         for(int i=0;i<g.n;++i) { diff=std::max(diff,std::abs(ref[i]-eval[i])); scale=std::max(scale,std::abs(ref[i])); }
         eigerr=diff/scale;
+        if (ref.front()!=0) smallerr=std::abs(ref.front()-eval.front())/std::abs(ref.front());
     } else if (reference) {
         Device<double> ar(original.size()), qr(original.size()); ar.put(original);
         std::vector<double> ref(g.n); elpa_solve(g,ar,qr,ref,ELPA_SOLVER_2STAGE);
         double diff=0,scale=0;
         for(int i=0;i<g.n;++i) { diff=std::max(diff,std::abs(ref[i]-eval[i])); scale=std::max(scale,std::abs(ref[i])); }
         eigerr=diff/scale;
+        if (ref.front()!=0) smallerr=std::abs(ref.front()-eval.front())/std::abs(ref.front());
     }
     double residual=std::sqrt(sums[0]/sums[1]), orth=std::sqrt(sums[2]);
-    if (!g.rank) std::printf("RESULT solver=%s n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s setup=%.9g total=%.9g comm=%.9g residual=%.9g orthogonality=%.9g eig_rel_max=%.9g input_rel=%.9g eig_min=%.9g eig_max=%.9g\n",
+    double input_residual=std::sqrt(sums[4]/sums[1]);
+    int negative=std::count_if(eval.begin(),eval.end(),[](double x){return x<0;});
+    if (!g.rank) std::printf("RESULT solver=%s n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s setup=%.9g total=%.9g comm=%.9g residual=%.9g orthogonality=%.9g eig_rel_max=%.9g input_rel=%.9g eig_min=%.9g eig_max=%.9g input_residual=%.9g eig_small_rel=%.9g negative=%d\n",
         solver.c_str(),g.n,g.pr,g.pc,g.b,std::is_same_v<T,double>?"fp64":"fp32",name.c_str(),quant.c_str(),setup,total,comm,
-        residual,orth,eigerr,std::sqrt(sums[3]/sums[1]),eval.front(),eval.back());
+        residual,orth,eigerr,std::sqrt(sums[3]/sums[1]),eval.front(),eval.back(),input_residual,smallerr,negative);
     BLAS(rocblas_destroy_handle(h));
     double tol=std::is_same_v<T,double>?1e-10:1e-4;
-    if (quant=="fp16") tol=2e-3;
-    if (quant=="bf16") tol=2e-2;
-    if (!std::isfinite(residual) || residual>tol || !std::isfinite(orth) || orth>tol*std::sqrt(g.n))
+    if (!std::isfinite(residual) || !std::isfinite(input_residual) || input_residual>tol || !std::isfinite(orth) || orth>tol*std::sqrt(g.n))
         throw std::runtime_error("numerical validation failed");
 }
 
@@ -369,8 +466,8 @@ int main(int argc,char** argv) {
         std::string precision=arg("--precision","fp64");
         {
             Grid g(n,b,pr,pc,arg("--gpu-mpi","0")=="1");
-            if (precision=="fp64") run<double>(g,arg("--solver","custom"),arg("--matrix","random"),arg("--quant","none"),arg("--reference","0")=="1",std::stoi(arg("--repeat","1")));
-            else if (precision=="fp32") run<float>(g,arg("--solver","custom"),arg("--matrix","random"),arg("--quant","none"),arg("--reference","0")=="1",std::stoi(arg("--repeat","1")));
+            if (precision=="fp64") run<double>(g,arg("--solver","custom"),arg("--matrix","random"),arg("--quant","none"),arg("--reference","0")=="1",std::stoi(arg("--repeat","1")),std::stoi(arg("--back-block","1")),std::stoi(arg("--panel","1")));
+            else if (precision=="fp32") run<float>(g,arg("--solver","custom"),arg("--matrix","random"),arg("--quant","none"),arg("--reference","0")=="1",std::stoi(arg("--repeat","1")),std::stoi(arg("--back-block","1")),std::stoi(arg("--panel","1")));
             else throw std::runtime_error("precision must be fp64 or fp32");
         }
         MPI(MPI_Finalize()); return 0;

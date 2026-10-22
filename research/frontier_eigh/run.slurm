@@ -19,6 +19,7 @@ echo "JOB $SLURM_JOB_ID $(date -Is) nodes=$SLURM_JOB_NODELIST suite=${1:-smoke}"
 run() {
     local ranks=$1; shift
     echo "COMMAND ranks=$ranks $*"
+    sha256sum "${EIGH_BIN:-build/custom-eigh/eigh}"
     srun -N1 -n "$ranks" --ntasks-per-node="$ranks" -c7 --gpus-per-task=1 \
         --gpu-bind=closest --kill-on-bad-exit=1 "${EIGH_BIN:-build/custom-eigh/eigh}" "$@"
 }
@@ -48,6 +49,58 @@ elif [[ $1 == baseline ]]; then
         run 8 --n 2048 --block "$block" --pr 2 --pc 4 --repeat 2
     done
     run 8 --n 2048 --block 64 --pr 2 --pc 4 --gpu-mpi 1 --repeat 2 --reference 1
+elif [[ $1 == precision ]]; then
+    for matrix in random lowrank indefinite clustered; do
+        run 8 --n 257 --block 16 --pr 2 --pc 4 --matrix "$matrix" --precision fp64
+        for quant in none fp16 bf16; do
+            run 8 --n 257 --block 16 --pr 2 --pc 4 --matrix "$matrix" --precision fp32 --quant "$quant"
+        done
+    done
+elif [[ $1 == active ]]; then
+    for n in 2048 4096; do
+        for grid in '2 4' '4 2'; do
+            read -r pr pc <<< "$grid"
+            for precision in fp64 fp32; do
+                EIGH_BIN=build/custom-eigh/baseline-eigh run 8 --n "$n" --block 64 --pr "$pr" --pc "$pc" --precision "$precision" --gpu-mpi 1 --repeat 2
+                run 8 --n "$n" --block 64 --pr "$pr" --pc "$pc" --precision "$precision" --gpu-mpi 1 --repeat 2
+            done
+        done
+    done
+elif [[ $1 == wy ]]; then
+    for grid in '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --precision "$precision" --back-block 13 --gpu-mpi 1
+        done
+    done
+    for matrix in random lowrank indefinite clustered; do
+        run 8 --n 257 --block 16 --pr 2 --pc 4 --matrix "$matrix" --precision fp64 --back-block 32 --gpu-mpi 1
+        for quant in none fp16 bf16; do
+            run 8 --n 257 --block 16 --pr 2 --pc 4 --matrix "$matrix" --precision fp32 --quant "$quant" --back-block 32 --gpu-mpi 1
+        done
+    done
+    for precision in fp64 fp32; do
+        for back in 1 16 32 64 128; do
+            run 8 --n 4096 --block 64 --pr 2 --pc 4 --precision "$precision" --back-block "$back" --gpu-mpi 1 --repeat 3
+        done
+        run 8 --n 4096 --block 64 --pr 2 --pc 4 --precision "$precision" --solver elpa2 --repeat 3
+    done
+    run 8 --n 4096 --block 64 --pr 2 --pc 4 --back-block 32 --gpu-mpi 0 --repeat 3
+elif [[ $1 == panel ]]; then
+    for grid in '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --precision "$precision" --back-block 13 --panel 7 --gpu-mpi 1
+        done
+    done
+    for precision in fp64 fp32; do
+        for panel in 1 8 16 32 64; do
+            run 8 --n 4096 --block 64 --pr 2 --pc 4 --precision "$precision" --back-block 32 --panel "$panel" --gpu-mpi 1 --repeat 3
+        done
+    done
+    for panel in 1 32; do
+        run 8 --n 8192 --block 64 --pr 2 --pc 4 --back-block 128 --panel "$panel" --gpu-mpi 1 --repeat 2 --reference 1
+    done
 elif [[ $1 == case ]]; then
     shift
     ranks=$1; shift
