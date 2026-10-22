@@ -323,10 +323,14 @@ template<class T, int Stage> __global__ void vector_scalar(const T* v, T* w,
         if constexpr(Stage==0) s[0]=partial[0];
         else if constexpr(Stage==1) {
             s[1]=partial[0]; s[2]=0; s[3]=0;
-            for (int i=0;i<nr;++i) {
-                if (rows[i]==k+1) s[2]=double(v[i]);
-                if (rows[i]==k) s[3]=double(v[i]);
+            int lo=0, hi=nr;
+            while (lo<hi) {
+                int mid=(lo+hi)/2;
+                if (rows[mid]<k) lo=mid+1;
+                else hi=mid;
             }
+            if (lo<nr && rows[lo]==k) { s[3]=double(v[lo]); ++lo; }
+            if (lo<nr && rows[lo]==k+1) s[2]=double(v[lo]);
         } else s[4]=partial[0];
     }
 }
