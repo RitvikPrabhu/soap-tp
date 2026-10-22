@@ -91,14 +91,58 @@ Hypothesis: delay a panel's rank-2 updates and apply A₂₂←A₂₂−[V W][W
 - Completed 18:04 EDT, frontier01560. All correctness checks passed. n4096 FP64 panel1/8/16/32/64 total1.787/1.903/1.941/1.979/2.117s; FP321.456/1.593/1.617/1.667/1.777s. At n8192 panel1/32 total6.539/6.750s, reduction3.614/3.825s. FP64 residual1.11e-14/1.09e-14; eigenvalue agreement with ELPA2 2.79e-15/2.27e-15.
 - Conclusion: select panel1. Delayed updates do not remove the sequential GEMV dependency and add coefficient reductions; GEMM alone is insufficient. Retain this explicitly non-default experimental control as evidence distinguishing this approach from genuine two-stage reduction, not as a performance improvement.
 
-### E5: tridiagonal component, transport, native-half bulk (submitted)
+### E5: tridiagonal component, transport, native-half bulk
 
 Hypotheses: ELPA's public GPU tridiagonal component may beat LibSci PDSTEDC without surrendering custom dense stages; RCCL may improve device collectives; native FP16 GEMM/FP32 accumulation may be the lowest useful bulk arithmetic.
 
 - Job **5736114**, 6-minute one-node limit, immutable `half-eigh` binary. Includes all rectangular ELPA-tridiagonal cases, RCCL rectangles, paired transports/components n4096, n8192 ELPA component plus full ELPA2 eigenvalue reference, native-half random/lowrank checks.
 - ELPA's component API uses host d/e and distributed local host Q; internal GPU work is ELPA-owned. Full-solver GPU-pointer API differs. FP64 tridiagonal solve remains in FP32 dense mode.
 - Native-half prototype converts operands for GEMM through rocBLAS GEMM_EX, retains FP32 state/accumulation. Tiny n31 failed strict orthogonality (0.00535), so this is an accuracy experiment, not a working low-precision solver. Batch explicitly records such failures rather than weakening acceptance.
+- Job5736114 completed 18:09 EDT, frontier00002. All ELPA-component and RCCL correctness cases passed; all four naive-half cases failed, as expected. n257 lowrank half/panel16 even produced120 negative eigenvalues.
+
+| n4096 FP64 transport | LibSci tri / total(s) | ELPA tri / total(s) |
+|---|---:|---:|
+| Host MPI | .4669 / 1.6231 | .1213 / 1.2822 |
+| Device MPI | .4740 / 1.7322 | .1180 / 1.3770 |
+| Synchronized RCCL | .4674 / 1.6540 | .1024 / 1.3061 |
+
+- n8192 host MPI with ELPA tridiagonal: total4.0769, reduction3.3114, tri.4858, back.2743s; deviceMPI4.2689/3.5894/.4942/.1800s. FP64 residual1.11e-14, orth9.67e-13, eigenvalue error2.79e-15 vsELPA2. Select ELPA component for performance mode, retain independent LibSci baseline. This is **not** wrapping full ELPA eigh: both dense stages are custom.
+- Source check confirms `elpa1/elpa_solve_tridi_impl_public.F90` stages host d/e/localQ to GPUs. `solve_tridi/solve_tridi_single_problem_template.F90` uses ROCm rocSOLVER STEDC for leaves when available; recursive GPU merges combine subproblems. Dense Z remains distributed.
 
 ### E6: scaled host norm (candidate)
 
-Hypothesis: per-element `hypot` in replicated Householder generation is expensive. Replace it by a two-pass max-scaled FP64 norm, retaining overflow-safe scaling and one final `hypot` with alpha. Tiny n31 lowrank FP64 and random FP32 passed. Snapshot `norm-eigh`; must compare against the previous binary on the same compute node before selecting.
+Hypothesis: per-element `hypot` in replicated Householder generation is expensive. Replace it by a two-pass max-scaled FP64 norm, retaining overflow-safe scaling and one final `hypot` with alpha. Tiny n31 lowrank FP64 and random FP32 passed. Snapshot `norm-eigh`.
+
+- Paired job **5736133**, frontier00642: n4096 FP64 hostMPI/ELPAtri reduction1.0852→.9420s, total1.2890→1.1429s. n8192 reduction3.3076→2.6659s, total4.0703→3.4223s. Keep scaled norm; numerical checks passed.
+
+### E7: scaled split-FP16 bulk arithmetic
+
+Hypothesis: three FP16-input/FP32-accumulate GEMMs for AhiBhi+AhiBlo+AloBhi may preserve FP32-like accuracy while using faster matrix instructions. State and reduction GEMV remain FP32; this is **not** an FP16 eigensolver.
+
+- Unscaled split failed tiny n31 (orth.00208). [AMD documents MI200 FP16 MFMA flushing subnormals](https://rocm.docs.amd.com/projects/rocBLAS/en/latest/conceptual/rocblas-design-notes.html). Corrected representation: high is rounded FP16 normal-or-zero, low is4096×residual; cross-term alpha is divided by4096. This prevents low corrections being represented directly as FP16 subnormals. Low×low is omitted, so this remains an approximation.
+- Tiny n31 random residual1.71e-7/orth2.21e-6; lowrank2.94e-7/2.39e-6. Job5736133 distributed n257 grid4x2 random/lowrank/indefinite all pass. Lowrank residual3.44e-7/orth8.34e-6, but smallest-eigenvalue error30.6% persists from FP32 reduction/input.
+- n8192 passes: split residual1.34e-6/orth.000155, versus FP32 1.37e-6/.000264. Backtransform .1892 vs .1506s; total2.7468 vs2.7034s. Not selected for speed. Retained as the lowest tested native bulk arithmetic with FP32-like normwise accuracy; not a guarantee for small eigenvalues or arbitrary dynamic range.
+
+### E8: synchronization and disjoint row-vector collectives (candidates)
+
+- `async-eigh`: remove redundant device-wide sync before blocking host copies; RCCL reductions/broadcasts enqueue on the same default HIP stream as rocBLAS. Host reads and phase boundaries synchronize as required. **No claim of algorithmic communication/computation overlap**; this first tests eliminating avoidable synchronization. `comm` becomes host call/enqueue wall time for RCCL, not device communication duration.
+- `gather-eigh`: replace zero-padded length-n MPI_SUM across process rows by an Allgatherv of disjoint local row pieces, then unpack cyclic blocks. This is only O(n) vector replication, never a dense gather. Used for both Householder columns and w vectors. Tiny local ELPA/RCCL passed; rectangular and performance checks in `transport` suite must precede selection.
+- Job **5736154** completed18:20 EDT, frontier02829, all cases passed. n8192 FP64 paired total seconds:
+
+| Binary | Host MPI | Device MPI | RCCL |
+|---|---:|---:|---:|
+| Scaled norm, synchronized | 3.4645 | 3.6800 | 3.4402 |
+| Remove redundant sync | 3.3610 | 3.6732 | 3.2435 |
+| +row-vector Allgatherv | 3.2376 | 3.5250 | **3.1420** |
+
+- Keep both changes. Best reduction2.5166/ELPAtri.4897/back.1301s, residual9.66e-15/orth8.11e-13. Default-stream RCCL is ordered with rocBLAS; this removes synchronization but does not implement look-ahead overlap.
+
+### E9: tuning, SOAP-relevant subspace validation (submitted)
+
+- Job **5736176**, five-minute limit, immutable `subspace-eigh`, varies matrix block32/64/128/256 and backtransform32/64/128/256 at8192; adds low-precision n257 top-eight subspace metrics and ELPA1/2 internal stage profiles.
+- SOAP caller inspection: `soap.py` initializes eigenvectors and discards eigenvalues; later refreshes use QR. FP32 input is promoted to FP64 in the existing ELPA path and results cast back. There is no inverse eigenvalue in this initializer. Therefore loss of tiny eigenvalues alone does **not** prove an optimizer failure; basis/subspace and training/update errors matter.
+- Validation now reports `||(I-RRᵀ)Qtop||F/||Qtop||F` for eight dominant reference vectors and the normalized boundary eigengap; suppresses this metric when the reference boundary is degenerate. Collects only n×8 thin panels, not the full eigenvector matrix. Tiny n31 FP16-rounded lowrank top-subspace8.50e-5 despite negative eigenvalues; clustered boundary correctly reports skipped. Full SOAP training/update comparison is not yet performed.
+
+### E10: genuine custom dense-to-band reduction (planned)
+
+Hypothesis: factor independent tall panels using distributed Householder QR, then apply two-sided compact-WY updates through GEMM, eliminating one full trailing-matrix GEMV per reflector. Keep full matrices distributed and preserve first-stage reflectors separately. Initially reuse only ELPA's banded-input mode for distributed band→tridiagonal/solve/second-stage backtransform, then our own first-stage backtransform. ELPA source explicitly skips its dense→band and last backtransform when `bandwidth` is set; this path will be runtime-validated, not assumed correct from source alone.

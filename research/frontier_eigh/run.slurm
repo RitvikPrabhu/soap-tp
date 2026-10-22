@@ -142,6 +142,38 @@ elif [[ $1 == norm ]]; then
     for half in 0 2; do
         EIGH_BIN=build/custom-eigh/split-eigh run 8 --n 8192 --block 64 --pr 2 --pc 4 --back-block 128 --tridiag elpa --precision fp32 --half-bulk "$half" --repeat 3 --reference 1
     done
+elif [[ $1 == transport ]]; then
+    for grid in '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --precision "$precision" --back-block 13 --tridiag elpa --gpu-mpi 1 --rccl 1
+        done
+    done
+    for binary in split-eigh async-eigh gather-eigh; do
+        for transport in '0 0' '1 0' '1 1'; do
+            read -r gpu rccl <<< "$transport"
+            EIGH_BIN=build/custom-eigh/$binary run 8 --n 8192 --block 64 --pr 2 --pc 4 --back-block 128 --tridiag elpa --gpu-mpi "$gpu" --rccl "$rccl" --repeat 3
+        done
+    done
+elif [[ $1 == tune ]]; then
+    for block in 32 64 128 256; do
+        run 8 --n 8192 --block "$block" --pr 2 --pc 4 --back-block 128 --tridiag elpa --gpu-mpi 1 --rccl 1 --repeat 3
+    done
+    for precision in fp64 fp32; do
+        for back in 32 64 128 256; do
+            [[ $precision == fp64 && $back == 128 ]] && continue
+            run 8 --n 8192 --block 64 --pr 2 --pc 4 --back-block "$back" --tridiag elpa --gpu-mpi 1 --rccl 1 --precision "$precision" --repeat 3
+        done
+    done
+    for matrix in random lowrank; do
+        run 8 --n 257 --block 16 --pr 2 --pc 4 --back-block 32 --matrix "$matrix"
+        for quant in none fp16 bf16; do
+            run 8 --n 257 --block 16 --pr 2 --pc 4 --back-block 32 --matrix "$matrix" --precision fp32 --quant "$quant"
+        done
+    done
+    for solver in elpa1 elpa2; do
+        run 8 --n 8192 --block 64 --pr 2 --pc 4 --solver "$solver" --elpa-times 1 --repeat 2
+    done
 elif [[ $1 == case ]]; then
     shift
     ranks=$1; shift
