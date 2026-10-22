@@ -137,12 +137,29 @@ Hypothesis: three FP16-input/FP32-accumulate GEMMs for AhiBhi+AhiBlo+AloBhi may 
 
 - Keep both changes. Best reduction2.5166/ELPAtri.4897/back.1301s, residual9.66e-15/orth8.11e-13. Default-stream RCCL is ordered with rocBLAS; this removes synchronization but does not implement look-ahead overlap.
 
-### E9: tuning, SOAP-relevant subspace validation (submitted)
+### E9: tuning, SOAP-relevant subspace validation
 
 - Job **5736176**, five-minute limit, immutable `subspace-eigh`, varies matrix block32/64/128/256 and backtransform32/64/128/256 at8192; adds low-precision n257 top-eight subspace metrics and ELPA1/2 internal stage profiles.
 - SOAP caller inspection: `soap.py` initializes eigenvectors and discards eigenvalues; later refreshes use QR. FP32 input is promoted to FP64 in the existing ELPA path and results cast back. There is no inverse eigenvalue in this initializer. Therefore loss of tiny eigenvalues alone does **not** prove an optimizer failure; basis/subspace and training/update errors matter.
 - Validation now reports `||(I-RRᵀ)Qtop||F/||Qtop||F` for eight dominant reference vectors and the normalized boundary eigengap; suppresses this metric when the reference boundary is degenerate. Collects only n×8 thin panels, not the full eigenvector matrix. Tiny n31 FP16-rounded lowrank top-subspace8.50e-5 despite negative eigenvalues; clustered boundary correctly reports skipped. Full SOAP training/update comparison is not yet performed.
+- Completed18:26, frontier02826, all checks passed. n8192 FP64 matrixblock32/64/128/256 total3.167/3.171/3.156/3.141s: small differences, no material block winner. Back32/64/128/256 phase.220/.140/.130/.302s. Keep128; FP32 back64 and128 effectively tied(.0709/.0719s), total2.492/2.476s.
+- n257 top-eight subspace residuals, reference boundary gaps random5.15e-4/lowrank.909:
 
-### E10: genuine custom dense-to-band reduction (planned)
+| Dense/input precision | Random SPD | Lowrank SPD |
+|---|---:|---:|
+| FP64 | 1.57e-13 | 1.21e-15 |
+| FP32 | 3.17e-5 | 1.19e-7 |
+| FP16-rounded / FP32 solve | .01569 | 3.88e-5 |
+| BF16-rounded / FP32 solve | .04153 | 3.34e-4 |
+
+- Dominant-subspace accuracy is eigengap-dependent: FP16-rounded lowrank has many negative small eigenvalues yet good dominant subspace; the closer random-SPD boundary rotates much more. No universal minimum SOAP precision is established without update/training metrics.
+- Profiled ELPA2 n8192 total3.785s includes timer/output overhead, so not an uninstrumented competitive result. Internal tridi→band backtransform~1.525s is substantial; stage totals must be compared rather than assuming any two-stage solver wins. Full uninstrumented controls remain necessary.
+
+### E10: genuine custom dense-to-band reduction (submitted)
 
 Hypothesis: factor independent tall panels using distributed Householder QR, then apply two-sided compact-WY updates through GEMM, eliminating one full trailing-matrix GEMV per reflector. Keep full matrices distributed and preserve first-stage reflectors separately. Initially reuse only ELPA's banded-input mode for distributed band→tridiagonal/solve/second-stage backtransform, then our own first-stage backtransform. ELPA source explicitly skips its dense→band and last backtransform when `bandwidth` is set; this path will be runtime-validated, not assumed correct from source alone.
+
+- Implemented `--band b` requiring band==distributionblock initially. Custom CPU distributed tall-panel QR uses scaled FP64 scalar formation and short column-communicator reductions. GPU forms V/T/W: W=AVT−½VTᵀ(VᵀAVT); two rocBLAS GEMMs update A←A−VWᵀ−WVᵀ. Store first-stage Householders in a separate **distributed** GPU matrix; only O(n×band) panels are replicated transiently. No full dense gather.
+- `tridiag` timing now means the complete ELPA banded-input pipeline (CPU distributed band→tridiagonal, distributed eigensolve, Q2 backtransform), not just eigensolution; `back` is our Q1 backtransform. Use `--elpa-times 1` for internal separation. FP32 band mode uses ELPA's FP32 band/tri path, unlike one-stage's FP64 tridiagonal component.
+- Tiny login31 b8/back13 FP64 random/lowrank/diagonal and FP32 random passed; FP64 residual1.16e-15/orth8.68e-15 and FP32 5.51e-7/3.89e-6. Includes partial last panel. Source-to-band correctness is checked indirectly by full original AQ−QΛ and reference spectrum, not by inspecting triangular zeros alone.
+- Job **5736208**, six-minute one-node limit, immutable `band-eigh`. Distributed97 rectangles/families precede target4096/8192 band32/64/128 versus one-stage controls, both precisions; all large cases use full ELPA2 reference plus thin-subspace validation. Last case tests split-FP16 bulk on band64 and records strict-check outcome.

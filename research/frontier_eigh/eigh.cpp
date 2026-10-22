@@ -114,6 +114,15 @@ struct Grid {
             std::copy_n(packed.data()+row_offsets[(i/b)%pr]+li(i,pr),std::min(b,n-i),full.data()+i);
         return full;
     }
+    template<class T> std::vector<T> column_layout(const std::vector<T>& local, int width) {
+        std::vector<T> full(size_t(n)*width,0), out(size_t(nc)*width);
+        for (int j=0;j<width;++j) for (int i=0;i<nr;++i)
+            full[rows[i]+size_t(j)*n]=local[i+size_t(j)*nr];
+        sum(full.data(),full.size(),col);
+        for (int j=0;j<width;++j) for (int i=0;i<nc;++i)
+            out[i+size_t(j)*nc]=full[cols[i]+size_t(j)*n];
+        return out;
+    }
     template<class T> void device_sum(Device<T>& d, MPI_Comm comm_) {
         if (rccl) {
             double t=MPI_Wtime();
@@ -152,6 +161,7 @@ template<class T> void gemm(rocblas_handle h, bool trans, int m, int n, int k,
 
 int half_bulk=0;
 bool elpa_times=false;
+int band_width=0;
 template<class T> __global__ void to_half(__half* out, const T* in, int rows, int cols, int ld, int parts) {
     size_t z=blockIdx.x*size_t(blockDim.x)+threadIdx.x;
     if (z<size_t(rows)*cols) {
@@ -233,6 +243,18 @@ struct Phases { double reduction=0, tridiag=0, back=0; };
 
 void tridiagonal_elpa(Grid&, std::vector<double>&, std::vector<double>&, std::vector<double>&);
 
+template<class T> std::vector<T> compact_t(const std::vector<T>& gram,
+    const std::vector<double>& tau, int start, int width) {
+    std::vector<double> t(size_t(width)*width,0), x(width);
+    for (int i=0;i<width;++i) {
+        for (int j=0;j<i;++j) x[j]=-tau[start+i]*gram[j+size_t(i)*width];
+        for (int j=0;j<i;++j) for (int l=j;l<i;++l)
+            t[j+size_t(i)*width]+=t[j+size_t(l)*width]*x[l];
+        t[i+size_t(i)*width]=tau[start+i];
+    }
+    return std::vector<T>(t.begin(),t.end());
+}
+
 template<class T> void backtransform(Grid& g, rocblas_handle h, Device<T>& a,
     Device<T>& q, const std::vector<double>& tau, int block) {
     // H_start ... H_end = I - V T V^T. V is row-distributed, replicated over process columns.
@@ -255,15 +277,7 @@ template<class T> void backtransform(Grid& g, rocblas_handle h, Device<T>& a,
         if (!g.gpu_mpi) v.put(hostv);
         gemm(h,true,width,width,g.nr,T(1),v.p,g.nr,v.p,g.nr,T(0),gram.p,width);
         g.device_sum(gram,g.col);
-        auto gv=gram.get();
-        std::vector<double> t(size_t(width)*width,0), x(width);
-        for (int i=0;i<width;++i) {
-            for (int j=0;j<i;++j) x[j]=-tau[start+i]*gv[j+size_t(i)*width];
-            for (int j=0;j<i;++j) for (int l=j;l<i;++l)
-                t[j+size_t(i)*width]+=t[j+size_t(l)*width]*x[l];
-            t[i+size_t(i)*width]=tau[start+i];
-        }
-        std::vector<T> tt(t.begin(),t.end()); dt.put(tt);
+        dt.put(compact_t(gram.get(),tau,start,width));
         bulk_gemm(h,true,width,g.nc,g.nr,T(1),v.p,g.nr,q.p,g.nr,T(0),y.p,width);
         g.device_sum(y,g.col);
         gemm(h,false,width,g.nc,width,T(1),dt.p,width,y.p,width,T(0),ty.p,width);
@@ -432,11 +446,12 @@ std::vector<double> product(Grid& g, rocblas_handle h,
 }
 
 void elpa_check(int error) { if (error!=ELPA_OK) throw std::runtime_error(elpa_strerr(error)); }
-elpa_t elpa_handle(Grid& g, int solver) {
+elpa_t elpa_handle(Grid& g, int solver, int bandwidth=0) {
     elpa_check(elpa_init(ELPA_API_VERSION));
     int error; elpa_t e=elpa_allocate(&error); elpa_check(error);
     auto set=[&](const char* k,int v) { elpa_set_integer(e,k,v,&error); elpa_check(error); };
     set("na",g.n); set("nev",g.n); set("local_nrows",g.nr); set("local_ncols",g.nc);
+    if (bandwidth) set("bandwidth",bandwidth);
     set("nblk",g.b); set("mpi_comm_parent",int(MPI_Comm_c2f(MPI_COMM_WORLD)));
     set("timings",int(elpa_times));
     set("process_row",g.r); set("process_col",g.c); elpa_check(elpa_setup(e));
@@ -456,8 +471,8 @@ void tridiagonal_elpa(Grid& g, std::vector<double>& d, std::vector<double>& e, s
     elpa_check(error); elpa_release(handle);
 }
 template<class T> void elpa_solve(Grid& g, Device<T>& a, Device<T>& q,
-                                  std::vector<double>& eigenvalues, int solver) {
-    auto e=elpa_handle(g,solver); int error;
+                                  std::vector<double>& eigenvalues, int solver, int bandwidth=0) {
+    auto e=elpa_handle(g,solver,bandwidth); int error;
     Device<T> dd(g.n);
     if constexpr(std::is_same_v<T,double>) elpa_eigenvectors_double(e,a.p,dd.p,q.p,&error);
     else elpa_eigenvectors_float(e,a.p,dd.p,q.p,&error);
@@ -468,6 +483,101 @@ template<class T> void elpa_solve(Grid& g, Device<T>& a, Device<T>& q,
         elpa_print_times(e,name.data());
     }
     elpa_release(e);
+}
+
+template<class T> __global__ void zero_outside_band(T* a, const int* rows,
+    const int* cols, int nr, int nc, int bandwidth) {
+    size_t z=blockIdx.x*size_t(blockDim.x)+threadIdx.x;
+    if (z<size_t(nr)*nc && abs(rows[z%nr]-cols[z/nr])>bandwidth) a[z]=0;
+}
+
+template<class T> Phases custom_band(Grid& g, rocblas_handle h, Device<T>& a,
+    Device<T>& q, std::vector<double>& eval, int back_block) {
+    if (band_width!=g.b || band_width<2 || band_width>=g.n)
+        throw std::runtime_error("initial band experiment requires 2 <= band == block < n");
+    Phases times;
+    Device<T> reflectors(a.n);
+    HIP(hipMemset(reflectors.p,0,reflectors.n*sizeof(T)));
+    std::vector<double> tau(g.n-1,0);
+    double begin=g.tick();
+    for (int p=0;p<g.n-band_width;p+=band_width) {
+        int width=std::min(band_width,g.n-band_width-p), start=p+band_width;
+        std::vector<T> panel(size_t(g.nr)*width);
+        int owner=(p/g.b)%g.pc;
+        if (g.c==owner) HIP(hipMemcpy(panel.data(),a.p+size_t(g.li(p,g.pc))*g.nr,
+            panel.size()*sizeof(T),hipMemcpyDeviceToHost));
+        g.bcast(panel.data(),panel.size(),owner,g.row);
+        // Distributed tall-panel Householder QR; only scalar/short-vector collectives.
+        for (int j=0;j<width;++j) {
+            int pivot=start+j;
+            double scale=0;
+            for (int i=0;i<g.nr;++i) if (g.rows[i]>pivot)
+                scale=std::max(scale,std::abs(double(panel[i+size_t(j)*g.nr])));
+            double clock=MPI_Wtime();
+            MPI(MPI_Allreduce(MPI_IN_PLACE,&scale,1,MPI_DOUBLE,MPI_MAX,g.col));
+            g.comm+=MPI_Wtime()-clock;
+            double values[2]={};
+            for (int i=0;i<g.nr;++i) {
+                double x=panel[i+size_t(j)*g.nr];
+                if (g.rows[i]==pivot) values[1]=x;
+                if (g.rows[i]>pivot && scale!=0) { x/=scale; values[0]+=x*x; }
+            }
+            g.sum(values,2,g.col);
+            double alpha=values[1], norm=scale*std::sqrt(values[0]);
+            double beta=norm ? -std::copysign(std::hypot(alpha,norm),alpha) : alpha;
+            tau[p+j]=norm ? (beta-alpha)/beta : 0;
+            for (int i=0;i<g.nr;++i) {
+                T& x=panel[i+size_t(j)*g.nr];
+                if (g.rows[i]==pivot) x=1;
+                else if (g.rows[i]>pivot && norm) x=T(x/(alpha-beta));
+            }
+            if (tau[p+j]!=0 && j+1<width) {
+                std::vector<double> dots(width-j-1,0);
+                for (int l=j+1;l<width;++l) for (int i=0;i<g.nr;++i) if (g.rows[i]>=pivot)
+                    dots[l-j-1]+=double(panel[i+size_t(j)*g.nr])*panel[i+size_t(l)*g.nr];
+                g.sum(dots.data(),dots.size(),g.col);
+                for (int l=j+1;l<width;++l) for (int i=0;i<g.nr;++i) if (g.rows[i]>=pivot)
+                    panel[i+size_t(l)*g.nr]-=T(tau[p+j]*dots[l-j-1]*panel[i+size_t(j)*g.nr]);
+            }
+        }
+        for (int j=0;j<width;++j) for (int i=0;i<g.nr;++i)
+            if (g.rows[i]<start+j) panel[i+size_t(j)*g.nr]=0;
+        if (g.c==owner) HIP(hipMemcpy(reflectors.p+size_t(g.li(p,g.pc))*g.nr,
+            panel.data(),panel.size()*sizeof(T),hipMemcpyHostToDevice));
+        Device<T> v(panel.size()), vc(size_t(g.nc)*width), av(panel.size()), w(panel.size());
+        Device<T> wc(size_t(g.nc)*width), gram(size_t(width)*width), dt(gram.n), cross(gram.n), s(gram.n);
+        v.put(panel); vc.put(g.column_layout(panel,width));
+        gemm(h,true,width,width,g.nr,T(1),v.p,g.nr,v.p,g.nr,T(0),gram.p,width);
+        g.device_sum(gram,g.col); dt.put(compact_t(gram.get(),tau,p,width));
+        int r0=std::lower_bound(g.rows.begin(),g.rows.end(),p)-g.rows.begin();
+        int c0=std::lower_bound(g.cols.begin(),g.cols.end(),start)-g.cols.begin();
+        HIP(hipMemset(av.p,0,av.n*sizeof(T)));
+        if (r0<g.nr && c0<g.nc) gemm(h,false,g.nr-r0,width,g.nc-c0,T(1),
+            a.p+r0+size_t(c0)*g.nr,g.nr,vc.p+c0,g.nc,T(0),av.p+r0,g.nr);
+        g.device_sum(av,g.row);
+        gemm(h,false,g.nr,width,width,T(1),av.p,g.nr,dt.p,width,T(0),w.p,g.nr);
+        gemm(h,true,width,width,g.nr,T(1),v.p,g.nr,w.p,g.nr,T(0),cross.p,width);
+        g.device_sum(cross,g.col);
+        gemm(h,true,width,width,width,T(.5),dt.p,width,cross.p,width,T(0),s.p,width);
+        gemm(h,false,g.nr,width,width,T(-1),v.p,g.nr,s.p,width,T(1),w.p,g.nr);
+        wc.put(g.column_layout(w.get(),width));
+        c0=std::lower_bound(g.cols.begin(),g.cols.end(),p)-g.cols.begin();
+        if (r0<g.nr && c0<g.nc) {
+            bulk_gemm(h,false,g.nr-r0,g.nc-c0,width,T(-1),v.p+r0,g.nr,wc.p+c0,g.nc,
+                T(1),a.p+r0+size_t(c0)*g.nr,g.nr,true);
+            bulk_gemm(h,false,g.nr-r0,g.nc-c0,width,T(-1),w.p+r0,g.nr,vc.p+c0,g.nc,
+                T(1),a.p+r0+size_t(c0)*g.nr,g.nr,true);
+        }
+    }
+    Device<int> dr(g.nr), dc(g.nc); dr.put(g.rows); dc.put(g.cols);
+    zero_outside_band<<<(a.n+255)/256,256>>>(a.p,dr.p,dc.p,g.nr,g.nc,band_width);
+    HIP(hipGetLastError());
+    times.reduction=g.tick()-begin;
+    elpa_solve(g,a,q,eval,ELPA_SOLVER_2STAGE,band_width);
+    double middle=g.tick(); times.tridiag=middle-begin-times.reduction;
+    backtransform(g,h,reflectors,q,tau,back_block);
+    times.back=g.tick()-middle;
+    return times;
 }
 
 std::vector<double> top_columns(Grid& g, const std::vector<double>& a, int width) {
@@ -494,7 +604,7 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
     double total=0;
     for (int trial=0;trial<repeat;++trial) {
         a.put(at); g.comm=0; double start=g.tick();
-        if (solver=="custom") phases=custom(g,h,a,q,eval,back_block,panel,tridiag);
+        if (solver=="custom") phases=band_width ? custom_band(g,h,a,q,eval,back_block) : custom(g,h,a,q,eval,back_block,panel,tridiag);
         else if (solver=="elpa1" || solver=="elpa2")
             elpa_solve(g,a,q,eval,solver=="elpa1"?ELPA_SOLVER_1STAGE:ELPA_SOLVER_2STAGE);
         else if (solver=="rocsolver") {
@@ -509,9 +619,9 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
             HIP(hipMemcpy(q.p,a.p,a.n*sizeof(T),hipMemcpyDeviceToDevice));
         } else throw std::runtime_error("unknown solver");
         total=g.maximum(g.tick()-start);
-        if (g.rank==0) std::printf("TIMING solver=%s trial=%d n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s total=%.9g reduction=%.9g tridiag=%.9g back=%.9g back_block=%d gpu_mpi=%d panel=%d tridiag_backend=%s rccl=%d half_bulk=%d\n",
+        if (g.rank==0) std::printf("TIMING solver=%s trial=%d n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s total=%.9g reduction=%.9g tridiag=%.9g back=%.9g back_block=%d gpu_mpi=%d panel=%d tridiag_backend=%s rccl=%d half_bulk=%d band=%d\n",
             solver.c_str(),trial,g.n,g.pr,g.pc,g.b,std::is_same_v<T,double>?"fp64":"fp32",name.c_str(),quant.c_str(),total,
-            phases.reduction,phases.tridiag,phases.back,back_block,int(g.gpu_mpi),panel,tridiag.c_str(),int(g.rccl),int(half_bulk));
+            phases.reduction,phases.tridiag,phases.back,back_block,int(g.gpu_mpi),panel,band_width?"elpa_banded":tridiag.c_str(),int(g.rccl),int(half_bulk),band_width);
     }
     double comm=g.maximum(g.comm); g.comm=0;
     auto qt=q.get(); std::vector<double> qd(qt.begin(),qt.end());
@@ -598,6 +708,7 @@ int main(int argc,char** argv) {
         int n=std::stoi(arg("--n","64")), b=std::stoi(arg("--block","16"));
         int pr=std::stoi(arg("--pr","1")), pc=std::stoi(arg("--pc","1"));
         std::string precision=arg("--precision","fp64");
+        band_width=std::stoi(arg("--band","0"));
         elpa_times=arg("--elpa-times","0")=="1";
         half_bulk=std::stoi(arg("--half-bulk","0"));
         if (half_bulk<0 || half_bulk>2) throw std::runtime_error("half bulk must be 0, 1, or 2");

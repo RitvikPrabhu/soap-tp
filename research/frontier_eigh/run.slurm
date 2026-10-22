@@ -174,6 +174,29 @@ elif [[ $1 == tune ]]; then
     for solver in elpa1 elpa2; do
         run 8 --n 8192 --block 64 --pr 2 --pc 4 --solver "$solver" --elpa-times 1 --repeat 2
     done
+elif [[ $1 == band ]]; then
+    for grid in '1 1' '1 2' '2 2' '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            run "$((pr*pc))" --n 97 --block 8 --band 8 --pr "$pr" --pc "$pc" --precision "$precision" --back-block 13 --gpu-mpi 1 --rccl 1
+        done
+    done
+    for matrix in diagonal clustered lowrank indefinite; do
+        run 8 --n 97 --block 8 --band 8 --pr 2 --pc 4 --matrix "$matrix" --back-block 13
+    done
+    for n in 4096 8192; do
+        for precision in fp64 fp32; do
+            run 8 --n "$n" --block 64 --pr 2 --pc 4 --precision "$precision" --back-block 128 --tridiag elpa --gpu-mpi 1 --rccl 1 --repeat 3 --reference 1
+            for band in 32 64 128; do
+                run 8 --n "$n" --block "$band" --band "$band" --pr 2 --pc 4 --precision "$precision" --back-block 128 --gpu-mpi 1 --rccl 1 --repeat 3 --reference 1
+            done
+        done
+    done
+    if run 8 --n 8192 --block 64 --band 64 --pr 2 --pc 4 --precision fp32 --back-block 128 --gpu-mpi 1 --rccl 1 --half-bulk 2 --repeat 3 --reference 1; then
+        echo 'SPLIT_BAND_CHECK passed'
+    else
+        echo 'SPLIT_BAND_CHECK FAILED; inspect metrics'
+    fi
 elif [[ $1 == case ]]; then
     shift
     ranks=$1; shift
