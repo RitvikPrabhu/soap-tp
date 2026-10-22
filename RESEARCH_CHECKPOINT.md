@@ -1,5 +1,16 @@
 # Frontier custom distributed eigh research checkpoint
 
+## Latest state (read this before chronological history)
+
+- 2026-10-22 19:12 EDT: ~1h37 elapsed,~2h23 remaining of original4h budget; deadline21:35EDT. Dedicated branch `research/custom-eigh-frontier-20261022`; never touch pre-existing dirty scripts/tests/core. Latest committed state `deda2f5`; active-suffix GPU candidate/runner/statistics/log edits not yet committed.
+- Best measured custom remains CPU-vector one-stage +ELPA tridiagonal component +custom WY128, block64,8G4x2:8192FP64/FP32 2.938/2.112s. FP32 useselpa32; FP64 useselpa. FullELPA1 faster2.137/1.607s at2x4; single-GCDrocSOLVER2.838/1.491s. Fullscaling/precision/phase evidence inRESULTS.md andmetrics.csv (currently273cases,4expectednative-half failures).
+- Job**5736421** runningfrontier03167,15minlimit, immutabledevice-active-eigh SHA16526d14...;24tinyrectangular/familycasespassed, now8192CPU/GPUcomparisons then16384 CPU/GPU/ELPA1/ELPA2/band64. FirstGPU-vector8192FP64 loses6.962vsCPU3.149s; stillnumericallycorrect2.72e-15resid. Do notselectunmeasured/losingcandidate. Originalfull-launchGPUcontrol snapshotdevice-vectors-eigh remainsavailable. No otherjobsrunning;QoSonejobatatime.
+- Next candidate: replace Stage1 thread0 fullGPUrow scan foralpha/diagonal bylower_boundon sortedrows;freeze`device-indexed-eigh`,tinycheck,paired8192batchbefore16384. Stage-specificELPAtrigrid8x1 mayimprove1x8 reductionlayout: CPUtri.934s versus.230s; evaluate distributedPDGEMR2D ofZ, no densegather. Not implementedyet.
+- E11BLASCPUQR retained:8192band64FP64/32 3.962/2.948s,slowerthanone-stage. Nativehalf1fails; split-half2passesbutslower, researchonly. CPUbasis-sensitivity45rows insoap_precision.csv showFP32notuniversallysafeSOAP atcondition1e6/1e9; actualprimitive+denseprojections,nottraining/customQintegration.
+- Environment/build commands unchanged below. Login onlytiny~1minprograms;alltimingsfrombatchMI250XGCDs. Accountgen150. Readworker/sourcecurrentdiffbeforechanges. Onlyourresearchdirectory/checkpointareowned. READMEforce-addedalready. Needfinal16384results, finalCSV/jobsmanifest/report,scopedcommits;nopush/mergeauthorized.
+
+## Chronological history
+
 - Objective: custom controllable AMD distributed eigensolver, rectangular 2D block-cyclic grids, then lowest useful precision.
 - Budget: up to four hours, started 2026-10-22 17:35 EDT; stop by 21:35 EDT (01:35 UTC Oct 23).
 - Branch: `research/custom-eigh-frontier-20261022`, created from `research/frontier-distributed-eigh` at `505abff`.

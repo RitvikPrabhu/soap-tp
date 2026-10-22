@@ -363,10 +363,12 @@ template<class T> __global__ void unpack_vector(T* out, const T* packed,
 }
 
 template<class T> __global__ void local_rank2(T* a, const T* v, const T* w,
-    const T* vc, const T* wc, const int* rows, const int* cols, int nr, int nc, int k) {
+    const T* vc, const T* wc, int nr, int mr, int mc, int r0, int c0) {
     size_t z=blockIdx.x*size_t(blockDim.x)+threadIdx.x;
-    if (z<size_t(nr)*nc && rows[z%nr]>k && cols[z/nr]>k)
-        a[z]-=v[z%nr]*wc[z/nr]+w[z%nr]*vc[z/nr];
+    if (z<size_t(mr)*mc) {
+        int i=r0+z%mr, j=c0+z/mr;
+        a[i+size_t(j)*nr]-=v[i]*wc[j]+w[i]*vc[j];
+    }
 }
 
 template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T>& a,
@@ -378,17 +380,24 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
     HIP(hipMemsetAsync(dd.p,0,dd.n*sizeof(double)));
     HIP(hipMemsetAsync(ee.p,0,ee.n*sizeof(double)));
     auto transpose=[&](Device<T>& local, Device<T>& out) {
+        double clock=MPI_Wtime();
         CCL(ncclAllGather(local.p,packed.p,padded,std::is_same_v<T,double>?ncclFloat64:ncclFloat32,g.ccl_col,nullptr));
+        g.comm+=MPI_Wtime()-clock;
         unpack_vector<<<(g.nc+255)/256,256>>>(out.p,packed.p,cols.p,g.nc,g.b,g.pr,padded);
+    };
+    auto reduce=[&](double* p, int count, ncclRedOp_t op) {
+        double clock=MPI_Wtime();
+        CCL(ncclAllReduce(p,p,count,ncclFloat64,op,g.ccl_col,nullptr));
+        g.comm+=MPI_Wtime()-clock;
     };
     for (int k=0;k<g.n-1;++k) {
         int owner=(k/g.b)%g.pc;
         if (g.c==owner) HIP(hipMemcpyAsync(v.p,a.p+size_t(g.li(k,g.pc))*g.nr,g.nr*sizeof(T),hipMemcpyDeviceToDevice));
         g.device_bcast(v.p,g.nr,owner,g.row);
         vector_scalar<T,0><<<1,256>>>(v.p,w.p,rows.p,g.nr,k,scalars.p,dd.p,ee.p,tt.p);
-        CCL(ncclAllReduce(scalars.p,scalars.p,1,ncclFloat64,ncclMax,g.ccl_col,nullptr));
+        reduce(scalars.p,1,ncclMax);
         vector_scalar<T,1><<<1,256>>>(v.p,w.p,rows.p,g.nr,k,scalars.p,dd.p,ee.p,tt.p);
-        CCL(ncclAllReduce(scalars.p+1,scalars.p+1,3,ncclFloat64,ncclSum,g.ccl_col,nullptr));
+        reduce(scalars.p+1,3,ncclSum);
         reflector_scalar<<<1,1>>>(scalars.p,dd.p,ee.p,tt.p,k);
         form_vector<<<(padded+255)/256,256>>>(v.p,rows.p,g.nr,padded,k,scalars.p,tt.p);
         transpose(v,vc);
@@ -399,10 +408,11 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
             a.p+r0+size_t(c0)*g.nr,vc.p+c0,w.p+r0);
         g.device_sum(w,g.row);
         vector_scalar<T,2><<<1,256>>>(v.p,w.p,rows.p,g.nr,k,scalars.p,dd.p,ee.p,tt.p);
-        CCL(ncclAllReduce(scalars.p+4,scalars.p+4,1,ncclFloat64,ncclSum,g.ccl_col,nullptr));
+        reduce(scalars.p+4,1,ncclSum);
         correct_w<<<(padded+255)/256,256>>>(w.p,v.p,padded,scalars.p,tt.p,k);
         transpose(w,wc);
-        local_rank2<<<(a.n+255)/256,256>>>(a.p,v.p,w.p,vc.p,wc.p,rows.p,cols.p,g.nr,g.nc,k);
+        int mr=g.nr-r0, mc=g.nc-c0;
+        if (mr && mc) local_rank2<<<(size_t(mr)*mc+255)/256,256>>>(a.p,v.p,w.p,vc.p,wc.p,g.nr,mr,mc,r0,c0);
         if (g.c==owner) HIP(hipMemcpyAsync(a.p+size_t(g.li(k,g.pc))*g.nr,v.p,g.nr*sizeof(T),hipMemcpyDeviceToDevice));
         HIP(hipGetLastError());
     }
@@ -764,9 +774,9 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
         } else throw std::runtime_error("unknown solver");
         total=g.maximum(g.tick()-start);
         double peak_mib=g.maximum(device_peak_bytes/1048576.);
-        if (g.rank==0) std::printf("TIMING solver=%s trial=%d n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s total=%.9g reduction=%.9g tridiag=%.9g back=%.9g back_block=%d gpu_mpi=%d panel=%d tridiag_backend=%s rccl=%d half_bulk=%d band=%d cpu_qr=%.9g managed_gpu_peak_mib=%.9g\n",
+        if (g.rank==0) std::printf("TIMING solver=%s trial=%d n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s total=%.9g reduction=%.9g tridiag=%.9g back=%.9g back_block=%d gpu_mpi=%d panel=%d tridiag_backend=%s rccl=%d half_bulk=%d band=%d cpu_qr=%.9g managed_gpu_peak_mib=%.9g device_vectors=%d\n",
             solver.c_str(),trial,g.n,g.pr,g.pc,g.b,std::is_same_v<T,double>?"fp64":"fp32",name.c_str(),quant.c_str(),total,
-            phases.reduction,phases.tridiag,phases.back,back_block,int(g.gpu_mpi),panel,band_width?"elpa_banded":tridiag.c_str(),int(g.rccl),int(half_bulk),band_width,phases.cpu_qr,peak_mib);
+            phases.reduction,phases.tridiag,phases.back,back_block,int(g.gpu_mpi),panel,band_width?"elpa_banded":tridiag.c_str(),int(g.rccl),int(half_bulk),band_width,phases.cpu_qr,peak_mib,int(device_vectors));
     }
     double comm=g.maximum(g.comm); g.comm=0;
     auto qt=q.get(); std::vector<double> qd(qt.begin(),qt.end());

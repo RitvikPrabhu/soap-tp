@@ -18,7 +18,7 @@ export LD_LIBRARY_PATH="$PWD/build/elpa-install/rocm/lib:$PWD/build/math-install
 echo "JOB $SLURM_JOB_ID $(date -Is) nodes=$SLURM_JOB_NODELIST suite=${1:-smoke}"
 run() {
     local ranks=$1; shift
-    echo "COMMAND ranks=$ranks $*"
+    echo "COMMAND ranks=$ranks OMP_NUM_THREADS=$OMP_NUM_THREADS OPENBLAS_NUM_THREADS=$OPENBLAS_NUM_THREADS $*"
     sha256sum "${EIGH_BIN:-build/custom-eigh/eigh}"
     srun -N1 -n "$ranks" --ntasks-per-node="$ranks" -c7 --gpus-per-task=1 \
         --gpu-bind=closest --kill-on-bad-exit=1 "${EIGH_BIN:-build/custom-eigh/eigh}" "$@"
@@ -247,6 +247,38 @@ elif [[ $1 == scaling ]]; then
     run 8 --n 8192 --block 64 --pr 2 --pc 4 --precision fp32 --tridiag elpa32 --back-block 128 --gpu-mpi 1 --rccl 1 --half-bulk 2 --repeat 3 --reference 1
     for precision in fp64 fp32; do
         run 1 --n 8192 --block 64 --pr 1 --pc 1 --precision "$precision" --solver rocsolver --repeat 3
+    done
+elif [[ $1 == resident ]]; then
+    for grid in '1 1' '1 2' '2 1' '2 2' '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            run "$((pr*pc))" --n 97 --block 8 --pr "$pr" --pc "$pc" --precision "$precision" --back-block 13 --device-vectors 1 --gpu-mpi 1 --rccl 1 --tridiag elpa
+        done
+    done
+    for matrix in diagonal clustered lowrank indefinite; do
+        for precision in fp64 fp32; do
+            run 8 --n 97 --block 8 --pr 2 --pc 4 --precision "$precision" --matrix "$matrix" --back-block 13 --device-vectors 1 --gpu-mpi 1 --rccl 1 --tridiag elpa
+        done
+    done
+    for grid in '2 4' '4 2'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            tridiag=elpa
+            [[ $precision == fp32 ]] && tridiag=elpa32
+            EIGH_BIN=build/custom-eigh/tri32-eigh run 8 --n 8192 --block 64 --pr "$pr" --pc "$pc" --precision "$precision" --tridiag "$tridiag" --back-block 128 --gpu-mpi 1 --rccl 1 --repeat 3
+            run 8 --n 8192 --block 64 --pr "$pr" --pc "$pc" --precision "$precision" --tridiag "$tridiag" --back-block 128 --gpu-mpi 1 --rccl 1 --device-vectors 1 --repeat 3 --reference 1
+        done
+    done
+    EIGH_BIN=build/custom-eigh/device-vectors-eigh run 8 --n 8192 --block 64 --pr 2 --pc 4 --tridiag elpa --back-block 128 --gpu-mpi 1 --rccl 1 --device-vectors 1 --repeat 3
+    for precision in fp64 fp32; do
+        tridiag=elpa
+        [[ $precision == fp32 ]] && tridiag=elpa32
+        EIGH_BIN=build/custom-eigh/tri32-eigh run 8 --n 16384 --block 64 --pr 4 --pc 2 --precision "$precision" --tridiag "$tridiag" --back-block 128 --gpu-mpi 1 --rccl 1 --repeat 3
+        run 8 --n 16384 --block 64 --pr 4 --pc 2 --precision "$precision" --tridiag "$tridiag" --back-block 128 --gpu-mpi 1 --rccl 1 --device-vectors 1 --repeat 3 --reference 1
+        for solver in elpa1 elpa2; do
+            run 8 --n 16384 --block 64 --pr 4 --pc 2 --precision "$precision" --solver "$solver" --repeat 3
+        done
+        run 8 --n 16384 --block 64 --band 64 --pr 4 --pc 2 --precision "$precision" --back-block 128 --gpu-mpi 1 --rccl 1 --repeat 3 --reference 1
     done
 elif [[ $1 == case ]]; then
     shift

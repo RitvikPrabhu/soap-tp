@@ -29,7 +29,7 @@ Batch scripts use account `gen150`, one node, one rank per GCD, seven CPU cores 
 python3 research/frontier_eigh/summarize.py output/custom-eigh/job-*.out > results.csv
 ```
 
-The CSV extractor keeps each case's final trial and numerical metrics; raw stdout preserves every trial. Native-half expected-failure rows are not successful solves: consult the `*_CHECK FAILED` markers and stderr. Earlier jobs predate some metadata fields.
+The CSV extractor keeps each case's final-trial phases and numerical metrics, plus cold timing and the median/min/max of subsequent warm trials. Single-trial correctness cases have no warm statistics. Raw stdout preserves every trial. Native-half expected-failure rows are not successful solves: consult the `*_CHECK FAILED` markers and stderr. Earlier jobs predate some metadata fields.
 
 Tested stack: ROCm7.0.2/gfx90a, Cray MPICH9.1, LibSci26.03, ELPA2026.02.002. Link tracing confirms CPU PDSTEDC/BLACS/BLAS resolve to **LibSci**, despite reference ScaLAPACK/OpenBLAS archives also being on the link line. Login-node MI210 runs are tiny debugging tests only; all performance evidence is compute-node MI250X GCDs.
 
