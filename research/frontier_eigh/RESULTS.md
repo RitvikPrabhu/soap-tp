@@ -209,6 +209,17 @@ Hypothesis: remove the per-reflector host vector transfers/replicated CPU scalar
 - Snapshot `device-vectors-eigh`, SHA2560942e84ec8e17588499ca4873928e7ba744f4dd793917f4bbaf213fcf10b0345. Tiny login31 random/lowrank/diagonal/indefinite FP64/32 plus2boundary and31FP32 elpa32 passed. Representative FP64 residual6.54e-16/orth6.22e-15; FP32 residual1.71e-7/orth1.92e-6. No multirank or performance claim yet. Requires RCCL/GPU-MPI/panel1/custom and rejects band mode.
 - Prepared `device-active-eigh` with active-suffix rank2 launch instead of a full local-matrix launch, and complete direct RCCL enqueue accounting. Both tiny precisions pass. Job **5736421**,15-minute one-node request, snapshotSHA16526d14aaa585d85be65b17ab93b9eba5335c1df9d61aaa8dd97afb1bb7fdee, running frontier03167. All24 tiny rectangular/family cases passed before performance. Includes pairedCPU/GPU8192, old full-launch GPU control, and16384CPU/GPU/ELPA1/ELPA2/band64. Fixed snapshots are immutable.
 - First8192 2x4 FP64 GPU-vector result **loses**: total6.962/reduction6.322s versus CPU-vector3.149/2.530. Residual2.72e-15/orth7.59e-13 still correct. Do not select this GPU path merely because it removes host copies. Remaining outcomes pending.
+- Completed job5736421 in14m20s; all43 executed cases passed. At8192/4x2, CPU-vector FP64/32 totals2.917/2.099s versus GPU-vector5.041/4.105s. Active-only GPU update improves2x4 FP64 reduction6.528→6.322s, but does not explain most of the gap. No reason to select the initial GPU-vector candidate.
+
+| n16384, eight GCDs, 4x2 | FP64 total (s) | FP32 total (s) |
+|---|---:|---:|
+| Custom one-stage, CPU vectors | 11.553 | 7.434 |
+| Custom one-stage, initial GPU vectors | 17.802 | 14.503 |
+| Full ELPA1 | **6.177** | **4.571** |
+| Full ELPA2 | 19.403 | 14.071 |
+| Custom band64 + ELPA banded component | 20.263 | 14.860 |
+
+- CPU-vector16384 reduction/tri/back FP64=10.045/1.074/.409s, FP32=6.317/.886/.213s. Custom one-stage GPU-vector FP64 reference eigenvalue error2.07e-15, residual3.78e-15, orthogonality1.35e-12; FP32 reference error6.04e-7, residual1.99e-6, orthogonality.000659. CPU-vector residuals1.35e-14/1.99e-6. The banded pipeline, not our GEMM-rich dense-to-band stage, dominates the two-stage loss at this size (16.431/12.328s).
 
 ### E15: eliminate serial GPU scalar lookup (next candidate)
 
@@ -216,3 +227,11 @@ Hypothesis: Stage1's thread0 scans all local rows to locate just alpha and the d
 - Lookup implemented in commit `cfd5c76`, snapshot `device-indexed-eigh` SHA37d517ade4bc8545b21cc9a80a7bb9a8be4017ff3925dcb4f5c3c8a22db795e9. Tiny31/2 FP64/32 pass with the same metrics as the frozen active-vector candidate; unequal ownership remains for batch validation.
 - Independent `--tri-pr` option implemented using a persistent alternate Grid, ELPA tridiagonal solve on that grid, then distributed LibSci PDGEMR2D of host-local Z into the main layout. Only Z changes distribution; reflector A and backtransform stay on the main grid. No dense gather. `retile` is a subset of `tridiag`, including packing and communication. Extra grid setup is outside timed trials; per-solve redistribution/allocations are inside.
 - Snapshot `retile-eigh` SHA2a62c0ba53eb80a6757632385113753b3f67bedc5f5f79baeee981cd63e6400b includes lookup+stage-grid support. Tiny single-rank31 ELPA FP64/32 paths pass, but those use identical grids and do **not** validate PDGEMR2D. Prepared `indexed` batch suite first gates97 unequal-ownership main grids1x8/2x4/4x2/8x1→tri8x1 for CPU/GPU vectors and FP64/32, then paired lookup timings, all8Ggrid GPU/ELPA1 controls, and1x8→8x1 performance.
+- Job5736491 running onfrontier03167,12-minute limit. All16 uneven rectangular n97 redistribution checks passed. Paired8192/2x4 FP64 reduction6.305→3.295s after replacing only the serial scalar scan; this confirms the scan was a substantial bottleneck, not the whole remaining performance problem. Indexed4x2 GPU-vector total3.554s still loses the CPU-vector baseline. Complete grid/FP32/stage-grid outcomes pending.
+
+### E16: pack rank-local GPU vectors (candidate)
+
+Hypothesis: the faster CPU-vector baseline still uploads full replicated V/W to every GPU. For panel1, pack just each rank's row and column pieces into contiguous V/W buffers. V now needs one H2D call rather than two, and the rank2 kernel uses direct local indices. Total uploaded elements per nontrivial step change from2n+nc to2nr+2nc; this is a40% reduction on4x2, but a6% increase on1x8 (with fewer copy calls). CPU scalar formation and communication are unchanged. Panel controls and the shared backtransform are preserved.
+
+- Snapshot `packed-eigh` SHA530960a08f7aa43481ecf5f6158371ecc2a141e9f35f92aa63564f6ab0f4dc5d. Tiny31 random/lowrank/indefinite/diagonal in both precisions and delayed-panel/unblocked control pass. FP64 random residual7.58e-16/orth6.16e-15; FP32 random1.71e-7/2.12e-6. These are login correctness checks, not performance evidence.
+- Prepared `packed` batch suite gates97 grids1/2/4/8G and all transports/backtransform controls; then pairs `retile-eigh` versus `packed-eigh` at8192 on1x8/2x4/4x2 with tri8x1. Separate rank0-only rocprofv3 kernel/copy traces compare CPU/GPU vector paths. Instrumented totals must not be used as competitive measurements.

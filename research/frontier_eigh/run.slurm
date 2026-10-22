@@ -309,6 +309,39 @@ elif [[ $1 == indexed ]]; then
             run 8 --n 8192 --block 64 --pr 1 --pc 8 --precision "$precision" --tridiag "$tridiag" --tri-pr 8 --back-block 128 --device-vectors "$vectors" --gpu-mpi 1 --rccl 1 --repeat 3 --reference 1
         done
     done
+elif [[ $1 == packed ]]; then
+    for grid in '1 1' '1 2' '2 2' '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            run "$((pr*pc))" --n 97 --block 8 --pr "$pr" --pc "$pc" --precision "$precision" --back-block 13 --gpu-mpi 1 --rccl 1
+        done
+    done
+    for transport in '0 0' '1 0' '1 1'; do
+        read -r gpu rccl <<< "$transport"
+        for back in 1 13; do
+            run 8 --n 97 --block 8 --pr 4 --pc 2 --back-block "$back" --gpu-mpi "$gpu" --rccl "$rccl"
+        done
+    done
+    for precision in fp64 fp32; do
+        tridiag=elpa
+        [[ $precision == fp32 ]] && tridiag=elpa32
+        for grid in '1 8' '2 4' '4 2'; do
+            read -r pr pc <<< "$grid"
+            for binary in retile-eigh packed-eigh; do
+                EIGH_BIN=build/custom-eigh/$binary run 8 --n 8192 --block 64 --pr "$pr" --pc "$pc" --precision "$precision" --tridiag "$tridiag" --tri-pr 8 --back-block 128 --gpu-mpi 1 --rccl 1 --repeat 3 --reference 1
+            done
+        done
+    done
+    for vectors in 0 1; do
+        echo "PROFILE rank=0 only vectors=$vectors; instrumentation is not a competitive timing"
+        export PROFILE_OUT="$PWD/output/custom-eigh/profile-$SLURM_JOB_ID-v$vectors"
+        mkdir -p "$PROFILE_OUT"
+        echo "COMMAND ranks=8 instrumented=rocprofv3-rank0 --n 8192 --block 64 --pr 4 --pc 2 --tridiag elpa --back-block 128 --gpu-mpi 1 --rccl 1 --device-vectors $vectors"
+        sha256sum "${EIGH_BIN:-build/custom-eigh/eigh}"
+        srun -N1 -n8 --ntasks-per-node=8 -c7 --gpus-per-task=1 --gpu-bind=closest --kill-on-bad-exit=1 \
+            bash -c 'if [[ $SLURM_PROCID == 0 ]]; then exec rocprofv3 --kernel-trace --memory-copy-trace --stats -d "$PROFILE_OUT" -o rank0 -- "$@"; else exec "$@"; fi' \
+            _ "${EIGH_BIN:-build/custom-eigh/eigh}" --n 8192 --block 64 --pr 4 --pc 2 --tridiag elpa --back-block 128 --gpu-mpi 1 --rccl 1 --device-vectors "$vectors"
+    done
 elif [[ $1 == case ]]; then
     shift
     ranks=$1; shift

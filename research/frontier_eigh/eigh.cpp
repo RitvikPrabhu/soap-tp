@@ -433,6 +433,8 @@ template<class T> Phases custom(Grid& g, rocblas_handle h, Device<T>& a,
     Device<int> dr(g.nr), dc(g.nc); dr.put(g.rows); dc.put(g.cols);
     Device<T> dv(g.n), dw(g.n), vx(g.nc), vy(g.nr), y(g.nc), vr(g.nr);
     Device<T> u(size_t(g.nr)*2*panel), dcross(size_t(g.nc)*2*panel), coeff(2*panel);
+    Device<T> localv(g.nr+g.nc), localw(g.nr+g.nc);
+    std::vector<T> packedv(localv.n), packedw(localw.n);
     HIP(hipMemset(vy.p,0,vy.n*sizeof(T)));
     std::vector<double> d(g.n), e(g.n,0), tau(g.n-1);
     double start=g.tick();
@@ -463,14 +465,21 @@ template<class T> Phases custom(Grid& g, rocblas_handle h, Device<T>& a,
         e[k]=beta;
         std::fill(v.begin(),v.begin()+k+1,T(0)); v[k+1]=1;
         if (tau[k]!=0) {
-            dv.put(v);
-            std::vector<T> vc(g.nc);
-            for (int j=0;j<g.nc;++j) vc[j]=v[g.cols[j]];
-            vx.put(vc);
+            T* column_v;
+            if (panel==1) {
+                for (int i=0;i<g.nr;++i) packedv[i]=v[g.rows[i]];
+                for (int j=0;j<g.nc;++j) packedv[g.nr+j]=v[g.cols[j]];
+                localv.put(packedv); column_v=localv.p+g.nr;
+            } else {
+                dv.put(v);
+                std::vector<T> vc(g.nc);
+                for (int j=0;j<g.nc;++j) vc[j]=v[g.cols[j]];
+                vx.put(vc); column_v=vx.p;
+            }
             int r0=std::upper_bound(g.rows.begin(),g.rows.end(),k)-g.rows.begin();
             int c0=std::upper_bound(g.cols.begin(),g.cols.end(),k)-g.cols.begin();
             int mr=g.nr-r0, mc=g.nc-c0;
-            if (mr && mc) gemv(h,false,mr,mc,g.nr,a.p+r0+size_t(c0)*g.nr,vx.p+c0,vy.p+r0);
+            if (mr && mc) gemv(h,false,mr,mc,g.nr,a.p+r0+size_t(c0)*g.nr,column_v+c0,vy.p+r0);
             else HIP(hipMemset(vy.p,0,vy.n*sizeof(T)));
             g.device_sum(vy,g.row);
             if (panel>1 && k%panel!=0) {
@@ -484,9 +493,16 @@ template<class T> Phases custom(Grid& g, rocblas_handle h, Device<T>& a,
             double dot=0;
             for (int i=k+1;i<g.n;++i) dot+=double(v[i])*w[i];
             for (int i=k+1;i<g.n;++i) w[i]-=T(0.5*tau[k]*dot*v[i]);
-            dw.put(w);
-            if (panel>1) pack_panel<<<(std::max(g.nr,g.nc)+255)/256,256>>>(u.p,dcross.p,dv.p,dw.p,dr.p,dc.p,g.nr,g.nc,k%panel,panel);
-            else if (mr && mc) rank2<<<(size_t(mr)*mc+255)/256,256>>>(a.p,dv.p,dw.p,dr.p,dc.p,g.nr,mr,mc,r0,c0);
+            if (panel>1) {
+                dw.put(w);
+                pack_panel<<<(std::max(g.nr,g.nc)+255)/256,256>>>(u.p,dcross.p,dv.p,dw.p,dr.p,dc.p,g.nr,g.nc,k%panel,panel);
+            } else {
+                for (int i=0;i<g.nr;++i) packedw[i]=w[g.rows[i]];
+                for (int j=0;j<g.nc;++j) packedw[g.nr+j]=w[g.cols[j]];
+                localw.put(packedw);
+                if (mr && mc) local_rank2<<<(size_t(mr)*mc+255)/256,256>>>(a.p,localv.p,localw.p,
+                    localv.p+g.nr,localw.p+g.nr,g.nr,mr,mc,r0,c0);
+            }
             HIP(hipGetLastError());
         }
         store_column(g,a,k,v);

@@ -35,6 +35,6 @@ for path in map(Path, sys.argv[1:]):
                                  **{**timing, **fields}))
 if not rows:
     raise SystemExit("No RESULT records found")
-writer = csv.DictWriter(sys.stdout, list(dict.fromkeys(k for row in rows for k in row)))
+writer = csv.DictWriter(sys.stdout, list(dict.fromkeys(k for row in rows for k in row)), lineterminator="\n")
 writer.writeheader()
 writer.writerows(rows)
