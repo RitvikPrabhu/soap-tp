@@ -228,6 +228,17 @@ Hypothesis: Stage1's thread0 scans all local rows to locate just alpha and the d
 - Independent `--tri-pr` option implemented using a persistent alternate Grid, ELPA tridiagonal solve on that grid, then distributed LibSci PDGEMR2D of host-local Z into the main layout. Only Z changes distribution; reflector A and backtransform stay on the main grid. No dense gather. `retile` is a subset of `tridiag`, including packing and communication. Extra grid setup is outside timed trials; per-solve redistribution/allocations are inside.
 - Snapshot `retile-eigh` SHA2a62c0ba53eb80a6757632385113753b3f67bedc5f5f79baeee981cd63e6400b includes lookup+stage-grid support. Tiny single-rank31 ELPA FP64/32 paths pass, but those use identical grids and do **not** validate PDGEMR2D. Prepared `indexed` batch suite first gates97 unequal-ownership main grids1x8/2x4/4x2/8x1→tri8x1 for CPU/GPU vectors and FP64/32, then paired lookup timings, all8Ggrid GPU/ELPA1 controls, and1x8→8x1 performance.
 - Job5736491 running onfrontier03167,12-minute limit. All16 uneven rectangular n97 redistribution checks passed. Paired8192/2x4 FP64 reduction6.305→3.295s after replacing only the serial scalar scan; this confirms the scan was a substantial bottleneck, not the whole remaining performance problem. Indexed4x2 GPU-vector total3.554s still loses the CPU-vector baseline. Complete grid/FP32/stage-grid outcomes pending.
+- Completed8m10s, all40 cases passed. The following are **warm medians** (two post-warmup trials), not final/minimum timings:
+
+| n8192 eight GCDs | FP64 (s) | FP32 (s) |
+|---|---:|---:|
+| GPU indexed vectors, main1x8 / tri1x8 | 3.111 | 2.314 |
+| GPU indexed vectors, main1x8 / tri8x1 | **2.543** | 2.141 |
+| CPU vectors, main1x8 / tri1x8 | 3.412 | 2.359 |
+| CPU vectors, main1x8 / tri8x1 | 2.842 | 2.139 |
+| Full ELPA1,4x2 | **1.952** | **1.563** |
+
+- Keep the stage-grid option, especially for skinny main grids; it is not universally profitable. GPU1x8→8x1 final redistribution.0646/.0687s, included in tridiag.3397/.3304s. Indexed GPU4x2 and8x1 still lose CPU-vector controls. FP64 best custom8192 now uses GPU vectors/main1x8/tri8x1; FP32 old CPU4x2 remains slightly faster (~2.11s). FullELPA1 is still faster than either. No blanket claim that GPU residency or square grids win.
 
 ### E16: pack rank-local GPU vectors (candidate)
 
@@ -235,3 +246,10 @@ Hypothesis: the faster CPU-vector baseline still uploads full replicated V/W to 
 
 - Snapshot `packed-eigh` SHA530960a08f7aa43481ecf5f6158371ecc2a141e9f35f92aa63564f6ab0f4dc5d. Tiny31 random/lowrank/indefinite/diagonal in both precisions and delayed-panel/unblocked control pass. FP64 random residual7.58e-16/orth6.16e-15; FP32 random1.71e-7/2.12e-6. These are login correctness checks, not performance evidence.
 - Prepared `packed` batch suite gates97 grids1/2/4/8G and all transports/backtransform controls; then pairs `retile-eigh` versus `packed-eigh` at8192 on1x8/2x4/4x2 with tri8x1. Separate rank0-only rocprofv3 kernel/copy traces compare CPU/GPU vector paths. Instrumented totals must not be used as competitive measurements.
+
+### E17: use the custom GPU solver's bases in SOAP-style updates (prepared)
+
+Hypothesis: low solver residual alone does not establish acceptable SOAP updates. Extend the same96×64,20-update,three-seed/condition experiment to bases exported by our actual custom GPU implementation, including split-half bulk arithmetic. Original preconditioners remain FP32 promoted toFP64, as in the existing SOAP path; update arithmetic remains FP64 to isolate basis changes.
+
+- Tiny binary input/export paths are explicitly limited to2≤n≤512. Normal-size A/Q stay distributed. FP64 andFP32 independent3×3 roundtrip tests compare exported AQ−QΛ, QᵀQ and eigenvalues to NumPy: residual4.10e-16/2.30e-7, orth8.85e-16/2.08e-7. Existing45-row CPU study reproduces exactly after adding the optional GPU backend.
+- Snapshot `basis-eigh` SHA57ae5f1dfef02daddb9afaaea42780942beb733d0eb17f511d02e0213e06c8ae; `soap` suite prepared for one compute-node GCD, not yet submitted. Six variants yield54 rows. This remains a frozen-basis update experiment, not training-loss validation or a distributed SOAP backend.

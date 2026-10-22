@@ -342,6 +342,14 @@ elif [[ $1 == packed ]]; then
             bash -c 'if [[ $SLURM_PROCID == 0 ]]; then exec rocprofv3 --kernel-trace --memory-copy-trace --stats -d "$PROFILE_OUT" -o rank0 -- "$@"; else exec "$@"; fi' \
             _ "${EIGH_BIN:-build/custom-eigh/eigh}" --n 8192 --block 64 --pr 4 --pc 2 --tridiag elpa --back-block 128 --gpu-mpi 1 --rccl 1 --device-vectors "$vectors"
     done
+elif [[ $1 == soap ]]; then
+    # Independent singleton MPI solves, restricted to tiny correctness examples on one GCD.
+    export ROCR_VISIBLE_DEVICES=0 PYTHONPATH=src
+    mkdir -p .amp/in
+    sha256sum "${EIGH_BIN:-build/custom-eigh/eigh}"
+    .venv/bin/python research/frontier_eigh/soap_precision.py --solver "${EIGH_BIN:-build/custom-eigh/eigh}" \
+        > "output/custom-eigh/soap-$SLURM_JOB_ID.csv"
+    cat "output/custom-eigh/soap-$SLURM_JOB_ID.csv"
 elif [[ $1 == case ]]; then
     shift
     ranks=$1; shift

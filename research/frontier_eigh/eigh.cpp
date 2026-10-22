@@ -176,6 +176,8 @@ bool elpa_times=false;
 int band_width=0;
 bool device_vectors=false;
 Grid* tridiagonal_grid=nullptr;
+std::vector<double> supplied_matrix;
+std::string basis_file;
 template<class T> __global__ void to_half(__half* out, const T* in, int rows, int cols, int ld, int parts) {
     size_t z=blockIdx.x*size_t(blockDim.x)+threadIdx.x;
     if (z<size_t(rows)*cols) {
@@ -551,6 +553,7 @@ template<class T> Phases custom(Grid& g, rocblas_handle h, Device<T>& a,
 }
 
 double entry(int i, int j, int n, const std::string& matrix) {
+    if (!supplied_matrix.empty()) return supplied_matrix[i+size_t(j)*n];
     if (matrix=="diagonal") return i==j ? double((i*17)%n)/n : 0;
     if (matrix=="clustered") return i==j ? 1.+1e-9*(i%3) : 0;
     if (matrix=="lowrank") {
@@ -889,6 +892,17 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
     if (!std::isfinite(residual) || !std::isfinite(input_residual) || input_residual>tol || !std::isfinite(orth) || orth>tol*std::sqrt(g.n)
         || (quant=="none" && (!std::isfinite(eigerr) || eigerr>tol)))
         throw std::runtime_error("numerical validation failed");
+    if (!basis_file.empty()) {
+        auto full=top_columns(g,qd,g.n);
+        if (!g.rank) {
+            auto file=std::fopen(basis_file.c_str(),"wb");
+            if (!file) throw std::runtime_error("cannot open basis output");
+            bool ok=std::fwrite(eval.data(),sizeof(double),eval.size(),file)==eval.size();
+            ok=std::fwrite(full.data(),sizeof(double),full.size(),file)==full.size() && ok;
+            std::fclose(file);
+            if (!ok) throw std::runtime_error("basis output write failed");
+        }
+    }
 }
 
 int main(int argc,char** argv) {
@@ -901,6 +915,19 @@ int main(int argc,char** argv) {
         int n=std::stoi(arg("--n","64")), b=std::stoi(arg("--block","16"));
         int pr=std::stoi(arg("--pr","1")), pc=std::stoi(arg("--pc","1"));
         std::string precision=arg("--precision","fp64");
+        std::string input_file=arg("--input","");
+        basis_file=arg("--export-basis","");
+        if ((!input_file.empty() || !basis_file.empty()) && (n<2 || n>512))
+            throw std::runtime_error("dense input/basis export is restricted to tiny tests, 2<=n<=512");
+        if (!input_file.empty()) {
+            supplied_matrix.resize(size_t(n)*n);
+            auto file=std::fopen(input_file.c_str(),"rb");
+            if (!file) throw std::runtime_error("cannot open matrix input");
+            bool ok=std::fread(supplied_matrix.data(),sizeof(double),supplied_matrix.size(),file)==supplied_matrix.size();
+            ok=std::fgetc(file)==EOF && ok;
+            std::fclose(file);
+            if (!ok) throw std::runtime_error("matrix input must contain exactly n*n FP64 column-major values");
+        }
         band_width=std::stoi(arg("--band","0"));
         elpa_times=arg("--elpa-times","0")=="1";
         half_bulk=std::stoi(arg("--half-bulk","0"));
