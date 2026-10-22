@@ -197,6 +197,57 @@ elif [[ $1 == band ]]; then
     else
         echo 'SPLIT_BAND_CHECK FAILED; inspect metrics'
     fi
+elif [[ $1 == blas-panel ]]; then
+    for grid in '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            run 8 --n 97 --block 8 --band 8 --pr "$pr" --pc "$pc" --precision "$precision" --back-block 13 --gpu-mpi 1 --rccl 1
+        done
+    done
+    for n in 4096 8192; do
+        for precision in fp64 fp32; do
+            for binary in band-eigh blas-panel-eigh; do
+                EIGH_BIN=build/custom-eigh/$binary run 8 --n "$n" --block 32 --band 32 --pr 2 --pc 4 --precision "$precision" --back-block 128 --gpu-mpi 1 --rccl 1 --repeat 3 --reference 1
+            done
+        done
+    done
+    for band in 16 64; do
+        for precision in fp64 fp32; do
+            run 8 --n 8192 --block "$band" --band "$band" --pr 2 --pc 4 --precision "$precision" --back-block 128 --gpu-mpi 1 --rccl 1 --repeat 3 --reference 1
+        done
+    done
+    for solver in elpa1 elpa2; do
+        for precision in fp64 fp32; do
+            run 8 --n 8192 --block 64 --pr 2 --pc 4 --solver "$solver" --precision "$precision" --repeat 3
+        done
+    done
+    if run 8 --n 8192 --block 32 --band 32 --pr 2 --pc 4 --precision fp32 --back-block 128 --gpu-mpi 1 --rccl 1 --half-bulk 2 --repeat 3 --reference 1; then
+        echo 'SPLIT_BLAS_BAND_CHECK passed'
+    else
+        echo 'SPLIT_BLAS_BAND_CHECK FAILED; inspect metrics'
+    fi
+elif [[ $1 == scaling ]]; then
+    for grid in '1 1' '1 2' '2 2' '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for matrix in random lowrank; do
+            run "$((pr*pc))" --n 97 --block 8 --pr "$pr" --pc "$pc" --precision fp32 --matrix "$matrix" --tridiag elpa32 --back-block 13 --gpu-mpi 1 --rccl 1
+        done
+    done
+    for grid in '1 1' '1 2' '2 2' '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            tridiag=elpa
+            [[ $precision == fp32 ]] && tridiag=elpa32
+            reference=0
+            [[ $grid == '2 4' || $grid == '4 2' ]] && reference=1
+            run "$((pr*pc))" --n 8192 --block 64 --pr "$pr" --pc "$pc" --precision "$precision" --tridiag "$tridiag" --back-block 128 --gpu-mpi 1 --rccl 1 --repeat 3 --reference "$reference"
+        done
+    done
+    run 8 --n 8192 --block 64 --pr 2 --pc 4 --precision fp32 --tridiag elpa --back-block 128 --gpu-mpi 1 --rccl 1 --repeat 3 --reference 1
+    run 8 --n 8192 --block 64 --pr 2 --pc 4 --precision fp32 --tridiag elpa32 --back-block 128 --gpu-mpi 1 --rccl 1 --half-bulk 2 --repeat 3 --reference 1
+    for precision in fp64 fp32; do
+        run 1 --n 8192 --block 64 --pr 1 --pc 1 --precision "$precision" --solver rocsolver --repeat 3
+    done
 elif [[ $1 == case ]]; then
     shift
     ranks=$1; shift

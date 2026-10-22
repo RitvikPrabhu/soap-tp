@@ -163,3 +163,47 @@ Hypothesis: factor independent tall panels using distributed Householder QR, the
 - `tridiag` timing now means the complete ELPA banded-input pipeline (CPU distributed band→tridiagonal, distributed eigensolve, Q2 backtransform), not just eigensolution; `back` is our Q1 backtransform. Use `--elpa-times 1` for internal separation. FP32 band mode uses ELPA's FP32 band/tri path, unlike one-stage's FP64 tridiagonal component.
 - Tiny login31 b8/back13 FP64 random/lowrank/diagonal and FP32 random passed; FP64 residual1.16e-15/orth8.68e-15 and FP32 5.51e-7/3.89e-6. Includes partial last panel. Source-to-band correctness is checked indirectly by full original AQ−QΛ and reference spectrum, not by inspecting triangular zeros alone.
 - Job **5736208**, six-minute one-node limit, immutable `band-eigh`. Distributed97 rectangles/families precede target4096/8192 band32/64/128 versus one-stage controls, both precisions; all large cases use full ELPA2 reference plus thin-subspace validation. Last case tests split-FP16 bulk on band64 and records strict-check outcome.
+- Job timed out at6m19s on frontier03617. **All34 executed cases passed**; the final split-half step was denied by Slurm and never ran. Its script failure marker is not a numerical failure. n8192 FP64 one-stage3.145s versus band32 5.965s (reduction2.282/band pipeline3.544/back.139), band64 6.687s. FP32 band32/64/128 totals5.610/5.327/7.984s. The first two-stage implementation loses overall despite Level-3 updates. No automatic selection of this path.
+
+### E11: use LibSci BLAS for narrow CPU-panel QR
+
+Hypothesis: nested CPU dot/rank-one loops, rather than GPU two-sided updates, dominate the first custom dense-to-band stage. Replace just these loops with LibSci DGEMV/DGER; promote the narrow panel to FP64 in FP32 mode as well, retaining requested GPU state precision. Scalar norm formation was already FP64.
+
+- Job **5736310**,8-minute one-node request, snapshot `blas-panel-eigh`, paired against `band-eigh` on the same node at4096/8192, then widths16/64, uninstrumented full ELPA1/2 controls, split-half band32. Initial8192 FP64 band32 reduction2.313→1.012s, total5.982→4.709s; CPU QR.223s. This is a real improvement but does not yet beat one-stage. Full outcomes pending.
+- Completed5m45s on frontier03585; all25 cases passed. Keep BLAS panel QR. n4096 band32 FP64 total1.279→.936s and FP32 1.030→.708s. n8192 band64 is better than32: FP64 total3.962s(reduction1.010/pipeline2.817/back.134), FP32 2.948s(.759/2.116/.072). Band16 loses6.390/5.096s. FP32 promotion also changes the band pipeline's numerical input, so not all FP32 total gain can be attributed solely to faster CPU BLAS.
+- Uninstrumented full ELPA1 n8192 FP64/FP32 **2.137/1.607s**, ELPA2 **3.717/2.643s**. Thus current custom one-stage beats ELPA2 at this configuration, but **does not beat ELPA1**. Split-half band32 passes(residual6.53e-6/orth.000484) but total3.587 versus native FP32 3.504s; not selected for speed.
+
+### E12: FP32 tridiagonal component and target-size scaling (prepared)
+
+Hypothesis: FP32 dense reduction need not pay for FP64 distributed tridiagonal eigensolution. Add explicit `--tridiag elpa32` using the public FP32 component, while preserving FP64 `elpa` and independent LibSci controls. FP64 scalar generation remains deliberate. Test reference eigenvalues/residual/orthogonality and dominant subspaces, not just timings.
+
+- Added `managed_gpu_peak_mib` instrumentation: maximum over ranks of this driver's live `Device` buffers during each solver trial. Includes A/Q and our temporaries; **excludes library/RCCL internal allocations and all host memory**, so it is not a total-device-memory high-water mark. Reset before each trial; reduce outside timed solve. Does not affect solver algorithms.
+- Prepared `scaling` suite: tiny FP32-component rectangular checks, n8192 grids1x1/1x2/2x2/1x8/2x4/4x2/8x1 in FP64 and FP32, paired FP64/FP32 tridiagonal component at2x4, split-half, single-GCD rocSOLVER controls. Three trials per performance configuration; full ELPA2 spectrum/subspace reference at2x4 and4x2, distributed residual/orthogonality everywhere. No dense gather.
+- Tiny login31 random/lowrank/indefinite/clustered/diagonal FP32-component checks passed after adding the new backend to argument validation. Lowrank smallest-eigenvalue relative error.745 despite residual2.69e-7: do not select FP32 tridiagonal work when accurate tiny eigenvalues matter.
+- Job **5736348**, snapshot `tri32-eigh`, completed6m21s on frontier02306; all32 cases passed. n8192 final warm timings(s):
+
+| Grid/GCDs | FP64 total / reduction / tri / back | FP32 total / reduction / tri / back |
+|---|---:|---:|
+|1x1/1|7.495 /6.124 /.969 /.376|4.402 /3.519 /.696 /.169|
+|1x2/2|5.201 /4.193 /.766 /.224|3.324 /2.640 /.545 /.126|
+|2x2/4|3.500 /2.884 /.457 /.150|2.409 /2.016 /.300 /.085|
+|1x8/8|3.378 /2.306 /.934 /.132|2.347 /1.750 /.496 /.098|
+|2x4/8|3.140 /2.526 /.479 /.129|2.300 /1.946 /.279 /.072|
+|4x2/8|**2.938** /2.538 /.285 /.109|**2.112** /1.842 /.197 /.069|
+|8x1/8|3.506 /3.180 /.230 /.090|2.180 /1.950 /.157 /.069|
+
+- FP64 speedup1→best8 is2.55x, FP32 2.08x; substantial reduction/communication floor remains. Rectangular4x2 wins overall, although1x8 has fastest FP64 reduction. FP64 residual9.3–9.7e-15/orth7.2–9.6e-13; FP32 residual1.4–1.6e-6/orth.00033–.00047.
+- Paired2x4 FP32 total2.475(FP64 tri)→2.300(FP32 tri), tri.460→.279; select FP32 component for normwise FP32 mode. Split-half adds.035s at8192(back.106 versus.072), still no speed win. Eight-GCD managed peak4x2 FP64/FP32 138.59/69.30MiB, excludes library internals.
+- Single-GCD rocSOLVER8192 FP64/FP32 **2.838/1.491s**, faster than this custom eight-GCD baseline. No dense gather is performed by this local control. This reinforces that custom solver overhead, not nominal GPU arithmetic throughput alone, must improve before claiming a practical win.
+
+### E13: SOAP basis precision sensitivity (CPU experiment)
+
+- `soap_precision.py`, command in its docstring, seeds42/43/44,96×64,20 frozen-basis updates, condition numbers100/1e6/1e9. Uses actual Adam primitive and SOAP epsilon/projection conventions; all update arithmetic FP64 isolates basis changes. Reference solves the same FP32 preconditioner promoted to FP64, matching existing ELPA input precision. FP16/BF16 are input-rounding experiments, not low-precision eigensolver arithmetic. Raw45 rows in `soap_precision.csv`.
+- Signed/permuted-basis control maximum update error6.52e-13; comparisons are sign/permutation invariant. At condition100, final-update FP32 error7.3–8.3e-6, FP16-rounded.0032–.0039, BF16-rounded.0235–.0306. First update can be much more sensitive: FP32 max.0030, FP16.101, BF16.292.
+- At condition1e6, final-update FP32 error.0678–.0731, FP16.423–.445, BF16.677–.680. At1e9 FP32.311–.354, FP16.875–.880, BF16.989–1.019. Near-degenerate/poorly conditioned bases can materially alter coordinate-wise Adam despite small eigensolver residuals. This is sensitivity evidence, **not** a training-loss regression, custom-solver comparison, or full distributed SOAP validation. No universal lowest SOAP precision is established.
+
+### E14: GPU-resident Householder vector candidate (prepared)
+
+Hypothesis: remove the per-reflector host vector transfers/replicated CPU scalar loops that remain in the one-stage reduction. Opt-in `--device-vectors 1` keeps scaled FP64 norms and scalar reductions on GPUs, uses RCCL row broadcasts/column reductions, padded vector AllGather to transpose block-cyclic row/column layouts, GPU W formation, fused rank2 updates, D2D reflector storage. Only O(n) d/e/tau return to host at reduction end. Existing distributed tridiagonal/backtransform stages are shared; baseline remains default.
+
+- Snapshot `device-vectors-eigh`, SHA2560942e84ec8e17588499ca4873928e7ba744f4dd793917f4bbaf213fcf10b0345. Tiny login31 random/lowrank/diagonal/indefinite FP64/32 plus2boundary and31FP32 elpa32 passed. Representative FP64 residual6.54e-16/orth6.22e-15; FP32 residual1.71e-7/orth1.92e-6. No multirank or performance claim yet. Requires RCCL/GPU-MPI/panel1/custom and rejects band mode.
