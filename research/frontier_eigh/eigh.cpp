@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -26,6 +27,8 @@ void pdstedc_(const char*, const int*, double*, double*, double*, const int*,
               const int*, const int*, double*, const int*, int*, const int*, int*);
 void pdtran_(const int*, const int*, const double*, const double*, const int*,
              const int*, const int*, const double*, double*, const int*, const int*, const int*);
+void pdgemr2d_(const int*, const int*, const double*, const int*, const int*, const int*,
+              double*, const int*, const int*, const int*, const int*);
 void dsyev_(const char*, const char*, const int*, double*, const int*, double*,
             double*, const int*, int*);
 void dgemv_(const char*, const int*, const int*, const double*, const double*,
@@ -172,6 +175,7 @@ int half_bulk=0;
 bool elpa_times=false;
 int band_width=0;
 bool device_vectors=false;
+Grid* tridiagonal_grid=nullptr;
 template<class T> __global__ void to_half(__half* out, const T* in, int rows, int cols, int ld, int parts) {
     size_t z=blockIdx.x*size_t(blockDim.x)+threadIdx.x;
     if (z<size_t(rows)*cols) {
@@ -249,9 +253,9 @@ template<class T> void store_column(Grid& g, Device<T>& a, int k, const std::vec
     HIP(hipMemcpy(a.p+size_t(g.li(k,g.pc))*g.nr,local.data(),g.nr*sizeof(T),hipMemcpyHostToDevice));
 }
 
-struct Phases { double reduction=0, tridiag=0, back=0, cpu_qr=0; };
+struct Phases { double reduction=0, tridiag=0, back=0, cpu_qr=0, retile=0; };
 
-template<class T> void tridiagonal_elpa(Grid&, std::vector<double>&, std::vector<double>&, std::vector<double>&);
+template<class T> double tridiagonal_elpa(Grid&, std::vector<double>&, std::vector<double>&, std::vector<double>&);
 
 template<class T> std::vector<T> compact_t(const std::vector<T>& gram,
     const std::vector<double>& tau, int start, int width) {
@@ -497,10 +501,10 @@ template<class T> Phases custom(Grid& g, rocblas_handle h, Device<T>& a,
     times.reduction=g.tick()-start;
     // Distributed divide-and-conquer. Only O(n) d/e are replicated.
     std::vector<double> z(size_t(g.nr)*g.nc);
-    if (tridiag=="elpa") tridiagonal_elpa<double>(g,d,e,z);
+    if (tridiag=="elpa") times.retile=tridiagonal_elpa<double>(g,d,e,z);
     else if (tridiag=="elpa32") {
         if constexpr(std::is_same_v<T,double>) throw std::runtime_error("elpa32 requires FP32 dense state");
-        tridiagonal_elpa<float>(g,d,e,z);
+        times.retile=tridiagonal_elpa<float>(g,d,e,z);
     }
     else {
         int one=1, info=0, lw=-1, liw=-1, iwq=0; double wq=0;
@@ -604,21 +608,34 @@ elpa_t elpa_handle(Grid& g, int solver, int bandwidth=0) {
 void elpa_release(elpa_t e) {
     int error; elpa_deallocate(e,&error); elpa_check(error); elpa_uninit(&error); elpa_check(error);
 }
-template<class T> void tridiagonal_elpa(Grid& g, std::vector<double>& d, std::vector<double>& e, std::vector<double>& z) {
-    auto handle=elpa_handle(g,ELPA_SOLVER_1STAGE);
+template<class T> double tridiagonal_elpa(Grid& g, std::vector<double>& d, std::vector<double>& e, std::vector<double>& z) {
+    Grid& target=tridiagonal_grid ? *tridiagonal_grid : g;
+    std::vector<double> local_z;
+    if (tridiagonal_grid) local_z.resize(size_t(target.nr)*target.nc);
+    auto& output=tridiagonal_grid ? local_z : z;
+    auto handle=elpa_handle(target,ELPA_SOLVER_1STAGE);
     int error;
     // This public component accepts HOST arrays and stages its distributed GPU work internally.
-    if constexpr(std::is_same_v<T,double>) elpa_solve_tridiagonal_d(handle,d.data(),e.data(),z.data(),&error);
+    if constexpr(std::is_same_v<T,double>) elpa_solve_tridiagonal_d(handle,d.data(),e.data(),output.data(),&error);
     else {
-        std::vector<float> df(d.begin(),d.end()), ef(e.begin(),e.end()), zf(z.size());
+        std::vector<float> df(d.begin(),d.end()), ef(e.begin(),e.end()), zf(output.size());
         elpa_solve_tridiagonal_f(handle,df.data(),ef.data(),zf.data(),&error);
-        d.assign(df.begin(),df.end()); z.assign(zf.begin(),zf.end());
+        d.assign(df.begin(),df.end()); output.assign(zf.begin(),zf.end());
     }
     if (elpa_times) {
         std::string name=std::string("elpa_solve_tridi_public_real_")+(std::is_same_v<T,double>?"double":"single");
         elpa_print_times(handle,name.data());
     }
     elpa_check(error); elpa_release(handle);
+    double retile=0;
+    if (tridiagonal_grid) {
+        int one=1;
+        double begin=MPI_Wtime();
+        pdgemr2d_(&g.n,&g.n,output.data(),&one,&one,target.desc,
+                  z.data(),&one,&one,g.desc,&g.ctxt);
+        retile=g.maximum(MPI_Wtime()-begin);
+    }
+    return retile;
 }
 template<class T> void elpa_solve(Grid& g, Device<T>& a, Device<T>& q,
                                   std::vector<double>& eigenvalues, int solver, int bandwidth=0) {
@@ -778,9 +795,10 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
         } else throw std::runtime_error("unknown solver");
         total=g.maximum(g.tick()-start);
         double peak_mib=g.maximum(device_peak_bytes/1048576.);
-        if (g.rank==0) std::printf("TIMING solver=%s trial=%d n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s total=%.9g reduction=%.9g tridiag=%.9g back=%.9g back_block=%d gpu_mpi=%d panel=%d tridiag_backend=%s rccl=%d half_bulk=%d band=%d cpu_qr=%.9g managed_gpu_peak_mib=%.9g device_vectors=%d\n",
+        if (g.rank==0) std::printf("TIMING solver=%s trial=%d n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s total=%.9g reduction=%.9g tridiag=%.9g back=%.9g back_block=%d gpu_mpi=%d panel=%d tridiag_backend=%s rccl=%d half_bulk=%d band=%d cpu_qr=%.9g managed_gpu_peak_mib=%.9g device_vectors=%d tridiag_grid=%dx%d retile=%.9g\n",
             solver.c_str(),trial,g.n,g.pr,g.pc,g.b,std::is_same_v<T,double>?"fp64":"fp32",name.c_str(),quant.c_str(),total,
-            phases.reduction,phases.tridiag,phases.back,back_block,int(g.gpu_mpi),panel,band_width?"elpa_banded":tridiag.c_str(),int(g.rccl),int(half_bulk),band_width,phases.cpu_qr,peak_mib,int(device_vectors));
+            phases.reduction,phases.tridiag,phases.back,back_block,int(g.gpu_mpi),panel,band_width?"elpa_banded":tridiag.c_str(),int(g.rccl),int(half_bulk),band_width,phases.cpu_qr,peak_mib,int(device_vectors),
+            tridiagonal_grid?tridiagonal_grid->pr:g.pr,tridiagonal_grid?tridiagonal_grid->pc:g.pc,phases.retile);
     }
     double comm=g.maximum(g.comm); g.comm=0;
     auto qt=q.get(); std::vector<double> qd(qt.begin(),qt.end());
@@ -878,9 +896,22 @@ int main(int argc,char** argv) {
         if (half_bulk && precision!="fp32") throw std::runtime_error("half bulk experiment requires FP32 state");
         {
             Grid g(n,b,pr,pc,arg("--gpu-mpi","0")=="1",arg("--rccl","0")=="1");
-            if (precision=="fp64") run<double>(g,arg("--solver","custom"),arg("--matrix","random"),arg("--quant","none"),arg("--reference","0")=="1",std::stoi(arg("--repeat","1")),std::stoi(arg("--back-block","1")),std::stoi(arg("--panel","1")),arg("--tridiag","scalapack"));
-            else if (precision=="fp32") run<float>(g,arg("--solver","custom"),arg("--matrix","random"),arg("--quant","none"),arg("--reference","0")=="1",std::stoi(arg("--repeat","1")),std::stoi(arg("--back-block","1")),std::stoi(arg("--panel","1")),arg("--tridiag","scalapack"));
+            std::string tridiag=arg("--tridiag","scalapack");
+            int tri_pr=std::stoi(arg("--tri-pr","0"));
+            std::unique_ptr<Grid> stage_grid;
+            if (tri_pr) {
+                if (tri_pr<1 || pr*pc%tri_pr || band_width || arg("--solver","custom")!="custom" ||
+                    (tridiag!="elpa" && tridiag!="elpa32"))
+                    throw std::runtime_error("--tri-pr must divide ranks and requires custom one-stage with elpa/elpa32");
+                if (tri_pr!=pr) {
+                    stage_grid=std::make_unique<Grid>(n,b,tri_pr,pr*pc/tri_pr,false,false);
+                    tridiagonal_grid=stage_grid.get();
+                }
+            }
+            if (precision=="fp64") run<double>(g,arg("--solver","custom"),arg("--matrix","random"),arg("--quant","none"),arg("--reference","0")=="1",std::stoi(arg("--repeat","1")),std::stoi(arg("--back-block","1")),std::stoi(arg("--panel","1")),tridiag);
+            else if (precision=="fp32") run<float>(g,arg("--solver","custom"),arg("--matrix","random"),arg("--quant","none"),arg("--reference","0")=="1",std::stoi(arg("--repeat","1")),std::stoi(arg("--back-block","1")),std::stoi(arg("--panel","1")),tridiag);
             else throw std::runtime_error("precision must be fp64 or fp32");
+            tridiagonal_grid=nullptr;
         }
         MPI(MPI_Finalize()); return 0;
     } catch (const std::exception& e) {

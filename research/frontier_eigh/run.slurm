@@ -280,6 +280,35 @@ elif [[ $1 == resident ]]; then
         done
         run 8 --n 16384 --block 64 --band 64 --pr 4 --pc 2 --precision "$precision" --back-block 128 --gpu-mpi 1 --rccl 1 --repeat 3 --reference 1
     done
+elif [[ $1 == indexed ]]; then
+    for grid in '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            tridiag=elpa
+            [[ $precision == fp32 ]] && tridiag=elpa32
+            for vectors in 0 1; do
+                run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --precision "$precision" --tridiag "$tridiag" --tri-pr 8 --back-block 13 --device-vectors "$vectors" --gpu-mpi 1 --rccl 1
+            done
+        done
+    done
+    for precision in fp64 fp32; do
+        tridiag=elpa
+        [[ $precision == fp32 ]] && tridiag=elpa32
+        for binary in device-active-eigh device-indexed-eigh; do
+            EIGH_BIN=build/custom-eigh/$binary run 8 --n 8192 --block 64 --pr 2 --pc 4 --precision "$precision" --tridiag "$tridiag" --back-block 128 --device-vectors 1 --gpu-mpi 1 --rccl 1 --repeat 3 --reference 1
+        done
+        for grid in '1 8' '2 4' '4 2' '8 1'; do
+            read -r pr pc <<< "$grid"
+            if [[ $pr != 2 ]]; then
+                run 8 --n 8192 --block 64 --pr "$pr" --pc "$pc" --precision "$precision" --tridiag "$tridiag" --back-block 128 --device-vectors 1 --gpu-mpi 1 --rccl 1 --repeat 3 --reference 1
+            fi
+            run 8 --n 8192 --block 64 --pr "$pr" --pc "$pc" --precision "$precision" --solver elpa1 --repeat 3
+        done
+        EIGH_BIN=build/custom-eigh/tri32-eigh run 8 --n 8192 --block 64 --pr 1 --pc 8 --precision "$precision" --tridiag "$tridiag" --back-block 128 --gpu-mpi 1 --rccl 1 --repeat 3
+        for vectors in 0 1; do
+            run 8 --n 8192 --block 64 --pr 1 --pc 8 --precision "$precision" --tridiag "$tridiag" --tri-pr 8 --back-block 128 --device-vectors "$vectors" --gpu-mpi 1 --rccl 1 --repeat 3 --reference 1
+        done
+    done
 elif [[ $1 == case ]]; then
     shift
     ranks=$1; shift
