@@ -101,6 +101,47 @@ elif [[ $1 == panel ]]; then
     for panel in 1 32; do
         run 8 --n 8192 --block 64 --pr 2 --pc 4 --back-block 128 --panel "$panel" --gpu-mpi 1 --repeat 2 --reference 1
     done
+elif [[ $1 == components ]]; then
+    for grid in '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --back-block 13 --tridiag elpa
+    done
+    for grid in '2 4' '4 2'; do
+        read -r pr pc <<< "$grid"
+        run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --back-block 13 --gpu-mpi 1 --rccl 1
+    done
+    for tridiag in scalapack elpa; do
+        for transport in '0 0' '1 0' '1 1'; do
+            read -r gpu rccl <<< "$transport"
+            run 8 --n 4096 --block 64 --pr 2 --pc 4 --back-block 128 --tridiag "$tridiag" --gpu-mpi "$gpu" --rccl "$rccl" --repeat 3
+        done
+    done
+    for gpu in 0 1; do
+        run 8 --n 8192 --block 64 --pr 2 --pc 4 --back-block 128 --tridiag elpa --gpu-mpi "$gpu" --repeat 2 --reference 1
+    done
+    for matrix in random lowrank; do
+        for panel in 1 16; do
+            if run 8 --n 257 --block 16 --pr 2 --pc 4 --back-block 32 --precision fp32 --half-bulk 1 --matrix "$matrix" --panel "$panel"; then
+                echo "HALF_BULK_CHECK passed matrix=$matrix panel=$panel"
+            else
+                echo "HALF_BULK_CHECK FAILED matrix=$matrix panel=$panel; inspect numerical metrics above"
+            fi
+        done
+    done
+elif [[ $1 == norm ]]; then
+    for n in 4096 8192; do
+        for binary in half-eigh norm-eigh; do
+            EIGH_BIN=build/custom-eigh/$binary run 8 --n "$n" --block 64 --pr 2 --pc 4 --back-block 128 --tridiag elpa --repeat 3
+        done
+    done
+    for matrix in random lowrank indefinite; do
+        for half in 0 2; do
+            EIGH_BIN=build/custom-eigh/split-eigh run 8 --n 257 --block 16 --pr 4 --pc 2 --back-block 32 --precision fp32 --half-bulk "$half" --matrix "$matrix"
+        done
+    done
+    for half in 0 2; do
+        EIGH_BIN=build/custom-eigh/split-eigh run 8 --n 8192 --block 64 --pr 2 --pc 4 --back-block 128 --tridiag elpa --precision fp32 --half-bulk "$half" --repeat 3 --reference 1
+    done
 elif [[ $1 == case ]]; then
     shift
     ranks=$1; shift

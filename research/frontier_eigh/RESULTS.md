@@ -80,7 +80,7 @@ Hypothesis: accumulate consecutive Householders into I−VTVᵀ and apply throug
 - Precision sweep n257 lowrank (true λmin≈1.001e-7): FP64 residual 1.66e-15 / smallest-eigenvalue relative error 1.32e-9; FP32 residual 3.94e-7 / λmin error 23.4%; FP16-rounded input residual 2.14e-4, λmin=−3.89e-5, **122 negative eigenvalues**; BF16 residual 1.68e-3, λmin=−3.65e-4, **123 negatives**. The quantized problems themselves solve to ~3.8e-7 residual.
 - Well-conditioned random SPD n257: FP32 original residual 3.07e-7; FP16 input 1.67e-4; BF16 input 1.23e-3. Low precision is a task-dependent accuracy decision, not automatically invalid, but cannot preserve the low-rank SOAP-like small spectrum in this test.
 
-### E4: delayed panel updates (prepared, not yet performance-validated)
+### E4: delayed panel updates (slower; not selected)
 
 Hypothesis: delay a panel's rank-2 updates and apply A₂₂←A₂₂−[V W][W V]ᵀ through GPU GEMM. Correct each panel column and Av for the still-pending low-rank updates. This is still **one-stage tridiagonalization**, not dense-to-band. It retains the sequential GEMV chain and adds a small coefficient reduction; measure whether saved bandwidth outweighs that latency.
 
@@ -88,3 +88,17 @@ Hypothesis: delay a panel's rank-2 updates and apply A₂₂←A₂₂−[V W][W
 - Snapshot `build/custom-eigh/panel-eigh`; `panel` suite prepared for after E3.
 - Link provenance check: `LD_DEBUG=bindings` confirms actual `PDSTEDC`, BLACS and CPU LAPACK/BLAS resolve to **Cray LibSci 26.03**, because the Frontier compiler wrapper links it before the local reference libraries. Source review used reference ScaLAPACK; measured backend is LibSci's compatible distributed CPU implementation. ELPA's host BLAS also resolves to LibSci. No claim that reference OpenBLAS supplied measured CPU flops.
 - Submitted job **5736055**, 5-minute one-node limit, includes rectangular-grid n97 tests, n4096 widths1/8/16/32/64 FP64/FP32, and paired n8192 direct/panel32 with ELPA2 eigenvalue reference.
+- Completed 18:04 EDT, frontier01560. All correctness checks passed. n4096 FP64 panel1/8/16/32/64 total1.787/1.903/1.941/1.979/2.117s; FP321.456/1.593/1.617/1.667/1.777s. At n8192 panel1/32 total6.539/6.750s, reduction3.614/3.825s. FP64 residual1.11e-14/1.09e-14; eigenvalue agreement with ELPA2 2.79e-15/2.27e-15.
+- Conclusion: select panel1. Delayed updates do not remove the sequential GEMV dependency and add coefficient reductions; GEMM alone is insufficient. Retain this explicitly non-default experimental control as evidence distinguishing this approach from genuine two-stage reduction, not as a performance improvement.
+
+### E5: tridiagonal component, transport, native-half bulk (submitted)
+
+Hypotheses: ELPA's public GPU tridiagonal component may beat LibSci PDSTEDC without surrendering custom dense stages; RCCL may improve device collectives; native FP16 GEMM/FP32 accumulation may be the lowest useful bulk arithmetic.
+
+- Job **5736114**, 6-minute one-node limit, immutable `half-eigh` binary. Includes all rectangular ELPA-tridiagonal cases, RCCL rectangles, paired transports/components n4096, n8192 ELPA component plus full ELPA2 eigenvalue reference, native-half random/lowrank checks.
+- ELPA's component API uses host d/e and distributed local host Q; internal GPU work is ELPA-owned. Full-solver GPU-pointer API differs. FP64 tridiagonal solve remains in FP32 dense mode.
+- Native-half prototype converts operands for GEMM through rocBLAS GEMM_EX, retains FP32 state/accumulation. Tiny n31 failed strict orthogonality (0.00535), so this is an accuracy experiment, not a working low-precision solver. Batch explicitly records such failures rather than weakening acceptance.
+
+### E6: scaled host norm (candidate)
+
+Hypothesis: per-element `hypot` in replicated Householder generation is expensive. Replace it by a two-pass max-scaled FP64 norm, retaining overflow-safe scaling and one final `hypot` with alpha. Tiny n31 lowrank FP64 and random FP32 passed. Snapshot `norm-eigh`; must compare against the previous binary on the same compute node before selecting.

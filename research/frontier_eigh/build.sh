@@ -11,5 +11,5 @@ hipcc -O3 -std=c++17 --offload-arch=gfx90a \
     -L"$ROOT/build/math-install/lib" -lscalapack -lopenblas \
     -L"$ELPA/lib" -lelpa -Wl,-rpath,"$ELPA/lib" \
     -Wl,-rpath,"$ROOT/build/math-install/lib" \
-    -lrocsolver -lrocblas -lgfortran \
+    -lrocsolver -lrocblas -lrccl -lgfortran \
     -o "$ROOT/build/custom-eigh/eigh"
