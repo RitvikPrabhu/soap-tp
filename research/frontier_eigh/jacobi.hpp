@@ -96,7 +96,7 @@ template<class T> Phases jacobi(Grid& original, rocblas_handle h, Device<T>& inp
     // At most two local column panels and a two-block pivot, never a dense gather.
     Device<T> pa(size_t(n)*2*b), pq(pa.n), u(size_t(2*b)*2*b), broadcast(u.n);
     Device<T> scratch(size_t(n)*g.nc), packed(size_t(2*b)*g.nc), left(packed.n);
-    Device<T> d(2*b), e(2*b); Device<int> info(1);
+    Device<T> d(2*b), e(2*b); Device<int> info(1), local_sweeps(1);
     Device<double> precise(jacobi_pivot64 ? u.n : 1), precise_d(2*b), precise_e(2*b);
     double solve_time=0, rotation_time=0, communication=0;
     auto sync=[] { HIP(hipDeviceSynchronize()); };
@@ -144,19 +144,29 @@ template<class T> Phases jacobi(Grid& original, rocblas_handle h, Device<T>& inp
             t=MPI_Wtime();
             pivot<<<(size_t(m)*m+255)/256,256>>>(u.p,pa.p,n,lo*b,hi*b,wl,m);
             HIP(hipGetLastError());
-            if constexpr(std::is_same_v<T,double>) BLAS(rocsolver_dsyevd(h,rocblas_evect_original,
-                rocblas_fill_lower,m,u.p,m,d.p,e.p,info.p));
+            if constexpr(std::is_same_v<T,double>) {
+                if (jacobi_local=="jacobi") BLAS(rocsolver_dsyevj(h,rocblas_esort_ascending,
+                    rocblas_evect_original,rocblas_fill_lower,m,u.p,m,0,e.p,30,local_sweeps.p,d.p,info.p));
+                else BLAS(rocsolver_dsyevd(h,rocblas_evect_original,
+                    rocblas_fill_lower,m,u.p,m,d.p,e.p,info.p));
+            }
             else if (jacobi_pivot64) {
                 cast<<<(size_t(m)*m+255)/256,256>>>(precise.p,u.p,size_t(m)*m);
-                BLAS(rocsolver_dsyevd(h,rocblas_evect_original,
+                if (jacobi_local=="jacobi") BLAS(rocsolver_dsyevj(h,rocblas_esort_ascending,
+                    rocblas_evect_original,rocblas_fill_lower,m,precise.p,m,0,precise_e.p,30,local_sweeps.p,precise_d.p,info.p));
+                else BLAS(rocsolver_dsyevd(h,rocblas_evect_original,
                     rocblas_fill_lower,m,precise.p,m,precise_d.p,precise_e.p,info.p));
                 cast<<<(size_t(m)*m+255)/256,256>>>(u.p,precise.p,size_t(m)*m);
                 cast<<<(m+255)/256,256>>>(d.p,precise_d.p,m);
-            } else BLAS(rocsolver_ssyevd(h,rocblas_evect_original,
-                rocblas_fill_lower,m,u.p,m,d.p,e.p,info.p));
+            } else {
+                if (jacobi_local=="jacobi") BLAS(rocsolver_ssyevj(h,rocblas_esort_ascending,
+                    rocblas_evect_original,rocblas_fill_lower,m,u.p,m,0,e.p,30,local_sweeps.p,d.p,info.p));
+                else BLAS(rocsolver_ssyevd(h,rocblas_evect_original,
+                    rocblas_fill_lower,m,u.p,m,d.p,e.p,info.p));
+            }
             int bad=info.get()[0]!=0;
             MPI(MPI_Allreduce(MPI_IN_PLACE,&bad,1,MPI_INT,MPI_MAX,g.row));
-            if (bad) throw std::runtime_error("Jacobi local SYEVD info != 0");
+            if (bad) throw std::runtime_error("Jacobi local eigensolver info != 0");
             normalize_columns<<<m,256>>>(u.p,m);
             solve_time+=MPI_Wtime()-t;
             // Freeze all rotations before the two-sided update.
@@ -242,6 +252,6 @@ template<class T> Phases jacobi(Grid& original, rocblas_handle h, Device<T>& inp
         original.comm+=g.comm;
     }
     original.comm+=communication;
-    if (!g.rank) std::printf("JACOBI_DONE pivot64=%d offdiag_rel=%.17g\n",int(jacobi_pivot64),ratio);
+    if (!g.rank) std::printf("JACOBI_DONE pivot64=%d local=%s offdiag_rel=%.17g\n",int(jacobi_pivot64),jacobi_local.c_str(),ratio);
     return times;
 }

@@ -13,7 +13,7 @@ rows = []
 for path in map(Path, sys.argv[1:]):
     timing = {}
     trials = []
-    binary = digest = command = ""
+    binary = digest = command = config = ""
     case = None
     for line in path.read_text().splitlines():
         if line.startswith("COMMAND "):
@@ -28,6 +28,8 @@ for path in map(Path, sys.argv[1:]):
                 case["check"] = "passed"
         elif "_CHECK " in line and case is not None:
             case["check"] = "failed" if "FAILED" in line else "passed"
+        elif line.startswith("RCCL_CONFIG "):
+            config = line.split()[1]
         elif re.match(r"^[a-f0-9]{64}  ", line):
             digest, binary = line.split()
         elif line.startswith(("TIMING ", "RESULT ")):
@@ -38,7 +40,7 @@ for path in map(Path, sys.argv[1:]):
             else:
                 warm = trials[1:]
                 rows.append(dict(job=path.stem[len("job-"):], binary=binary,
-                                 sha256=digest, command=command, trials=len(trials), check="unconfirmed",
+                                 sha256=digest, command=command, rccl_config=config, trials=len(trials), check="unconfirmed",
                                  cold_total=trials[0], warm_median=median(warm) if warm else "",
                                  warm_min=min(warm) if warm else "", warm_max=max(warm) if warm else "",
                                  **{**timing, **fields}))

@@ -12,6 +12,7 @@ Input-only rounding is deliberately not used as a substitute for FP16 computatio
 import argparse
 import csv
 import hashlib
+import itertools
 import json
 import math
 from pathlib import Path
@@ -51,6 +52,7 @@ def main():
     p.add_argument("--output", type=Path, default=Path("output/custom-eigh/torch-loop2"))
     p.add_argument("--n", type=int, default=97)
     p.add_argument("--seeds", type=int, nargs="+", default=[42])
+    p.add_argument("--scales", type=float, nargs="+", default=[1.0])
     p.add_argument("--cases", nargs="+", choices=["spd", "indefinite", "clustered", "illconditioned"],
                    default=["spd", "indefinite", "clustered", "illconditioned"])
     p.add_argument("--device", choices=["cpu", "rocm"], default="cpu")
@@ -61,13 +63,17 @@ def main():
     p.add_argument("--pr", type=int, default=1)
     p.add_argument("--pc", type=int, default=1)
     p.add_argument("--panel", type=int, default=1)
+    p.add_argument("--fused-av", type=int, choices=[0, 1], default=0)
     p.add_argument("--solver", choices=["custom", "jacobi"], default="custom")
     p.add_argument("--jacobi-pivot64", type=int, choices=[0, 1], default=0)
+    p.add_argument("--jacobi-local", choices=["dc", "jacobi"], default="dc")
     p.add_argument("--variants", nargs="+", choices=["fp64", "fp32", "half", "split_half"],
                    default=["fp64", "fp32", "half", "split_half"])
     args = p.parse_args()
     if not 2 <= args.n < 512:
         p.error("only tiny correctness matrices 2 <= n < 512 are permitted")
+    if any(not math.isfinite(scale) or scale <= 0 for scale in args.scales):
+        p.error("scales must be positive and finite")
     if args.pr < 1 or args.pc < 1 or (args.run_custom and args.pr * args.pc > 1 and not args.launcher):
         p.error("positive process grid and an explicit launcher for distributed runs required")
     torch.set_num_threads(1)
@@ -77,6 +83,8 @@ def main():
                 "gpu_available": torch.cuda.is_available(), "requested_backend": args.device,
                 "python": sys.executable, "numpy": np.__version__,
                 "custom_solver": args.solver, "custom_panel": args.panel, "jacobi_pivot64": args.jacobi_pivot64,
+                "fused_av": args.fused_av,
+                "scales": args.scales, "jacobi_local": args.jacobi_local,
                 "note": "correctness only; torch FP16 eigh is probed, never silently promoted"}
     device = "cpu"
     if args.device == "rocm":
@@ -94,14 +102,14 @@ def main():
         evidence["custom_sha256"] = hashlib.sha256(args.binary.read_bytes()).hexdigest()
     (args.output / "backend.json").write_text(json.dumps(evidence, indent=2) + "\n")
     print(json.dumps(evidence), flush=True)
-    rows, details, failures, missing_exports = [], [], [], []
+    rows, details, failures, missing_exports, reference_failures = [], [], [], [], []
     eps = torch.finfo(torch.float32).eps
     n = args.n
     for seed in args.seeds:
         gen = torch.Generator().manual_seed(seed)
         u = torch.linalg.qr(torch.randn(n, n, generator=gen, dtype=torch.float64)).Q
-        for case in args.cases:
-            stem = f"{case}-s{seed}-n{n}"
+        for case, scale in itertools.product(args.cases, args.scales):
+            stem = f"{case}-s{seed}-n{n}" + (f"-scale{scale:g}" if scale != 1 else "")
             spectrum = torch.linspace(0.1, 1, n, dtype=torch.float64)
             if case == "indefinite":
                 spectrum = torch.linspace(-1, 1, n, dtype=torch.float64)
@@ -112,44 +120,56 @@ def main():
             elif case == "illconditioned":
                 spectrum = torch.logspace(-7, 0, n, dtype=torch.float64)
             a = (u * spectrum) @ u.T
-            a = ((a + a.T) / 2).float().double()
+            a = ((a + a.T) * (scale / 2)).float().double()
             input_path = args.output / f"{stem}.input.bin"
             a.T.contiguous().numpy().tofile(input_path)
             if args.prepare_only:
                 continue
             wr, qr = torch.linalg.eigh(a)  # CPU FP64 reference on exactly the FP32 input.
-            wf, qf = torch.linalg.eigh(a.float().to(device))
-            wf, qf = wf.cpu().double(), qf.cpu().double()
+            torch_error = None
+            try:
+                wf, qf = torch.linalg.eigh(a.float().to(device))
+                wf, qf = wf.cpu().double(), qf.cpu().double()
+            except torch.linalg.LinAlgError as exc:
+                torch_error = str(exc)
+                reference_failures.append({"case": stem, "error": torch_error})
+                print(f"TORCH_REFERENCE_FAILED {stem}: {torch_error}", flush=True)
             radius = float(torch.max(abs(wr)))
             # Never cut a repeated/unresolved subspace. The same groups apply to all solvers.
             cuts = [0] + [i for i in range(1, n) if float(wr[i] - wr[i - 1]) > 64 * eps * radius] + [n]
             groups = [(lo, hi) for lo, hi in zip(cuts[:-1], cuts[1:]) if hi - lo < n]
             gaps = [float(wr[i] - wr[i - 1]) for i in cuts[1:-1]]
-            baseline = metrics(a, wf, qf, wr, qr, groups)
+            baseline = metrics(a, wf, qf, wr, qr, groups) if torch_error is None else {}
             # Bounded torch-matching policy: 8x measured torch error, precision floor,
             # and an independent hard ceiling. No universal loose 1e-4 residual gate.
             floor = 4 * eps * math.sqrt(n)
             cap = 64 * eps * math.sqrt(n)
-            limits = {k: min(cap, max(floor, 8 * value)) for k, value in baseline.items()}
-            limits["q_norm_relative"] = min(8 * eps, max(2 * eps, 4 * baseline["q_norm_relative"]))
+            # If FP32 torch cannot solve the input, enforce only the precision floors;
+            # retain the FP64 reference and explicitly report the missing comparison.
+            limits = {k: min(cap, max(floor, 8 * baseline.get(k, 0)))
+                      for k in metrics(a, wr, qr, wr, qr, groups)}
+            limits["q_norm_relative"] = min(8 * eps, max(2 * eps, 4 * baseline.get("q_norm_relative", 0)))
             space_floor = min(0.05, 4 * eps * radius / min(gaps)) if gaps else floor
-            limits["eigenspace_max"] = min(0.05, max(space_floor, 8 * baseline["eigenspace_max"]))
+            limits["eigenspace_max"] = min(0.05, max(space_floor, 8 * baseline.get("eigenspace_max", 0)))
             details.append({"case": stem, "groups": groups, "gap_min": min(gaps, default=None),
-                            "limits": limits, "input_sha256": hashlib.sha256(input_path.read_bytes()).hexdigest()})
-            candidates = [(f"torch_fp32_{args.device}", wf, qf), ("torch_fp64_cpu", wr, qr)]
+                            "limits": limits, "torch_fp32_error": torch_error,
+                            "input_sha256": hashlib.sha256(input_path.read_bytes()).hexdigest()})
+            candidates = [("torch_fp64_cpu", wr, qr)]
+            if torch_error is None:
+                candidates.append((f"torch_fp32_{args.device}", wf, qf))
             for variant in args.variants:
                 export = args.output / f"{stem}.{variant}.basis.bin"
                 if args.run_custom:
                     export.unlink(missing_ok=True)  # A failed solve must not reuse a stale export.
                     extra = ["--half-bulk", {"half": "1", "split_half": "2"}[variant]] if variant in ("half", "split_half") else []
-                    extra += ["--device-vectors", "1"] if args.solver == "custom" else ["--solver", "jacobi", "--jacobi-pivot64", str(args.jacobi_pivot64)]
+                    extra += ["--device-vectors", "1"] if args.solver == "custom" else ["--solver", "jacobi", "--jacobi-pivot64", str(args.jacobi_pivot64), "--jacobi-local", args.jacobi_local]
                     cmd = shlex.split(args.launcher) + [str(args.binary.resolve()), "--n", str(n),
                         "--block", "16", "--back-block", "32", "--pr", str(args.pr), "--pc", str(args.pc),
                         "--precision", "fp64" if variant == "fp64" else "fp32", "--tridiag",
                         "elpa" if variant == "fp64" else "elpa32", "--input", str(input_path.resolve()),
                         "--export-basis", str(export.resolve()),
                         "--gpu-mpi", "1", "--rccl", "1", "--async-alloc", "1",
-                        "--panel", str(args.panel)] + extra
+                        "--panel", str(args.panel), "--fused-av", str(args.fused_av)] + extra
                     print(shlex.join(cmd), flush=True)
                     try:
                         run = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -181,15 +201,18 @@ def main():
             writer.writeheader()
             writer.writerows(rows)
     (args.output / "acceptance.json").write_text(json.dumps({"policy": "8x measured FP32 torch, 4eps*sqrt(n) floor, 64eps*sqrt(n) hard cap; relative Q norm min(8eps,max(2eps,4x torch)); eigenspaces gap-aware floor, 0.05 cap", "cases": details, "failures": failures,
-        "missing_exports_not_evaluated": missing_exports}, indent=2) + "\n")
+        "missing_exports_not_evaluated": missing_exports,
+        "torch_reference_failures": reference_failures}, indent=2) + "\n")
     if missing_exports:
         print(f"NOTE: {len(missing_exports)} absent custom exports were NOT evaluated", file=sys.stderr)
     for row in rows:
         print(json.dumps(row))
+    if reference_failures:
+        print(f"NOTE: {len(reference_failures)} FP32 torch reference failures; those custom cases use precision floors, not a measured torch match", file=sys.stderr)
     if failures:
         print("FAILED: " + "; ".join(failures), file=sys.stderr)
         return 1
-    return 0
+    return int(bool(reference_failures))
 
 
 if __name__ == "__main__":

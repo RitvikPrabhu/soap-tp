@@ -30,6 +30,8 @@ void pdtran_(const int*, const int*, const double*, const double*, const int*,
              const int*, const int*, const double*, double*, const int*, const int*, const int*);
 void pdgemr2d_(const int*, const int*, const double*, const int*, const int*, const int*,
               double*, const int*, const int*, const int*, const int*);
+void psgemr2d_(const int*, const int*, const float*, const int*, const int*, const int*,
+              float*, const int*, const int*, const int*, const int*);
 void dsyev_(const char*, const char*, const int*, double*, const int*, double*,
             double*, const int*, int*);
 void dstemr_(const char*, const char*, const int*, double*, double*, const double*, const double*,
@@ -42,6 +44,8 @@ void dgemv_(const char*, const int*, const int*, const double*, const double*,
             const int*, const double*, const int*, const double*, double*, const int*);
 void dger_(const int*, const int*, const double*, const double*, const int*,
            const double*, const int*, double*, const int*);
+void dtrmv_(const char*, const char*, const char*, const int*, const double*,
+            const int*, double*, const int*);
 }
 
 #define HIP(x) do { auto s = (x); if (s != hipSuccess) throw std::runtime_error( \
@@ -189,9 +193,11 @@ bool elpa_times=false;
 int band_width=0;
 bool device_vectors=false;
 bool lower_triangle=false;
+bool fused_av=false;
 int jacobi_sweeps=8;
 double jacobi_tol=0;
 bool jacobi_pivot64=false;
+std::string jacobi_local="dc";
 Grid* tridiagonal_grid=nullptr;
 std::vector<double> supplied_matrix;
 std::string basis_file;
@@ -294,43 +300,25 @@ template<class T> void store_column(Grid& g, Device<T>& a, int k, const std::vec
 
 struct Phases { double reduction=0, tridiag=0, back=0, cpu_qr=0, retile=0; };
 
-template<class T> double tridiagonal_elpa(Grid&, std::vector<double>&, std::vector<double>&, std::vector<double>&);
+template<class T> double tridiagonal_elpa(Grid&, std::vector<double>&, std::vector<double>&, std::vector<T>&);
 template<class T> double tridiagonal_mrrr(Grid&, std::vector<double>&, std::vector<double>&, std::vector<double>&);
 
 template<class T> std::vector<T> compact_t(const std::vector<T>& gram,
     const std::vector<double>& tau, int start, int width) {
     std::vector<double> t(size_t(width)*width,0), x(width);
+    int one=1;
     for (int i=0;i<width;++i) {
         for (int j=0;j<i;++j) x[j]=-tau[start+i]*gram[j+size_t(i)*width];
-        for (int j=0;j<i;++j) for (int l=j;l<i;++l)
-            t[j+size_t(i)*width]+=t[j+size_t(l)*width]*x[l];
+        if (i) dtrmv_("U","N","N",&i,t.data(),&width,x.data(),&one);
+        std::copy_n(x.data(),i,t.data()+size_t(i)*width);
         t[i+size_t(i)*width]=tau[start+i];
     }
     return std::vector<T>(t.begin(),t.end());
 }
 
-template<class T> __global__ void compact_t_device(T* out, const T* gram,
-    const double* tau, int start, int width) {
-    extern __shared__ double t[];
-    // Each row depends only on its own earlier entries; rows are independent.
-    int j=blockIdx.x*blockDim.x+threadIdx.x;
-    if (j<width) {
-        for (int i=0;i<width;++i) {
-            double sum=0;
-            if (j==i) sum=tau[start+i];
-            else if (j<i) for (int l=j;l<i;++l)
-                sum+=t[threadIdx.x+size_t(l)*blockDim.x]*(-tau[start+i]*double(gram[l+size_t(i)*width]));
-            t[threadIdx.x+size_t(i)*blockDim.x]=sum;
-            out[j+size_t(i)*width]=T(sum);
-        }
-    }
-}
-
 template<class T> void backtransform(Grid& g, rocblas_handle h, Device<T>& a,
     Device<T>& q, const std::vector<double>& tau, int block) {
     // H_start ... H_end = I - V T V^T. V is row-distributed, replicated over process columns.
-    if (std::min(block,g.n-1)>8192) throw std::runtime_error("GPU compact-WY requires panel width <= 8192");
-    Device<double> dtau(tau.size()); dtau.put(tau);
     for (int end=g.n-1;end>0;) {
         int start=((end-1)/block)*block, width=end-start;
         Device<T> v(size_t(g.nr)*width), gram(size_t(width)*width), dt(size_t(width)*width);
@@ -352,9 +340,7 @@ template<class T> void backtransform(Grid& g, rocblas_handle h, Device<T>& a,
         if (!g.gpu_mpi) v.put(hostv);
         gemm(h,true,width,width,g.nr,T(1),v.p,g.nr,v.p,g.nr,T(0),gram.p,width);
         g.device_sum(gram,g.col);
-        int threads=64;
-        while (size_t(threads)*width*sizeof(double)>65536) threads/=2;
-        compact_t_device<<<(width+threads-1)/threads,threads,size_t(threads)*width*sizeof(double)>>>(dt.p,gram.p,dtau.p,start,width);
+        dt.put(compact_t(gram.get(),tau,start,width));
         bulk_gemm(h,true,width,g.nc,g.nr,T(1),v.p,g.nr,q.p,g.nr,T(0),y.p,width);
         g.device_sum(y,g.col);
         gemm(h,false,width,g.nc,width,T(1),dt.p,width,y.p,width,T(0),ty.p,width);
@@ -468,6 +454,36 @@ template<class T> __global__ void local_rank2(T* a, const T* v, const T* w,
     }
 }
 
+template<class T> __global__ void pending_column(T* column, const T* v, const T* w,
+    const T* vc, const T* wc, int nr, int first, int j) {
+    int i=first+blockIdx.x*blockDim.x+threadIdx.x;
+    if (i<nr) column[i]-=v[i]*wc[j]+w[i]*vc[j];
+}
+
+template<class T> __global__ void update_av(T* a, const T* oldv, const T* oldw,
+    const T* oldvc, const T* oldwc, const T* vc, T* out, int nr, int nc, int r0, int c0) {
+    __shared__ T partial[8][32];
+    int x=threadIdx.x, y=threadIdx.y, i=r0+32*blockIdx.x+x;
+    T sum=0;
+    if (i<nr) for (int j=c0+y;j<nc;j+=8) {
+        T value=a[i+size_t(j)*nr]-(oldv[i]*oldwc[j]+oldw[i]*oldvc[j]);
+        a[i+size_t(j)*nr]=value;
+        sum+=value*vc[j];
+    }
+    partial[y][x]=sum; __syncthreads();
+    if (!y && i<nr) {
+        for (int t=1;t<8;++t) sum+=partial[t][x];
+        out[i]=sum;
+    }
+}
+
+template<class T> __global__ void save_vectors(T* oldv, T* oldw, T* oldvc, T* oldwc,
+    const T* v, const T* w, const T* vc, const T* wc, int nr, int nc) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if (i<nr) { oldv[i]=v[i]; oldw[i]=w[i]; }
+    if (i<nc) { oldvc[i]=vc[i]; oldwc[i]=wc[i]; }
+}
+
 template<class T> __global__ void symmetric_av(const T* a, const T* v, const T* vc,
     T* out, const int* rows, const int* cols, int nr, int nc, int r0, int c0) {
     __shared__ T partial[8][32];
@@ -524,6 +540,8 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
     int padded=((g.n+g.b*g.pr-1)/(g.b*g.pr))*g.b;
     Device<T> v(padded), w(padded), vc(g.nc), wc(g.nc), packed(size_t(padded)*g.pr);
     Device<T> full_w(lower_triangle ? g.n : 1);
+    Device<T> oldv(fused_av ? g.nr : 1), oldw(oldv.n);
+    Device<T> oldvc(fused_av ? g.nc : 1), oldwc(oldvc.n);
     Device<T> u(size_t(g.nr)*2*panel), cross(size_t(g.nc)*2*panel), coeff(2*panel);
     Device<double> scalars(6), statistics(4*g.pr), dd(g.n), ee(g.n), tt(g.n-1);
     HIP(hipMemsetAsync(dd.p,0,dd.n*sizeof(double)));
@@ -537,6 +555,11 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
     for (int k=0;k<g.n-1;++k) {
         int owner=(k/g.b)%g.pc;
         T* column=g.c==owner ? a.p+size_t(g.li(k,g.pc))*g.nr : nullptr;
+        if (fused_av && k && column) {
+            int first=std::lower_bound(g.rows.begin(),g.rows.end(),k)-g.rows.begin();
+            if (first<g.nr) pending_column<<<(g.nr-first+255)/256,256>>>(column,
+                oldv.p,oldw.p,oldvc.p,oldwc.p,g.nr,first,g.li(k,g.pc));
+        }
         if (panel>1) {
             if (k%panel==0) {
                 HIP(hipMemsetAsync(u.p,0,u.n*sizeof(T)));
@@ -570,8 +593,12 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
             g.device_sum(full_w,g.row); g.device_sum(full_w,g.col);
             local_rows<<<(g.nr+255)/256,256>>>(w.p,full_w.p,rows.p,g.nr);
         } else {
-            if (r0<g.nr && c0<g.nc) gemv(h,false,g.nr-r0,g.nc-c0,g.nr,
-                a.p+r0+size_t(c0)*g.nr,vc.p+c0,w.p+r0);
+            if (r0<g.nr && c0<g.nc) {
+                if (fused_av && k) update_av<<<(g.nr-r0+31)/32,dim3(32,8)>>>(a.p,
+                    oldv.p,oldw.p,oldvc.p,oldwc.p,vc.p,w.p,g.nr,g.nc,r0,c0);
+                else gemv(h,false,g.nr-r0,g.nc-c0,g.nr,
+                    a.p+r0+size_t(c0)*g.nr,vc.p+c0,w.p+r0);
+            }
             g.device_sum(w,g.row);
         }
         if (panel>1 && k%panel) {
@@ -597,10 +624,32 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
             if (mr && mc && ((k+1)%panel==0 || k==g.n-2))
                 bulk_gemm(h,false,mr,mc,2*panel,T(-1),u.p+r0,g.nr,cross.p+c0,g.nc,
                     T(1),a.p+r0+size_t(c0)*g.nr,g.nr,true);
-        } else if (mr && mc) local_rank2<<<dim3((mr+127)/128,(mc+1)/2),dim3(128,2)>>>(a.p,v.p,corrected,vc.p,wc.p,g.nr,g.nc,r0,c0,lower_triangle?rows.p:nullptr,cols.p);
+        } else {
+            if (fused_av && k<g.n-2) save_vectors<<<(std::max(g.nr,g.nc)+255)/256,256>>>(
+                oldv.p,oldw.p,oldvc.p,oldwc.p,v.p,corrected,vc.p,wc.p,g.nr,g.nc);
+            else if (mr && mc) local_rank2<<<dim3((mr+127)/128,(mc+1)/2),dim3(128,2)>>>(a.p,v.p,corrected,vc.p,wc.p,g.nr,g.nc,r0,c0,lower_triangle?rows.p:nullptr,cols.p);
+        }
         HIP(hipGetLastError());
     }
     d=dd.get(); e=ee.get(); tau=tt.get();
+}
+
+template<class T> __global__ void matrix_max(const T* a, size_t n, double* out) {
+    __shared__ double partial[256];
+    int t=threadIdx.x; double value=0;
+    for (size_t i=blockIdx.x*size_t(blockDim.x)+t;i<n;i+=size_t(gridDim.x)*blockDim.x)
+        value=fmax(value,fabs(double(a[i])));
+    partial[t]=value; __syncthreads();
+    for (int stride=128;stride;stride/=2) {
+        if (t<stride) partial[t]=fmax(partial[t],partial[t+stride]);
+        __syncthreads();
+    }
+    if (!t) out[blockIdx.x]=partial[0];
+}
+
+template<class T> __global__ void matrix_scale(T* a, size_t n, int exponent) {
+    size_t i=blockIdx.x*size_t(blockDim.x)+threadIdx.x;
+    if (i<n) a[i]=T(scalbn(double(a[i]),exponent));
 }
 
 template<class T> Phases custom(Grid& g, rocblas_handle h, Device<T>& a,
@@ -614,6 +663,16 @@ template<class T> Phases custom(Grid& g, rocblas_handle h, Device<T>& a,
     HIP(hipMemset(vy.p,0,vy.n*sizeof(T)));
     std::vector<double> d(g.n), e(g.n,0), tau(g.n-1);
     double start=g.tick();
+    int groups=std::min<size_t>(1024,(a.n+255)/256), exponent=0;
+    Device<double> maxima(groups);
+    matrix_max<<<groups,256>>>(a.p,a.n,maxima.p);
+    auto local_maxima=maxima.get();
+    double maximum=*std::max_element(local_maxima.begin(),local_maxima.end());
+    double clock=MPI_Wtime();
+    MPI(MPI_Allreduce(MPI_IN_PLACE,&maximum,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD));
+    g.comm+=MPI_Wtime()-clock;
+    std::frexp(maximum,&exponent);
+    if (exponent) matrix_scale<<<(a.n+255)/256,256>>>(a.p,a.n,-exponent);
     if (device_vectors) reduce_device_vectors(g,h,a,dr,dc,d,e,tau,panel);
     else for (int k=0;k<g.n-1;++k) {
         if (panel>1) {
@@ -692,7 +751,7 @@ template<class T> Phases custom(Grid& g, rocblas_handle h, Device<T>& a,
     d.back()=column(g,a,g.n-1).back();
     times.reduction=g.tick()-start;
     // Distributed tridiagonal eigensolution. Only O(n) d/e are replicated.
-    std::vector<double> z(size_t(g.nr)*g.nc);
+    std::vector<double> z(tridiag=="elpa32" ? 0 : size_t(g.nr)*g.nc);
     if (tridiag=="elpa") times.retile=tridiagonal_elpa<double>(g,d,e,z);
     else if (tridiag=="mrrr") times.retile=tridiagonal_mrrr<double>(g,d,e,z);
     else if (tridiag=="mrrr32") {
@@ -701,7 +760,11 @@ template<class T> Phases custom(Grid& g, rocblas_handle h, Device<T>& a,
     }
     else if (tridiag=="elpa32") {
         if constexpr(std::is_same_v<T,double>) throw std::runtime_error("elpa32 requires FP32 dense state");
-        times.retile=tridiagonal_elpa<float>(g,d,e,z);
+        else {
+            std::vector<T> zf(size_t(g.nr)*g.nc);
+            times.retile=tridiagonal_elpa<T>(g,d,e,zf);
+            q.put(zf);
+        }
     }
     else {
         int one=1, info=0, lw=-1, liw=-1, iwq=0; double wq=0;
@@ -713,7 +776,8 @@ template<class T> Phases custom(Grid& g, rocblas_handle h, Device<T>& a,
         if (info) throw std::runtime_error("pdstedc: "+std::to_string(info));
     }
     eval=d;
-    std::vector<T> zt(z.begin(),z.end()); q.put(zt);
+    for (double& value:eval) value=std::scalbn(value,exponent);
+    if (tridiag!="elpa32") q.put(std::vector<T>(z.begin(),z.end()));
     double middle=g.tick(); times.tridiag=middle-start-times.reduction;
     // Q = H_0 H_1 ... H_(n-2) Z: left multiplication in reverse order.
     if (back_block>1) backtransform(g,h,a,q,tau,back_block);
@@ -807,9 +871,9 @@ elpa_t elpa_handle(Grid& g, int solver, int bandwidth=0) {
 void elpa_release(elpa_t e) {
     int error; elpa_deallocate(e,&error); elpa_check(error); elpa_uninit(&error); elpa_check(error);
 }
-template<class T> double tridiagonal_elpa(Grid& g, std::vector<double>& d, std::vector<double>& e, std::vector<double>& z) {
+template<class T> double tridiagonal_elpa(Grid& g, std::vector<double>& d, std::vector<double>& e, std::vector<T>& z) {
     Grid& target=tridiagonal_grid ? *tridiagonal_grid : g;
-    std::vector<double> local_z;
+    std::vector<T> local_z;
     if (tridiagonal_grid) local_z.resize(size_t(target.nr)*target.nc);
     auto& output=tridiagonal_grid ? local_z : z;
     auto handle=elpa_handle(target,ELPA_SOLVER_1STAGE);
@@ -817,9 +881,9 @@ template<class T> double tridiagonal_elpa(Grid& g, std::vector<double>& d, std::
     // This public component accepts HOST arrays and stages its distributed GPU work internally.
     if constexpr(std::is_same_v<T,double>) elpa_solve_tridiagonal_d(handle,d.data(),e.data(),output.data(),&error);
     else {
-        std::vector<float> df(d.begin(),d.end()), ef(e.begin(),e.end()), zf(output.size());
-        elpa_solve_tridiagonal_f(handle,df.data(),ef.data(),zf.data(),&error);
-        d.assign(df.begin(),df.end()); output.assign(zf.begin(),zf.end());
+        std::vector<float> df(d.begin(),d.end()), ef(e.begin(),e.end());
+        elpa_solve_tridiagonal_f(handle,df.data(),ef.data(),output.data(),&error);
+        d.assign(df.begin(),df.end());
     }
     if (elpa_times) {
         std::string name=std::string("elpa_solve_tridi_public_real_")+(std::is_same_v<T,double>?"double":"single");
@@ -830,8 +894,10 @@ template<class T> double tridiagonal_elpa(Grid& g, std::vector<double>& d, std::
     if (tridiagonal_grid) {
         int one=1;
         double begin=MPI_Wtime();
-        pdgemr2d_(&g.n,&g.n,output.data(),&one,&one,target.desc,
-                  z.data(),&one,&one,g.desc,&g.ctxt);
+        if constexpr(std::is_same_v<T,double>) pdgemr2d_(&g.n,&g.n,output.data(),&one,&one,target.desc,
+            z.data(),&one,&one,g.desc,&g.ctxt);
+        else psgemr2d_(&g.n,&g.n,output.data(),&one,&one,target.desc,
+            z.data(),&one,&one,g.desc,&g.ctxt);
         retile=g.maximum(MPI_Wtime()-begin);
     }
     return retile;
@@ -1151,6 +1217,8 @@ int main(int argc,char** argv) {
         jacobi_sweeps=std::stoi(arg("--jacobi-sweeps","8"));
         jacobi_tol=std::stod(arg("--jacobi-tol",precision=="fp64"?"1e-13":"2e-6"));
         jacobi_pivot64=arg("--jacobi-pivot64","0")=="1";
+        jacobi_local=arg("--jacobi-local","dc");
+        if (jacobi_local!="dc" && jacobi_local!="jacobi") throw std::runtime_error("jacobi-local must be dc or jacobi");
         std::string input_file=arg("--input","");
         basis_file=arg("--export-basis","");
         torch_reference=arg("--torch-reference","");
@@ -1171,6 +1239,9 @@ int main(int argc,char** argv) {
         bf16_bulk=std::stoi(arg("--bf16-bulk","0"));
         device_vectors=arg("--device-vectors","0")=="1";
         lower_triangle=arg("--lower-triangle","0")=="1";
+        fused_av=arg("--fused-av","0")=="1";
+        if (fused_av && (!device_vectors || lower_triangle || std::stoi(arg("--panel","1"))!=1))
+            throw std::runtime_error("--fused-av requires --device-vectors 1 --panel 1 and full triangle");
         if (lower_triangle && (!device_vectors || std::stoi(arg("--panel","1"))!=1))
             throw std::runtime_error("--lower-triangle requires --device-vectors 1 --panel 1");
         if (device_vectors && (arg("--rccl","0")!="1" || arg("--gpu-mpi","0")!="1" ||
