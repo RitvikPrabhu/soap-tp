@@ -279,6 +279,7 @@ Hypothesis: the GPU-resident path pays collective and kernel latency for separat
 
 - Snapshot `fused-eigh` SHA4628d316d3b5385a7cc162c5c5b9ecd0fd9da09800f7e32510179a7adff4c5b7. Tiny31 random/lowrank/diagonal/indefinite FP64/32 all pass; random residual6.51e-16/1.71e-7 and orthogonality6.61e-15/2.12e-6. Not yet a measured performance selection.
 - `fused` suite gates uneven rectangular ownership and four matrix families, then pairs the frozen `twod-eigh` control with this candidate on three8192 grids and tests16384/main1x8→tri8x1. The allgather increases scalar payload slightly, so latency reduction is a hypothesis to measure rather than a guaranteed win.
+- Job5736836 COMPLETED6m57 onfrontier01244; all26 cases passed. **Keep fusion**: paired8192 warm medians FP64/32 before→after:1x8→tri8x1 2.551→2.219 /2.112→1.770s;2x4 3.919→3.458 /3.172→2.732s;4x2 3.559→3.185 /2.633→2.167s. At16384/main1x8→tri8x1 warm9.429/6.257s; final FP64 phases7.280/1.426/.697s and FP32 4.819/.911/.441s. FP64 residual3.79e-15/orth1.79e-12/spectrum1.65e-15; FP32 1.98e-6/.000898/5.79e-7. Norm fusion changes reduction, not the dominant asymptotic GEMV work.
 
 ### E20: fuse row/column vector transformations (candidate)
 
@@ -309,3 +310,10 @@ Hypothesis: broadcast the owner GPU's matrix column directly into V, and store t
 
 - Snapshot `direct-eigh` SHAc7f313e14282f2e37cab2629269871e609077284692ceac70a07511280076801. Tiny31 four families/both precisions pass with identical numerical metrics to the norm-fused control. `direct` suite will gate97 rectangles/families then compare `fused-eigh`, `vector-fusion-eigh`, and `direct-eigh` on the same node, isolating E20 and E22 separately. Not yet a performance selection.
 - E19 job **5736836** currently running; all12 correctness gates passed. Initial paired8192 FP64 main1x8→tri8x1 warm2.551→2.219s confirms scalar-collective fusion helps. Full FP32/16384 outcomes pending. This justifies continuing launch/collective overhead work rather than implementing a speculative new eigensolver stage.
+
+### E23: form scalar coefficients inside the vector kernel (candidate)
+
+Hypothesis: a separate one-thread kernel solely merging a few gathered norm statistics adds another launch dependency. Merge those statistics once per vector CTA in shared memory, with only CTA0 publishing d/e/tau. Each CTA computes the same tiny robust scalar problem; no cross-CTA barrier or global scalar read is needed during vector formation. Later kernels read tau only after this kernel completes. One kernel/name and one scalar workspace entry disappear.
+
+- Snapshot `merged-eigh` SHA75c673ccedcf8e9435588345cf7eda83b6d12d4c26798570b113030d6b8bd969. Tiny31 four families/both precisions pass with unchanged metrics. Batch `merged` will gate uneven rectangles, pair direct→merged at8192, test16384, refresh1/2/4/8G scaling and same-node fullELPA1 controls. No performance claim yet.
+- Job **5736889**,14min, `direct` suite onfrontier02621 currently compares E20/E22 frozen snapshots. No snapshots are rebuilt while jobs use them.

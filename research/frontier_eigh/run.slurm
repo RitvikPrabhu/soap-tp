@@ -363,10 +363,11 @@ elif [[ $1 == twod ]]; then
             run 8 --n 16384 --block 64 --pr "$pr" --pc "$pc" --tri-pr "$tri_pr" --precision "$precision" --tridiag "$tridiag" --back-block 128 --gpu-mpi 1 --rccl 1 --device-vectors "$vectors" --repeat 3 --reference 1
         done
     done
-elif [[ $1 == fused || $1 == vector-fusion || $1 == direct ]]; then
+elif [[ $1 == fused || $1 == vector-fusion || $1 == direct || $1 == merged ]]; then
     binaries=(twod-eigh fused-eigh)
     [[ $1 == vector-fusion ]] && binaries=(fused-eigh vector-fusion-eigh)
     [[ $1 == direct ]] && binaries=(fused-eigh vector-fusion-eigh direct-eigh)
+    [[ $1 == merged ]] && binaries=(direct-eigh merged-eigh)
     for grid in '1 8' '2 4' '4 2' '8 1'; do
         read -r pr pc <<< "$grid"
         for precision in fp64 fp32; do
@@ -389,6 +390,18 @@ elif [[ $1 == fused || $1 == vector-fusion || $1 == direct ]]; then
         done
         run 8 --n 16384 --block 64 --pr 1 --pc 8 --tri-pr 8 --precision "$precision" --tridiag "$tridiag" --back-block 128 --gpu-mpi 1 --rccl 1 --device-vectors 1 --repeat 3 --reference 1
     done
+    if [[ $1 == merged ]]; then
+        for precision in fp64 fp32; do
+            tridiag=elpa
+            [[ $precision == fp32 ]] && tridiag=elpa32
+            for ranks in 1 2 4; do
+                run "$ranks" --n 8192 --block 64 --pr 1 --pc "$ranks" --tri-pr "$ranks" --precision "$precision" --tridiag "$tridiag" --back-block 128 --gpu-mpi 1 --rccl 1 --device-vectors 1 --repeat 3 --reference 1
+            done
+            for n in 8192 16384; do
+                run 8 --n "$n" --block 64 --pr 4 --pc 2 --solver elpa1 --precision "$precision" --repeat 3 --reference 1
+            done
+        done
+    fi
 elif [[ $1 == soap ]]; then
     # Independent singleton MPI solves, restricted to tiny correctness examples on one GCD.
     export ROCR_VISIBLE_DEVICES=0
