@@ -829,6 +829,24 @@ elif [[ $1 == rccl-tune ]]; then
             echo "RCCL_CHECK FAILED config=$config"
         fi
     done
+elif [[ $1 == loop3-graph ]]; then
+    EIGH_BIN=build/custom-eigh/graph-eigh
+    for grid in '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for mode in fp64 fp32 split; do
+            precision=fp32; tri=elpa32; half=0
+            if [[ $mode == fp64 ]]; then precision=fp64; tri=elpa; fi
+            if [[ $mode == split ]]; then half=2; fi
+            run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --tri-pr 8 --precision "$precision" --tridiag "$tri" --matrix indefinite --panel 7 --back-block 13 --half-bulk "$half" --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --graph-reduction 1
+        done
+    done
+    for n in 2048 8192; do
+        for graph in 0 1; do
+            for half in 0 2; do
+                run 8 --n "$n" --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --panel 1 --back-block 256 --half-bulk "$half" --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --graph-reduction "$graph" --repeat 3 --reference 1
+            done
+        done
+    done
 elif [[ $1 == case ]]; then
     shift
     ranks=$1; shift
