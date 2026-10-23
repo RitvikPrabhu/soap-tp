@@ -363,6 +363,29 @@ elif [[ $1 == twod ]]; then
             run 8 --n 16384 --block 64 --pr "$pr" --pc "$pc" --tri-pr "$tri_pr" --precision "$precision" --tridiag "$tridiag" --back-block 128 --gpu-mpi 1 --rccl 1 --device-vectors "$vectors" --repeat 3 --reference 1
         done
     done
+elif [[ $1 == fused ]]; then
+    for grid in '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --precision "$precision" --back-block 13 --device-vectors 1 --gpu-mpi 1 --rccl 1
+        done
+    done
+    for matrix in diagonal lowrank indefinite clustered; do
+        run 8 --n 97 --block 8 --pr 2 --pc 4 --matrix "$matrix" --precision fp64 --back-block 13 --device-vectors 1 --gpu-mpi 1 --rccl 1
+    done
+    for precision in fp64 fp32; do
+        tridiag=elpa
+        [[ $precision == fp32 ]] && tridiag=elpa32
+        for grid in '1 8' '2 4' '4 2'; do
+            read -r pr pc <<< "$grid"
+            tri_pr=$pr
+            [[ $pr == 1 ]] && tri_pr=8
+            for binary in twod-eigh fused-eigh; do
+                EIGH_BIN=build/custom-eigh/$binary run 8 --n 8192 --block 64 --pr "$pr" --pc "$pc" --tri-pr "$tri_pr" --precision "$precision" --tridiag "$tridiag" --back-block 128 --gpu-mpi 1 --rccl 1 --device-vectors 1 --repeat 3 --reference 1
+            done
+        done
+        run 8 --n 16384 --block 64 --pr 1 --pc 8 --tri-pr 8 --precision "$precision" --tridiag "$tridiag" --back-block 128 --gpu-mpi 1 --rccl 1 --device-vectors 1 --repeat 3 --reference 1
+    done
 elif [[ $1 == soap ]]; then
     # Independent singleton MPI solves, restricted to tiny correctness examples on one GCD.
     export ROCR_VISIBLE_DEVICES=0

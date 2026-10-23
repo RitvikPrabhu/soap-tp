@@ -293,50 +293,64 @@ template<class T> void backtransform(Grid& g, rocblas_handle h, Device<T>& a,
     }
 }
 
-// One block per scalar reduction: FP64 accumulation, including for FP32 state.
-template<class T, int Stage> __global__ void vector_scalar(const T* v, T* w,
-    const int* rows, int nr, int k, double* s, double* d, double* e, double* tau) {
+// Gather local scaled norm pairs once, rather than globally reducing max then sum.
+template<class T> __global__ void local_statistics(const T* v, int nr, int tail,
+    int diagonal, int alpha, double* s) {
     __shared__ double partial[256];
+    __shared__ double scale;
     int t=threadIdx.x;
     double x=0;
-    for (int i=t;i<nr;i+=256) {
-        int r=rows[i];
-        if constexpr(Stage==0) { if (r>k+1) x=fmax(x,fabs(double(v[i]))); }
-        if constexpr(Stage==1) { if (r>k+1 && s[0]!=0) { double y=double(v[i])/s[0]; x+=y*y; } }
-        if constexpr(Stage==2) {
-            w[i]=r>k ? T(tau[k]*double(w[i])) : T(0);
-            x+=double(v[i])*double(w[i]);
-        }
-    }
+    for (int i=tail+t;i<nr;i+=256) x=fmax(x,fabs(double(v[i])));
     partial[t]=x; __syncthreads();
     for (int stride=128;stride;stride/=2) {
-        if (t<stride) {
-            if constexpr(Stage==0) partial[t]=fmax(partial[t],partial[t+stride]);
-            else partial[t]+=partial[t+stride];
-        }
+        if (t<stride) partial[t]=fmax(partial[t],partial[t+stride]);
+        __syncthreads();
+    }
+    if (!t) scale=partial[0];
+    __syncthreads();
+    x=0;
+    if (scale!=0) for (int i=tail+t;i<nr;i+=256) { double y=double(v[i])/scale; x+=y*y; }
+    partial[t]=x; __syncthreads();
+    for (int stride=128;stride;stride/=2) {
+        if (t<stride) partial[t]+=partial[t+stride];
         __syncthreads();
     }
     if (!t) {
-        if constexpr(Stage==0) s[0]=partial[0];
-        else if constexpr(Stage==1) {
-            s[1]=partial[0]; s[2]=0; s[3]=0;
-            int lo=0, hi=nr;
-            while (lo<hi) {
-                int mid=(lo+hi)/2;
-                if (rows[mid]<k) lo=mid+1;
-                else hi=mid;
-            }
-            if (lo<nr && rows[lo]==k) { s[3]=double(v[lo]); ++lo; }
-            if (lo<nr && rows[lo]==k+1) s[2]=double(v[lo]);
-        } else s[4]=partial[0];
+        s[0]=scale; s[1]=partial[0];
+        s[2]=alpha<0 ? 0 : double(v[alpha]);
+        s[3]=diagonal<0 ? 0 : double(v[diagonal]);
     }
 }
 
-__global__ void reflector_scalar(double* s, double* d, double* e, double* tau, int k) {
-    double norm=s[0]*sqrt(s[1]), alpha=s[2];
+__global__ void reflector_scalar(const double* gathered, int pr, double* s,
+    double* d, double* e, double* tau, int k) {
+    double scale=0, sum=0, alpha=0, diagonal=0;
+    for (int r=0;r<pr;++r) scale=fmax(scale,gathered[4*r]);
+    for (int r=0;r<pr;++r) {
+        double ratio=scale!=0 ? gathered[4*r]/scale : 0;
+        sum+=gathered[4*r+1]*ratio*ratio;
+        alpha+=gathered[4*r+2]; diagonal+=gathered[4*r+3];
+    }
+    double norm=scale*sqrt(sum);
     double beta=norm!=0 ? -copysign(hypot(alpha,norm),alpha) : alpha;
-    d[k]=s[3]; e[k]=beta; tau[k]=norm!=0 ? (beta-alpha)/beta : 0;
+    d[k]=diagonal; e[k]=beta; tau[k]=norm!=0 ? (beta-alpha)/beta : 0;
     s[5]=alpha-beta;
+}
+
+template<class T> __global__ void vector_dot(const T* v, T* w, int nr, int start,
+    int k, double* s, const double* tau) {
+    __shared__ double partial[256];
+    int t=threadIdx.x;
+    double dot=0;
+    for (int i=start+t;i<nr;i+=256) {
+        w[i]=T(tau[k]*double(w[i])); dot+=double(v[i])*double(w[i]);
+    }
+    partial[t]=dot; __syncthreads();
+    for (int stride=128;stride;stride/=2) {
+        if (t<stride) partial[t]+=partial[t+stride];
+        __syncthreads();
+    }
+    if (!t) s[4]=partial[0];
 }
 
 template<class T> __global__ void form_vector(T* v, const int* rows, int nr,
@@ -377,7 +391,7 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
     std::vector<double>& e, std::vector<double>& tau) {
     int padded=((g.n+g.b*g.pr-1)/(g.b*g.pr))*g.b;
     Device<T> v(padded), w(padded), vc(g.nc), wc(g.nc), packed(size_t(padded)*g.pr);
-    Device<double> scalars(6), dd(g.n), ee(g.n), tt(g.n-1);
+    Device<double> scalars(6), statistics(4*g.pr), dd(g.n), ee(g.n), tt(g.n-1);
     HIP(hipMemsetAsync(dd.p,0,dd.n*sizeof(double)));
     HIP(hipMemsetAsync(ee.p,0,ee.n*sizeof(double)));
     auto transpose=[&](Device<T>& local, Device<T>& out) {
@@ -386,30 +400,29 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
         g.comm+=MPI_Wtime()-clock;
         unpack_vector<<<(g.nc+255)/256,256>>>(out.p,packed.p,cols.p,g.nc,g.b,g.pr,padded);
     };
-    auto reduce=[&](double* p, int count, ncclRedOp_t op) {
-        double clock=MPI_Wtime();
-        CCL(ncclAllReduce(p,p,count,ncclFloat64,op,g.ccl_col,nullptr));
-        g.comm+=MPI_Wtime()-clock;
-    };
     for (int k=0;k<g.n-1;++k) {
         int owner=(k/g.b)%g.pc;
         if (g.c==owner) HIP(hipMemcpyAsync(v.p,a.p+size_t(g.li(k,g.pc))*g.nr,g.nr*sizeof(T),hipMemcpyDeviceToDevice));
         g.device_bcast(v.p,g.nr,owner,g.row);
-        vector_scalar<T,0><<<1,256>>>(v.p,w.p,rows.p,g.nr,k,scalars.p,dd.p,ee.p,tt.p);
-        reduce(scalars.p,1,ncclMax);
-        vector_scalar<T,1><<<1,256>>>(v.p,w.p,rows.p,g.nr,k,scalars.p,dd.p,ee.p,tt.p);
-        reduce(scalars.p+1,3,ncclSum);
-        reflector_scalar<<<1,1>>>(scalars.p,dd.p,ee.p,tt.p,k);
+        int r0=std::upper_bound(g.rows.begin(),g.rows.end(),k)-g.rows.begin();
+        int c0=std::upper_bound(g.cols.begin(),g.cols.end(),k)-g.cols.begin();
+        int diagonal=(k/g.b)%g.pr==g.r ? g.li(k,g.pr) : -1;
+        int alpha=((k+1)/g.b)%g.pr==g.r ? g.li(k+1,g.pr) : -1;
+        local_statistics<<<1,256>>>(v.p,g.nr,r0+(alpha>=0),diagonal,alpha,scalars.p);
+        double clock=MPI_Wtime();
+        CCL(ncclAllGather(scalars.p,statistics.p,4,ncclFloat64,g.ccl_col,nullptr));
+        g.comm+=MPI_Wtime()-clock;
+        reflector_scalar<<<1,1>>>(statistics.p,g.pr,scalars.p,dd.p,ee.p,tt.p,k);
         form_vector<<<(padded+255)/256,256>>>(v.p,rows.p,g.nr,padded,k,scalars.p,tt.p);
         transpose(v,vc);
         HIP(hipMemsetAsync(w.p,0,padded*sizeof(T)));
-        int r0=std::upper_bound(g.rows.begin(),g.rows.end(),k)-g.rows.begin();
-        int c0=std::upper_bound(g.cols.begin(),g.cols.end(),k)-g.cols.begin();
         if (r0<g.nr && c0<g.nc) gemv(h,false,g.nr-r0,g.nc-c0,g.nr,
             a.p+r0+size_t(c0)*g.nr,vc.p+c0,w.p+r0);
         g.device_sum(w,g.row);
-        vector_scalar<T,2><<<1,256>>>(v.p,w.p,rows.p,g.nr,k,scalars.p,dd.p,ee.p,tt.p);
-        reduce(scalars.p+4,1,ncclSum);
+        vector_dot<<<1,256>>>(v.p,w.p,g.nr,r0,k,scalars.p,tt.p);
+        clock=MPI_Wtime();
+        CCL(ncclAllReduce(scalars.p+4,scalars.p+4,1,ncclFloat64,ncclSum,g.ccl_col,nullptr));
+        g.comm+=MPI_Wtime()-clock;
         correct_w<<<(padded+255)/256,256>>>(w.p,v.p,padded,scalars.p,tt.p,k);
         transpose(w,wc);
         int mr=g.nr-r0, mc=g.nc-c0;

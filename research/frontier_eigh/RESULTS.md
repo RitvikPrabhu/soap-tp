@@ -270,3 +270,10 @@ Hypothesis: rank2 is the second-largest custom compute kernel in the trace. Its 
 
 - Snapshot `twod-eigh` SHAe7984d83d8509a4ec0601a0c3cb8d250306e533c1bbf6bb78868b6528f2428b6. Tiny2/31, FP64/32, CPU/GPU vectors all pass; FP32 random residual1.71e-7/orth2.12e-6. No performance claim yet.
 - Job5736758 submitted12min, suite `twod`:16 uneven rectangular checks, paired8192 CPU4x2/GPU1x8→tri8x1 against `basis-eigh`, then16384 updated candidates in both precisions with full ELPA2 reference. Latest source changes affect only rank2 indexing; frozen precision-study binary remains unchanged.
+
+### E19: gather scaled norm statistics once (candidate)
+
+Hypothesis: the GPU-resident path pays collective and kernel latency for separate maximum and scaled-sum reductions. Compute a local max/SSQ pair, gather four scalars per process row (scale, SSQ, unique alpha, unique diagonal), and merge robustly on the GPU. This removes one collective and one kernel per reflector without using an unsafe unscaled norm. CPU ownership arithmetic replaces GPU scalar searches; the dot kernel visits only active rows.
+
+- Snapshot `fused-eigh` SHA4628d316d3b5385a7cc162c5c5b9ecd0fd9da09800f7e32510179a7adff4c5b7. Tiny31 random/lowrank/diagonal/indefinite FP64/32 all pass; random residual6.51e-16/1.71e-7 and orthogonality6.61e-15/2.12e-6. Not yet a measured performance selection.
+- `fused` suite gates uneven rectangular ownership and four matrix families, then pairs the frozen `twod-eigh` control with this candidate on three8192 grids and tests16384/main1x8→tri8x1. The allgather increases scalar payload slightly, so latency reduction is a hypothesis to measure rather than a guaranteed win.
