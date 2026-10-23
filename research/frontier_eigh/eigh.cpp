@@ -18,6 +18,7 @@
 #include <type_traits>
 #include <vector>
 #include "half_fused.hpp"
+#include "gemv.hpp"
 
 extern "C" {
 void Cblacs_get(int, int, int*);
@@ -180,13 +181,35 @@ template<class T> void gemv(rocblas_handle h, bool trans, int m, int n, int lda,
     else BLAS(rocblas_sgemv(h,op,m,n,&alpha,a,lda,x,1,&beta,y,1));
 }
 
+int panel_solution=0;
+size_t panel_selected=0, panel_default=0;
 template<class T> void gemm(rocblas_handle h, bool trans, int m, int n, int k,
     T alpha, T* a, int lda, T* b, int ldb, T beta, T* c, int ldc, bool transb=false) {
     auto op=trans?rocblas_operation_transpose:rocblas_operation_none;
     auto opb=transb?rocblas_operation_transpose:rocblas_operation_none;
     if constexpr(std::is_same_v<T,double>) BLAS(rocblas_dgemm(h,op,opb,
         m,n,k,&alpha,a,lda,b,ldb,&beta,c,ldc));
-    else BLAS(rocblas_sgemm(h,op,opb,m,n,k,&alpha,a,lda,b,ldb,&beta,c,ldc));
+    else {
+        if (panel_solution && !trans && transb) {
+            // Shrinking/edge panels need not satisfy the tuned kernel's predicates.
+            // The check flag tests support without launching or modifying C.
+            auto status=rocblas_gemm_ex(h,op,opb,m,n,k,&alpha,a,rocblas_datatype_f32_r,lda,
+                b,rocblas_datatype_f32_r,ldb,&beta,c,rocblas_datatype_f32_r,ldc,
+                c,rocblas_datatype_f32_r,ldc,rocblas_datatype_f32_r,
+                rocblas_gemm_algo_solution_index,panel_solution,rocblas_gemm_flags_check_solution_index);
+            if (status==rocblas_status_success) {
+                BLAS(rocblas_gemm_ex(h,op,opb,m,n,k,&alpha,a,rocblas_datatype_f32_r,lda,
+                    b,rocblas_datatype_f32_r,ldb,&beta,c,rocblas_datatype_f32_r,ldc,
+                    c,rocblas_datatype_f32_r,ldc,rocblas_datatype_f32_r,
+                    rocblas_gemm_algo_solution_index,panel_solution,0));
+                ++panel_selected;
+                return;
+            }
+            if (status!=rocblas_status_invalid_value) BLAS(status);
+            ++panel_default;
+        }
+        BLAS(rocblas_sgemm(h,op,opb,m,n,k,&alpha,a,lda,b,ldb,&beta,c,ldc));
+    }
 }
 
 int half_bulk=0, bf16_bulk=0;
@@ -195,10 +218,10 @@ bool elpa_times=false;
 int band_width=0;
 bool device_vectors=false;
 bool lower_triangle=false;
+bool use_tiled_gemv=false;
 int jacobi_sweeps=8;
 double jacobi_tol=0;
 bool jacobi_pivot64=false;
-int jacobi_refinement=0;
 std::string jacobi_local="dc";
 Grid* tridiagonal_grid=nullptr;
 std::vector<double> supplied_matrix;
@@ -519,6 +542,7 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
     int padded=((g.n+g.b*g.pr-1)/(g.b*g.pr))*g.b;
     Device<T> v(padded), w(padded), vc(g.nc), wc(g.nc), packed(size_t(padded)*g.pr);
     Device<T> full_w(lower_triangle ? g.n : 1);
+    Device<T> gemv_partials(use_tiled_gemv ? size_t(g.nr)*((g.nc+255)/256) : 1);
     Device<T> u(size_t(g.nr)*2*panel), cross(size_t(g.nc)*2*panel), coeff(2*panel);
     Device<double> scalars(6), statistics(4*g.pr), dd(g.n), ee(g.n), tt(g.n-1);
     HIP(hipMemsetAsync(dd.p,0,dd.n*sizeof(double)));
@@ -565,8 +589,12 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
             g.device_sum(full_w,g.row); g.device_sum(full_w,g.col);
             local_rows<<<(g.nr+255)/256,256>>>(w.p,full_w.p,rows.p,g.nr);
         } else {
-            if (r0<g.nr && c0<g.nc) gemv(h,false,g.nr-r0,g.nc-c0,g.nr,
-                a.p+r0+size_t(c0)*g.nr,vc.p+c0,w.p+r0);
+            if (r0<g.nr && c0<g.nc) {
+                if (use_tiled_gemv) tiled_gemv::launch(g.nr-r0,g.nc-c0,
+                    a.p+r0+size_t(c0)*g.nr,g.nr,vc.p+c0,w.p+r0,gemv_partials.p);
+                else gemv(h,false,g.nr-r0,g.nc-c0,g.nr,
+                    a.p+r0+size_t(c0)*g.nr,vc.p+c0,w.p+r0);
+            }
             g.device_sum(w,g.row);
         }
         if (panel>1 && k%panel) {
@@ -1037,6 +1065,7 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
     Phases phases;
     double total=0;
     for (int trial=0;trial<repeat;++trial) {
+        panel_selected=panel_default=0;
         a.put(at); g.comm=0; device_peak_bytes=device_live_bytes; double start=g.tick();
         if (solver=="custom") phases=band_width ? custom_band(g,h,a,q,eval,back_block) : custom(g,h,a,q,eval,back_block,panel,tridiag);
         else if (solver=="jacobi") {
@@ -1058,10 +1087,11 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
         } else throw std::runtime_error("unknown solver");
         total=g.maximum(g.tick()-start);
         double peak_mib=g.maximum(device_peak_bytes/1048576.);
-        if (g.rank==0) std::printf("TIMING solver=%s trial=%d n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s total=%.9g reduction=%.9g tridiag=%.9g back=%.9g back_block=%d gpu_mpi=%d panel=%d tridiag_backend=%s rccl=%d half_bulk=%d band=%d cpu_qr=%.9g managed_gpu_peak_mib=%.9g device_vectors=%d tridiag_grid=%dx%d retile=%.9g bf16_bulk=%d async_alloc=%d lower_triangle=%d half_panel=%d\n",
+        if (g.rank==0) std::printf("TIMING solver=%s trial=%d n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s total=%.9g reduction=%.9g tridiag=%.9g back=%.9g back_block=%d gpu_mpi=%d panel=%d tridiag_backend=%s rccl=%d half_bulk=%d band=%d cpu_qr=%.9g managed_gpu_peak_mib=%.9g device_vectors=%d tridiag_grid=%dx%d retile=%.9g bf16_bulk=%d async_alloc=%d lower_triangle=%d half_panel=%d tiled_gemv=%d panel_solution=%d\n",
             solver.c_str(),trial,g.n,g.pr,g.pc,g.b,std::is_same_v<T,double>?"fp64":"fp32",name.c_str(),quant.c_str(),total,
             phases.reduction,phases.tridiag,phases.back,back_block,int(g.gpu_mpi),panel,solver=="jacobi"?"jacobi":band_width?"elpa_banded":tridiag.c_str(),int(g.rccl),int(half_bulk),band_width,phases.cpu_qr,peak_mib,int(device_vectors),
-            tridiagonal_grid?tridiagonal_grid->pr:g.pr,tridiagonal_grid?tridiagonal_grid->pc:g.pc,phases.retile,bf16_bulk,int(async_alloc),int(lower_triangle),int(half_panel));
+            tridiagonal_grid?tridiagonal_grid->pr:g.pr,tridiagonal_grid?tridiagonal_grid->pc:g.pc,phases.retile,bf16_bulk,int(async_alloc),int(lower_triangle),int(half_panel),int(use_tiled_gemv),panel_solution);
+        if (!g.rank && panel_solution) std::printf("PANEL_SELECTION trial=%d rank=0 selected=%zu default_unsupported=%zu\n",trial,panel_selected,panel_default);
     }
     double comm=g.maximum(g.comm); g.comm=0;
     auto qt=q.get(); std::vector<double> qd(qt.begin(),qt.end());
@@ -1181,9 +1211,6 @@ int main(int argc,char** argv) {
         jacobi_sweeps=std::stoi(arg("--jacobi-sweeps","8"));
         jacobi_tol=std::stod(arg("--jacobi-tol",precision=="fp64"?"1e-13":"2e-6"));
         jacobi_pivot64=arg("--jacobi-pivot64","0")=="1";
-        jacobi_refinement=std::stoi(arg("--jacobi-refine","0"));
-        if (jacobi_refinement<0 || jacobi_refinement>2 || (jacobi_refinement && jacobi_pivot64))
-            throw std::runtime_error("Jacobi refinement requires 0/1/2 iterations and no --jacobi-pivot64");
         jacobi_local=arg("--jacobi-local","dc");
         if (jacobi_local!="dc" && jacobi_local!="jacobi") throw std::runtime_error("jacobi-local must be dc or jacobi");
         std::string input_file=arg("--input","");
@@ -1205,8 +1232,15 @@ int main(int argc,char** argv) {
         half_bulk=std::stoi(arg("--half-bulk","0"));
         half_panel=arg("--half-panel","0")=="1";
         bf16_bulk=std::stoi(arg("--bf16-bulk","0"));
+        panel_solution=std::stoi(arg("--panel-solution","0"));
+        if (panel_solution && (precision!="fp32" || half_panel || half_bulk || bf16_bulk ||
+            band_width || arg("--solver","custom")!="custom" || std::stoi(arg("--panel","1"))<=1))
+            throw std::runtime_error("--panel-solution requires custom native FP32 with panel>1");
         device_vectors=arg("--device-vectors","0")=="1";
         lower_triangle=arg("--lower-triangle","0")=="1";
+        use_tiled_gemv=arg("--tiled-gemv","0")=="1";
+        if (use_tiled_gemv && (!device_vectors || lower_triangle))
+            throw std::runtime_error("--tiled-gemv requires GPU vectors and full-triangle state");
         if (half_panel && (precision!="fp32" || band_width || arg("--solver","custom")!="custom" ||
             bf16_bulk || std::stoi(arg("--panel","1"))<=1 || std::stoi(arg("--panel","1"))>32))
             throw std::runtime_error("--half-panel requires custom FP32, panel 2..32, no band/BF16");

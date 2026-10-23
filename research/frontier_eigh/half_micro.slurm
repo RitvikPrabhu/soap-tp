@@ -37,6 +37,11 @@ while read -r lib; do
     realpath "$lib"; sha256sum "$lib"
 done < <(ldd "$HALF_MICRO_BIN" | awk '/librocblas|libamdhip64|libhipblaslt/ {print $3}')
 env | sort | grep -E '^(ROCBLAS|TENSILE|HIP|ROCR|ROCM|HSA|SLURM|LD_LIBRARY_PATH)' || true
+profile=()
+if [[ ${1:-} == --selection-check ]]; then
+    export ROCBLAS_LAYER=13 TENSILE_DB=4
+    profile=(rocprofv3 --kernel-trace --stats -d "output/custom-eigh/selection-$SLURM_JOB_ID" -o selection-check --)
+fi
 set -x
 srun -N1 -n1 --ntasks-per-node=1 -c7 --gpus-per-task=1 --gpu-bind=closest --kill-on-bad-exit=1 \
-    "$HALF_MICRO_BIN" --warmup 3 --repeat 10 "$@"
+    "${profile[@]}" "$HALF_MICRO_BIN" --warmup 3 --repeat 10 "$@"

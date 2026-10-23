@@ -848,6 +848,7 @@ elif [[ $1 == loop3-graph ]]; then
         done
     done
 elif [[ $1 == loop3-refine ]]; then
+    EIGH_BIN=build/custom-eigh/refine-normalized-eigh
     for grid in '2 4' '4 2'; do
         read -r pr pc <<< "$grid"
         for matrix in lowrank random indefinite clustered diagonal zero; do
@@ -873,6 +874,39 @@ elif [[ $1 == loop3-half-panel ]]; then
         for fused in 0 1; do
             run 8 --n "$n" --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --panel 32 --back-block 256 --half-panel "$fused" --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference "output/custom-eigh/torch-large/n$n"
         done
+    done
+elif [[ $1 == loop3-gemv ]]; then
+    for grid in '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            tri=elpa; if [[ $precision == fp32 ]]; then tri=elpa32; fi
+            for matrix in random indefinite lowrank; do
+                run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --precision "$precision" --matrix "$matrix" --panel 7 --back-block 13 --tiled-gemv 1 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --tridiag "$tri" --tri-pr 8
+            done
+        done
+    done
+    for n in 8192 16384; do
+        panel=1; if [[ $n == 16384 ]]; then panel=32; fi
+        for tiled in 0 1; do
+            for half in 0 2; do
+                run 8 --n "$n" --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --panel "$panel" --back-block 256 --tiled-gemv "$tiled" --half-bulk "$half" --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference "output/custom-eigh/torch-large/n$n"
+            done
+        done
+    done
+elif [[ $1 == loop3-panel-solution ]]; then
+    for grid in '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for matrix in random indefinite lowrank diagonal; do
+            run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --precision fp32 --matrix "$matrix" --panel 7 --back-block 13 --panel-solution -606624864 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --tridiag elpa32 --tri-pr 8
+        done
+    done
+    for n in 8192 16384; do
+        for panel in 16 32; do
+            for solution in 0 -606624864; do
+                run 8 --n "$n" --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --panel "$panel" --back-block 256 --panel-solution "$solution" --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference "output/custom-eigh/torch-large/n$n"
+            done
+        done
+        run 8 --n "$n" --block 64 --pr 4 --pc 2 --precision fp32 --solver elpa1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference "output/custom-eigh/torch-large/n$n"
     done
 elif [[ $1 == case ]]; then
     shift

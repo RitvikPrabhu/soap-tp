@@ -257,6 +257,12 @@ void stats(const Shape& s,const Mode& mode,const char* phase,std::vector<float> 
 struct TuneGemm {
     Case& c; const char* name; int k,la,lb; float alpha,beta;
     const void* a; const void* b; rocblas_datatype type;
+    // Only our exact -1 sentinel means heuristic selection. Returned Tensile
+    // IDs are negative too: preserve their sign/value and use explicit selection.
+    static constexpr rocblas_gemm_algo algorithm(int solution) {
+        return solution==-1?rocblas_gemm_algo_standard:rocblas_gemm_algo_solution_index;
+    }
+    static constexpr int requested_index(int solution) { return solution==-1?0:solution; }
     rocblas_status invoke(int solution,rocblas_int* list=nullptr,rocblas_int* count=nullptr) const {
         auto oa=c.s.ta?rocblas_operation_transpose:rocblas_operation_none;
         auto ob=c.s.tb?rocblas_operation_transpose:rocblas_operation_none;
@@ -266,10 +272,21 @@ struct TuneGemm {
             rocblas_gemm_algo_solution_index,0,list,count);
         return rocblas_gemm_ex(c.h,oa,ob,c.s.m,c.s.n,k,&alpha,a,type,la,b,type,lb,
             &beta,c.c.p,rocblas_datatype_f32_r,c.ldc,c.c.p,rocblas_datatype_f32_r,c.ldc,
-            rocblas_datatype_f32_r,solution<0?rocblas_gemm_algo_standard:rocblas_gemm_algo_solution_index,
-            solution<0?0:solution,0);
+            rocblas_datatype_f32_r,algorithm(solution),requested_index(solution),0);
+    }
+    std::vector<rocblas_int> solutions() const {
+        rocblas_int count=0;
+        BLAS(invoke(-1,nullptr,&count)); // Explicit tuning requires working beta API.
+        if(count<0) throw std::runtime_error("solution query returned negative count");
+        std::vector<rocblas_int> all(count);
+        if(count) { rocblas_int capacity=count; BLAS(invoke(-1,all.data(),&capacity)); }
+        return all;
     }
 };
+static_assert(TuneGemm::algorithm(-1)==rocblas_gemm_algo_standard && TuneGemm::requested_index(-1)==0);
+static_assert(TuneGemm::algorithm(-606618098)==rocblas_gemm_algo_solution_index &&
+              TuneGemm::requested_index(-606618098)==-606618098);
+static_assert(TuneGemm::algorithm(123)==rocblas_gemm_algo_solution_index && TuneGemm::requested_index(123)==123);
 
 // Gather only 12 complete dot products, including corners/interior, for an
 // independent CPU FP64 reference at the exact target shape. Never full FP64 C.
@@ -324,14 +341,8 @@ int tune_one(const TuneGemm& g,int cap,std::chrono::steady_clock::time_point dea
     printf("TUNE_PROBLEM,%s,%s,m=%d,n=%d,k=%d,lda=%d,ldb=%d,ldc=%d,alpha=%.9g,beta=%.9g,input=%s,flags=0\n",
         g.c.s.name,g.name,g.c.s.m,g.c.s.n,g.k,g.la,g.lb,g.c.ldc,g.alpha,g.beta,
         g.type==rocblas_datatype_f16_r?"f16":"f32");
-    rocblas_int count=0;
-    auto status=g.invoke(-1,nullptr,&count);
-    if(status!=rocblas_status_success || count<0) {
-        printf("TUNE_QUERY,%s,%s,status=%d,count=%d,fallback=standard\n",g.c.s.name,g.name,int(status),count);
-        count=0; // Still measure and independently validate the standard call.
-    }
-    std::vector<rocblas_int> all(count);
-    if(count) { rocblas_int capacity=count; BLAS(g.invoke(-1,all.data(),&capacity)); }
+    auto all=g.solutions();
+    int count=all.size();
     Events e;
     auto measure=[&](int id) {
         g.c.reset(); BLAS(g.invoke(id)); HIP(hipDeviceSynchronize()); // warm this exact solution
@@ -362,6 +373,34 @@ int tune_one(const TuneGemm& g,int cap,std::chrono::steady_clock::time_point dea
         g.c.s.name,g.name,count,cap,tried,failed,count-tried-failed,winner,best);
     g.c.reset(); BLAS(g.invoke(winner)); HIP(hipDeviceSynchronize()); validate_tuned(g);
     return winner;
+}
+
+// No event or wall timing. Exactly three labelled GEMM requests, each followed
+// by completion and an independent sampled FP64 product check. Main can profile
+// actual dispatches; labels alone do not establish distinct selected kernels.
+void selection_check(rocblas_handle h) {
+    Case c({"back1_8192",256,1024,8192,true,false,1,0},h,0,true);
+    c.packing(5); HIP(hipDeviceSynchronize());
+    TuneGemm g{c,"concat64",3*c.s.k,3*c.ar,3*c.br,c.s.alpha/4096.f,c.s.beta,
+               c.ah.p,c.bh.p,rocblas_datatype_f16_r};
+    auto ids=g.solutions();
+    if(ids.empty()) throw std::runtime_error("selection-check requires at least one returned solution ID");
+    printf("SELECTION_CHECK,shape=back1_8192,mode=concat64,m=256,n=1024,k=24576,supported=%zu,first=%d,last=%d,no_timing=1\n",
+           ids.size(),int(ids.front()),int(ids.back()));
+    const char* labels[]={"standard","first","last"};
+    int requests[]={-1,ids.front(),ids.back()};
+    for(int q=0;q<3;++q) {
+        int id=requests[q];
+        c.reset(); HIP(hipDeviceSynchronize());
+        printf("SELECTION_REQUEST,label=%s,requested_algo=%d,requested_index=%d,raw_id=%d\n",
+               labels[q],int(TuneGemm::algorithm(id)),TuneGemm::requested_index(id),id);
+        fflush(stdout);
+        BLAS(g.invoke(id)); HIP(hipDeviceSynchronize());
+        validate_tuned(g);
+        printf("SELECTION_COMPLETE,label=%s,requested_index=%d,FP64_sample_check=passed\n",
+               labels[q],TuneGemm::requested_index(id));
+        fflush(stdout);
+    }
 }
 
 void autotune_case(Case& c,int cap,std::chrono::steady_clock::time_point deadline) {
@@ -419,12 +458,13 @@ void stats(const Shape& s,const Mode& mode,const char* phase,std::vector<float> 
         (phase==std::string("pack") || phase==std::string("C_reset_wall_separate"))?0.:2.*s.m*s.n*s.k/(median*1e9));
 }
 int main(int argc,char** argv) try {
-    bool check=false,concat64=false,cpu_concat=false,autotune=false; int warm=3,repeat=10,tune_cap=8;
+    bool check=false,concat64=false,cpu_concat=false,autotune=false,selection=false; int warm=3,repeat=10,tune_cap=8;
     for(int i=1;i<argc;++i) {
         std::string arg=argv[i];
         if(arg=="--check-only") check=true;
         else if(arg=="--concat64") concat64=true;
         else if(arg=="--cpu-concat-check") cpu_concat=true;
+        else if(arg=="--selection-check") selection=true;
         else if(arg=="--autotune") { autotune=true; concat64=true; }
         else if(arg=="--autotune-max" && i+1<argc) {
             tune_cap=std::stoi(argv[++i]);
@@ -433,7 +473,7 @@ int main(int argc,char** argv) try {
         else if((arg=="--warmup" || arg=="--repeat") && i+1<argc) {
             int v=std::stoi(argv[++i]); if(v<1 || v>100) throw std::runtime_error("count must be 1..100");
             (arg=="--warmup"?warm:repeat)=v;
-        } else throw std::runtime_error("usage: half_micro [--check-only] [--concat64] [--cpu-concat-check] [--autotune] [--autotune-max 1..32] [--warmup N] [--repeat N]");
+        } else throw std::runtime_error("usage: half_micro [--check-only] [--concat64] [--cpu-concat-check] [--selection-check] [--autotune] [--autotune-max 1..32] [--warmup N] [--repeat N]");
     }
     if(cpu_concat) { cpu_concat64_check(); return 0; }
     if(!check && !std::getenv("SLURM_JOB_ID")) throw std::runtime_error("timing requires a Slurm batch allocation");
@@ -455,6 +495,7 @@ int main(int argc,char** argv) try {
     Dl_info info{}; dladdr(dlsym(RTLD_DEFAULT,"rocblas_sgemm"),&info);
     printf("BACKEND rocblas=%s library=%s API=rocblas_sgemm/rocblas_gemm_ex algo=standard solution=0 compute=f32 stream=default\n",
            version,info.dli_fname?info.dli_fname:"unknown");
+    if(selection) { selection_check(h); BLAS(rocblas_destroy_handle(h)); return 0; }
     printf("CONFIG warmup=%d repeat=%d allocation=pooled reset_C=outside_events high_half_is_NOT_FP32_accurate\n",warm,repeat);
     printf("FUSED_BACKEND rocWMMA=%d.%d.%d tile=16x16x16 wave=64 accumulators=HH+cross f32 C_writes=1 packing=inside_kernel\n",
            ROCWMMA_VERSION_MAJOR,ROCWMMA_VERSION_MINOR,ROCWMMA_VERSION_PATCH);
