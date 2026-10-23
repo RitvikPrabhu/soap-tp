@@ -847,6 +847,33 @@ elif [[ $1 == loop3-graph ]]; then
             done
         done
     done
+elif [[ $1 == loop3-refine ]]; then
+    for grid in '2 4' '4 2'; do
+        read -r pr pc <<< "$grid"
+        for matrix in lowrank random indefinite clustered diagonal zero; do
+            for half in 0 2; do
+                run 8 --solver jacobi --n 97 --block 8 --pr "$pr" --pc "$pc" --precision fp32 --matrix "$matrix" --jacobi-refine 2 --half-bulk "$half" --gpu-mpi 1 --rccl 1 --async-alloc 1
+            done
+        done
+    done
+    for pivot in 1 0; do
+        refine=0; if [[ $pivot == 0 ]]; then refine=2; fi
+        for half in 0 2; do
+            run 8 --solver jacobi --n 2048 --block 256 --pr 1 --pc 8 --precision fp32 --jacobi-pivot64 "$pivot" --jacobi-refine "$refine" --half-bulk "$half" --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --reference 1
+        done
+    done
+elif [[ $1 == loop3-half-panel ]]; then
+    for grid in '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for matrix in random indefinite clustered lowrank diagonal zero; do
+            run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --precision fp32 --matrix "$matrix" --panel 7 --back-block 13 --half-panel 1 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --tridiag elpa32 --tri-pr 8
+        done
+    done
+    for n in 8192 16384; do
+        for fused in 0 1; do
+            run 8 --n "$n" --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --panel 32 --back-block 256 --half-panel "$fused" --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference "output/custom-eigh/torch-large/n$n"
+        done
+    done
 elif [[ $1 == case ]]; then
     shift
     ranks=$1; shift

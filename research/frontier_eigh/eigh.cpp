@@ -17,6 +17,7 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#include "half_fused.hpp"
 
 extern "C" {
 void Cblacs_get(int, int, int*);
@@ -58,20 +59,17 @@ void dtrmv_(const char*, const char*, const char*, const int*, const double*,
 
 size_t device_live_bytes=0, device_peak_bytes=0;
 bool async_alloc=false;
-bool graph_reduction=false;
-int graph_block=0;
-hipStream_t compute_stream=nullptr;
 template<class T> struct Device {
     T* p = nullptr;
     size_t n;
     explicit Device(size_t count): n(count) {
-        if (async_alloc) HIP(hipMallocAsync(&p,std::max(size_t(1),n)*sizeof(T),compute_stream));
+        if (async_alloc) HIP(hipMallocAsync(&p,std::max(size_t(1),n)*sizeof(T),nullptr));
         else HIP(hipMalloc(&p, std::max(size_t(1), n)*sizeof(T)));
         device_live_bytes+=std::max(size_t(1), n)*sizeof(T);
         device_peak_bytes=std::max(device_peak_bytes,device_live_bytes);
     }
     ~Device() {
-        if (async_alloc) hipFreeAsync(p,compute_stream); else hipFree(p);
+        if (async_alloc) hipFreeAsync(p,nullptr); else hipFree(p);
         device_live_bytes-=std::max(size_t(1), n)*sizeof(T);
     }
     Device(const Device&) = delete;
@@ -159,7 +157,7 @@ struct Grid {
         if (rccl) {
             double t=MPI_Wtime();
             CCL(ncclAllReduce(d.p,d.p,d.n,std::is_same_v<T,double>?ncclFloat64:ncclFloat32,
-                ncclSum,comm_==row?ccl_row:ccl_col,compute_stream));
+                ncclSum,comm_==row?ccl_row:ccl_col,nullptr));
             comm+=MPI_Wtime()-t;
         } else if (gpu_mpi) { HIP(hipDeviceSynchronize()); sum(d.p, d.n, comm_); }
         else { auto h=d.get(); sum(h.data(), h.size(), comm_); d.put(h); }
@@ -192,6 +190,7 @@ template<class T> void gemm(rocblas_handle h, bool trans, int m, int n, int k,
 }
 
 int half_bulk=0, bf16_bulk=0;
+bool half_panel=false;
 bool elpa_times=false;
 int band_width=0;
 bool device_vectors=false;
@@ -234,17 +233,24 @@ template<class T> __global__ void to_bfloat16(rocblas_bfloat16* out, const T* in
 }
 template<class T> void bulk_gemm(rocblas_handle h, bool trans, int m, int n, int k,
     T alpha, T* a, int lda, T* b, int ldb, T beta, T* c, int ldc, bool transb=false) {
+    if constexpr(std::is_same_v<T,float>) {
+        if (half_panel && !trans && transb) {
+            half_fused::launch_tile(false,true,m,n,k,alpha,a,lda,b,ldb,beta,c,ldc);
+            HIP(hipGetLastError());
+            return;
+        }
+    }
     if (!half_bulk && !bf16_bulk) { gemm(h,trans,m,n,k,alpha,a,lda,b,ldb,beta,c,ldc,transb); return; }
     int ar=trans?k:m, ac=trans?m:k, br=transb?n:k, bc=transb?k:n;
     size_t an=size_t(ar)*ac, bn=size_t(br)*bc;
     int parts=half_bulk ? half_bulk : bf16_bulk;
     Device<uint16_t> ah(an*parts), bh(bn*parts);
     if (half_bulk) {
-        to_half<<<(an+255)/256,256,0,compute_stream>>>(reinterpret_cast<__half*>(ah.p),a,ar,ac,lda,parts,trans,false);
-        to_half<<<(bn+255)/256,256,0,compute_stream>>>(reinterpret_cast<__half*>(bh.p),b,br,bc,ldb,parts,!transb,true);
+        to_half<<<(an+255)/256,256>>>(reinterpret_cast<__half*>(ah.p),a,ar,ac,lda,parts,trans,false);
+        to_half<<<(bn+255)/256,256>>>(reinterpret_cast<__half*>(bh.p),b,br,bc,ldb,parts,!transb,true);
     } else {
-        to_bfloat16<<<(an+255)/256,256,0,compute_stream>>>(reinterpret_cast<rocblas_bfloat16*>(ah.p),a,ar,ac,lda,parts,trans,false);
-        to_bfloat16<<<(bn+255)/256,256,0,compute_stream>>>(reinterpret_cast<rocblas_bfloat16*>(bh.p),b,br,bc,ldb,parts,!transb,true);
+        to_bfloat16<<<(an+255)/256,256>>>(reinterpret_cast<rocblas_bfloat16*>(ah.p),a,ar,ac,lda,parts,trans,false);
+        to_bfloat16<<<(bn+255)/256,256>>>(reinterpret_cast<rocblas_bfloat16*>(bh.p),b,br,bc,ldb,parts,!transb,true);
     }
     HIP(hipGetLastError());
     // [A_hi A_lo] [B_lo; B_hi] combines both correction products in one GEMM.
@@ -517,35 +523,10 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
     Device<double> scalars(6), statistics(4*g.pr), dd(g.n), ee(g.n), tt(g.n-1);
     HIP(hipMemsetAsync(dd.p,0,dd.n*sizeof(double)));
     HIP(hipMemsetAsync(ee.p,0,ee.n*sizeof(double)));
-    double capture_start=0, capture_total=0, instantiate_total=0, replay_total=0;
-    size_t graph_nodes=0;
-    auto begin_capture=[&]() {
-        capture_start=MPI_Wtime();
-        HIP(hipStreamBeginCapture(compute_stream,hipStreamCaptureModeThreadLocal));
-    };
-    auto end_capture=[&]() {
-        hipGraph_t graph; hipGraphExec_t executable;
-        HIP(hipStreamEndCapture(compute_stream,&graph));
-        double captured=MPI_Wtime();
-        size_t nodes=0; HIP(hipGraphGetNodes(graph,nullptr,&nodes)); graph_nodes+=nodes;
-        HIP(hipGraphInstantiate(&executable,graph,nullptr,nullptr,0));
-        double instantiated=MPI_Wtime();
-        HIP(hipGraphLaunch(executable,compute_stream));
-        HIP(hipStreamSynchronize(compute_stream));
-        capture_total+=captured-capture_start; instantiate_total+=instantiated-captured;
-        replay_total+=MPI_Wtime()-instantiated;
-        HIP(hipGraphExecDestroy(executable)); HIP(hipGraphDestroy(graph));
-    };
-    if (graph_reduction) {
-        HIP(hipDeviceSynchronize());
-        HIP(hipStreamCreateWithFlags(&compute_stream,hipStreamNonBlocking));
-        BLAS(rocblas_set_stream(h,compute_stream));
-        begin_capture();
-    }
     auto gather=[&](Device<T>& local) {
         double clock=MPI_Wtime();
-        if (g.pr==1) HIP(hipMemcpyAsync(packed.p,local.p,padded*sizeof(T),hipMemcpyDeviceToDevice,compute_stream));
-        else CCL(ncclAllGather(local.p,packed.p,padded,std::is_same_v<T,double>?ncclFloat64:ncclFloat32,g.ccl_col,compute_stream));
+        if (g.pr==1) HIP(hipMemcpyAsync(packed.p,local.p,padded*sizeof(T),hipMemcpyDeviceToDevice));
+        else CCL(ncclAllGather(local.p,packed.p,padded,std::is_same_v<T,double>?ncclFloat64:ncclFloat32,g.ccl_col,nullptr));
         g.comm+=MPI_Wtime()-clock;
     };
     for (int k=0;k<g.n-1;++k) {
@@ -553,36 +534,36 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
         T* column=g.c==owner ? a.p+size_t(g.li(k,g.pc))*g.nr : nullptr;
         if (panel>1) {
             if (k%panel==0) {
-                HIP(hipMemsetAsync(u.p,0,u.n*sizeof(T),compute_stream));
-                HIP(hipMemsetAsync(cross.p,0,cross.n*sizeof(T),compute_stream));
+                HIP(hipMemsetAsync(u.p,0,u.n*sizeof(T)));
+                HIP(hipMemsetAsync(cross.p,0,cross.n*sizeof(T)));
             } else if (column) {
-                correct_column<<<(g.nr+255)/256,256,0,compute_stream>>>(a.p,u.p,cross.p,g.nr,g.nc,g.li(k,g.pc),panel);
+                correct_column<<<(g.nr+255)/256,256>>>(a.p,u.p,cross.p,g.nr,g.nc,g.li(k,g.pc),panel);
             }
         }
         double clock=MPI_Wtime();
         T* raw=g.pr==1 ? packed.p : v.p;
-        if (g.pc==1) HIP(hipMemcpyAsync(raw,column,g.nr*sizeof(T),hipMemcpyDeviceToDevice,compute_stream));
-        else CCL(ncclBroadcast(column ? column : raw,raw,g.nr,std::is_same_v<T,double>?ncclFloat64:ncclFloat32,owner,g.ccl_row,compute_stream));
+        if (g.pc==1) HIP(hipMemcpyAsync(raw,column,g.nr*sizeof(T),hipMemcpyDeviceToDevice));
+        else CCL(ncclBroadcast(column ? column : raw,raw,g.nr,std::is_same_v<T,double>?ncclFloat64:ncclFloat32,owner,g.ccl_row,nullptr));
         g.comm+=MPI_Wtime()-clock;
         int r0=std::upper_bound(g.rows.begin(),g.rows.end(),k)-g.rows.begin();
         int c0=std::upper_bound(g.cols.begin(),g.cols.end(),k)-g.cols.begin();
         int diagonal=(k/g.b)%g.pr==g.r ? g.li(k,g.pr) : -1;
         int alpha=((k+1)/g.b)%g.pr==g.r ? g.li(k+1,g.pr) : -1;
-        local_statistics<<<1,256,0,compute_stream>>>(raw,g.nr,r0+(alpha>=0),diagonal,alpha,scalars.p,dd.p,ee.p,tt.p,k,g.pr==1);
+        local_statistics<<<1,256>>>(raw,g.nr,r0+(alpha>=0),diagonal,alpha,scalars.p,dd.p,ee.p,tt.p,k,g.pr==1);
         clock=MPI_Wtime();
-        if (g.pr>1) CCL(ncclAllGather(scalars.p,statistics.p,4,ncclFloat64,g.ccl_col,compute_stream));
+        if (g.pr>1) CCL(ncclAllGather(scalars.p,statistics.p,4,ncclFloat64,g.ccl_col,nullptr));
         g.comm+=MPI_Wtime()-clock;
         if (g.pr>1) {
-            reflector_scalar<<<1,1,0,compute_stream>>>(statistics.p,g.pr,scalars.p,dd.p,ee.p,tt.p,k);
+            reflector_scalar<<<1,1>>>(statistics.p,g.pr,scalars.p,dd.p,ee.p,tt.p,k);
             gather(v);
         }
-        form_vectors<<<(std::max(padded,g.nc)+255)/256,256,0,compute_stream>>>(v.p,vc.p,w.p,column,raw,packed.p,rows.p,cols.p,g.nr,g.nc,padded,g.b,g.pr,k,scalars.p,tt.p);
+        form_vectors<<<(std::max(padded,g.nc)+255)/256,256>>>(v.p,vc.p,w.p,column,raw,packed.p,rows.p,cols.p,g.nr,g.nc,padded,g.b,g.pr,k,scalars.p,tt.p);
         if (lower_triangle) {
-            HIP(hipMemsetAsync(full_w.p,0,full_w.n*sizeof(T),compute_stream));
+            HIP(hipMemsetAsync(full_w.p,0,full_w.n*sizeof(T)));
             if (r0<g.nr && c0<g.nc)
-                symmetric_av<<<dim3((g.nr-r0+31)/32,(g.nc-c0+31)/32),dim3(32,8),0,compute_stream>>>(a.p,v.p,vc.p,full_w.p,rows.p,cols.p,g.nr,g.nc,r0,c0);
+                symmetric_av<<<dim3((g.nr-r0+31)/32,(g.nc-c0+31)/32),dim3(32,8)>>>(a.p,v.p,vc.p,full_w.p,rows.p,cols.p,g.nr,g.nc,r0,c0);
             g.device_sum(full_w,g.row); g.device_sum(full_w,g.col);
-            local_rows<<<(g.nr+255)/256,256,0,compute_stream>>>(w.p,full_w.p,rows.p,g.nr);
+            local_rows<<<(g.nr+255)/256,256>>>(w.p,full_w.p,rows.p,g.nr);
         } else {
             if (r0<g.nr && c0<g.nc) gemv(h,false,g.nr-r0,g.nc-c0,g.nr,
                 a.p+r0+size_t(c0)*g.nr,vc.p+c0,w.p+r0);
@@ -590,7 +571,7 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
         }
         if (panel>1 && k%panel) {
             if (g.pr<g.pc) {
-                panel_dot<<<2*panel,256,0,compute_stream>>>(coeff.p,u.p,v.p,g.nr,panel);
+                panel_dot<<<2*panel,256>>>(coeff.p,u.p,v.p,g.nr,panel);
                 g.device_sum(coeff,g.col);
             } else {
                 gemv(h,true,g.nc,2*panel,g.nc,cross.p,vc.p,coeff.p);
@@ -598,31 +579,21 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
             }
             gemv(h,false,g.nr,2*panel,g.nr,u.p,coeff.p,w.p,T(-1),T(1));
         }
-        vector_dot<<<1,256,0,compute_stream>>>(v.p,w.p,g.nr,r0,k,scalars.p,tt.p);
+        vector_dot<<<1,256>>>(v.p,w.p,g.nr,r0,k,scalars.p,tt.p);
         clock=MPI_Wtime();
-        if (g.pr>1) CCL(ncclAllReduce(scalars.p+4,scalars.p+4,1,ncclFloat64,ncclSum,g.ccl_col,compute_stream));
+        if (g.pr>1) CCL(ncclAllReduce(scalars.p+4,scalars.p+4,1,ncclFloat64,ncclSum,g.ccl_col,nullptr));
         g.comm+=MPI_Wtime()-clock;
         if (g.pr>1) gather(w);
         T* corrected=g.pr==1 ? packed.p : w.p;
-        correct_vectors<<<(std::max(padded,g.nc)+255)/256,256,0,compute_stream>>>(corrected,wc.p,w.p,v.p,vc.p,g.pr==1 ? w.p : packed.p,cols.p,g.nc,padded,g.b,g.pr,scalars.p,tt.p,k);
+        correct_vectors<<<(std::max(padded,g.nc)+255)/256,256>>>(corrected,wc.p,w.p,v.p,vc.p,g.pr==1 ? w.p : packed.p,cols.p,g.nc,padded,g.b,g.pr,scalars.p,tt.p,k);
         int mr=g.nr-r0, mc=g.nc-c0;
         if (panel>1) {
-            retain_panel<<<(std::max(g.nr,g.nc)+255)/256,256,0,compute_stream>>>(u.p,cross.p,v.p,corrected,vc.p,wc.p,g.nr,g.nc,k%panel,panel);
+            retain_panel<<<(std::max(g.nr,g.nc)+255)/256,256>>>(u.p,cross.p,v.p,corrected,vc.p,wc.p,g.nr,g.nc,k%panel,panel);
             if (mr && mc && ((k+1)%panel==0 || k==g.n-2))
                 bulk_gemm(h,false,mr,mc,2*panel,T(-1),u.p+r0,g.nr,cross.p+c0,g.nc,
                     T(1),a.p+r0+size_t(c0)*g.nr,g.nr,true);
-        } else if (mr && mc) local_rank2<<<dim3((mr+127)/128,(mc+1)/2),dim3(128,2),0,compute_stream>>>(a.p,v.p,corrected,vc.p,wc.p,g.nr,g.nc,r0,c0,lower_triangle?rows.p:nullptr,cols.p);
+        } else if (mr && mc) local_rank2<<<dim3((mr+127)/128,(mc+1)/2),dim3(128,2)>>>(a.p,v.p,corrected,vc.p,wc.p,g.nr,g.nc,r0,c0,lower_triangle?rows.p:nullptr,cols.p);
         HIP(hipGetLastError());
-        if (graph_reduction && (k==g.n-2 || (graph_block && (k+1)%graph_block==0))) {
-            end_capture();
-            if (k<g.n-2) begin_capture();
-        }
-    }
-    if (graph_reduction) {
-        if (!g.rank) std::printf("GRAPH reduction nodes=%zu block=%d capture=%.9g instantiate=%.9g replay=%.9g\n",
-            graph_nodes,graph_block,capture_total,instantiate_total,replay_total);
-        BLAS(rocblas_set_stream(h,nullptr));
-        HIP(hipStreamDestroy(compute_stream)); compute_stream=nullptr;
     }
     d=dd.get(); e=ee.get(); tau=tt.get();
 }
@@ -1087,10 +1058,10 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
         } else throw std::runtime_error("unknown solver");
         total=g.maximum(g.tick()-start);
         double peak_mib=g.maximum(device_peak_bytes/1048576.);
-        if (g.rank==0) std::printf("TIMING solver=%s trial=%d n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s total=%.9g reduction=%.9g tridiag=%.9g back=%.9g back_block=%d gpu_mpi=%d panel=%d tridiag_backend=%s rccl=%d half_bulk=%d band=%d cpu_qr=%.9g managed_gpu_peak_mib=%.9g device_vectors=%d tridiag_grid=%dx%d retile=%.9g bf16_bulk=%d async_alloc=%d lower_triangle=%d\n",
+        if (g.rank==0) std::printf("TIMING solver=%s trial=%d n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s total=%.9g reduction=%.9g tridiag=%.9g back=%.9g back_block=%d gpu_mpi=%d panel=%d tridiag_backend=%s rccl=%d half_bulk=%d band=%d cpu_qr=%.9g managed_gpu_peak_mib=%.9g device_vectors=%d tridiag_grid=%dx%d retile=%.9g bf16_bulk=%d async_alloc=%d lower_triangle=%d half_panel=%d\n",
             solver.c_str(),trial,g.n,g.pr,g.pc,g.b,std::is_same_v<T,double>?"fp64":"fp32",name.c_str(),quant.c_str(),total,
             phases.reduction,phases.tridiag,phases.back,back_block,int(g.gpu_mpi),panel,solver=="jacobi"?"jacobi":band_width?"elpa_banded":tridiag.c_str(),int(g.rccl),int(half_bulk),band_width,phases.cpu_qr,peak_mib,int(device_vectors),
-            tridiagonal_grid?tridiagonal_grid->pr:g.pr,tridiagonal_grid?tridiagonal_grid->pc:g.pc,phases.retile,bf16_bulk,int(async_alloc),int(lower_triangle));
+            tridiagonal_grid?tridiagonal_grid->pr:g.pr,tridiagonal_grid?tridiagonal_grid->pc:g.pc,phases.retile,bf16_bulk,int(async_alloc),int(lower_triangle),int(half_panel));
     }
     double comm=g.maximum(g.comm); g.comm=0;
     auto qt=q.get(); std::vector<double> qd(qt.begin(),qt.end());
@@ -1232,15 +1203,13 @@ int main(int argc,char** argv) {
         band_width=std::stoi(arg("--band","0"));
         elpa_times=arg("--elpa-times","0")=="1";
         half_bulk=std::stoi(arg("--half-bulk","0"));
+        half_panel=arg("--half-panel","0")=="1";
         bf16_bulk=std::stoi(arg("--bf16-bulk","0"));
         device_vectors=arg("--device-vectors","0")=="1";
-        graph_reduction=arg("--graph-reduction","0")=="1";
-        graph_block=std::stoi(arg("--graph-block","0"));
-        if (graph_block<0 || (graph_block && !graph_reduction))
-            throw std::runtime_error("graph block must be nonnegative and requires graph reduction");
-        if (graph_reduction && (!device_vectors || arg("--async-alloc","0")!="1"))
-            throw std::runtime_error("graph reduction requires device vectors and async allocation");
         lower_triangle=arg("--lower-triangle","0")=="1";
+        if (half_panel && (precision!="fp32" || band_width || arg("--solver","custom")!="custom" ||
+            bf16_bulk || std::stoi(arg("--panel","1"))<=1 || std::stoi(arg("--panel","1"))>32))
+            throw std::runtime_error("--half-panel requires custom FP32, panel 2..32, no band/BF16");
         if (lower_triangle && (!device_vectors || std::stoi(arg("--panel","1"))!=1))
             throw std::runtime_error("--lower-triangle requires --device-vectors 1 --panel 1");
         if (device_vectors && (arg("--rccl","0")!="1" || arg("--gpu-mpi","0")!="1" ||
