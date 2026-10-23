@@ -363,7 +363,9 @@ elif [[ $1 == twod ]]; then
             run 8 --n 16384 --block 64 --pr "$pr" --pc "$pc" --tri-pr "$tri_pr" --precision "$precision" --tridiag "$tridiag" --back-block 128 --gpu-mpi 1 --rccl 1 --device-vectors "$vectors" --repeat 3 --reference 1
         done
     done
-elif [[ $1 == fused ]]; then
+elif [[ $1 == fused || $1 == vector-fusion ]]; then
+    binaries=(twod-eigh fused-eigh)
+    [[ $1 == vector-fusion ]] && binaries=(fused-eigh vector-fusion-eigh)
     for grid in '1 8' '2 4' '4 2' '8 1'; do
         read -r pr pc <<< "$grid"
         for precision in fp64 fp32; do
@@ -380,7 +382,7 @@ elif [[ $1 == fused ]]; then
             read -r pr pc <<< "$grid"
             tri_pr=$pr
             [[ $pr == 1 ]] && tri_pr=8
-            for binary in twod-eigh fused-eigh; do
+            for binary in "${binaries[@]}"; do
                 EIGH_BIN=build/custom-eigh/$binary run 8 --n 8192 --block 64 --pr "$pr" --pc "$pc" --tri-pr "$tri_pr" --precision "$precision" --tridiag "$tridiag" --back-block 128 --gpu-mpi 1 --rccl 1 --device-vectors 1 --repeat 3 --reference 1
             done
         done

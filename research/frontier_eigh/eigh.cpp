@@ -353,27 +353,32 @@ template<class T> __global__ void vector_dot(const T* v, T* w, int nr, int start
     if (!t) s[4]=partial[0];
 }
 
-template<class T> __global__ void form_vector(T* v, const int* rows, int nr,
-    int padded, int k, const double* s, const double* tau) {
+template<class T> __global__ void form_vectors(T* v, T* vc, T* w, const T* packed,
+    const int* rows, const int* cols, int nr, int nc, int padded, int b, int pr,
+    int k, const double* s, const double* tau) {
     int i=blockIdx.x*blockDim.x+threadIdx.x;
-    if (i>=padded) return;
-    if (i>=nr || rows[i]<=k) v[i]=0;
-    else if (rows[i]==k+1) v[i]=1;
-    else if (tau[k]!=0) v[i]=T(double(v[i])/s[5]);
+    if (i<padded) {
+        w[i]=0;
+        if (i>=nr || rows[i]<=k) v[i]=0;
+        else if (rows[i]==k+1) v[i]=1;
+        else if (tau[k]!=0) v[i]=T(double(v[i])/s[5]);
+    }
+    if (i<nc) {
+        int r=cols[i];
+        T value=packed[size_t((r/b)%pr)*padded+(r/b/pr)*b+r%b];
+        vc[i]=r<=k ? T(0) : r==k+1 ? T(1) : tau[k]!=0 ? T(double(value)/s[5]) : value;
+    }
 }
 
-template<class T> __global__ void correct_w(T* w, const T* v, int padded,
-    const double* s, const double* tau, int k) {
+template<class T> __global__ void correct_vectors(T* w, T* wc, const T* v,
+    const T* vc, const T* packed, const int* cols, int nc, int padded, int b,
+    int pr, const double* s, const double* tau, int k) {
     int i=blockIdx.x*blockDim.x+threadIdx.x;
     if (i<padded) w[i]-=T(.5*tau[k]*s[4]*double(v[i]));
-}
-
-template<class T> __global__ void unpack_vector(T* out, const T* packed,
-    const int* cols, int nc, int b, int pr, int padded) {
-    int j=blockIdx.x*blockDim.x+threadIdx.x;
-    if (j<nc) {
-        int i=cols[j];
-        out[j]=packed[size_t((i/b)%pr)*padded+(i/b/pr)*b+i%b];
+    if (i<nc) {
+        int r=cols[i];
+        T value=packed[size_t((r/b)%pr)*padded+(r/b/pr)*b+r%b];
+        wc[i]=value-T(.5*tau[k]*s[4]*double(vc[i]));
     }
 }
 
@@ -394,11 +399,10 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
     Device<double> scalars(6), statistics(4*g.pr), dd(g.n), ee(g.n), tt(g.n-1);
     HIP(hipMemsetAsync(dd.p,0,dd.n*sizeof(double)));
     HIP(hipMemsetAsync(ee.p,0,ee.n*sizeof(double)));
-    auto transpose=[&](Device<T>& local, Device<T>& out) {
+    auto gather=[&](Device<T>& local) {
         double clock=MPI_Wtime();
         CCL(ncclAllGather(local.p,packed.p,padded,std::is_same_v<T,double>?ncclFloat64:ncclFloat32,g.ccl_col,nullptr));
         g.comm+=MPI_Wtime()-clock;
-        unpack_vector<<<(g.nc+255)/256,256>>>(out.p,packed.p,cols.p,g.nc,g.b,g.pr,padded);
     };
     for (int k=0;k<g.n-1;++k) {
         int owner=(k/g.b)%g.pc;
@@ -413,9 +417,8 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
         CCL(ncclAllGather(scalars.p,statistics.p,4,ncclFloat64,g.ccl_col,nullptr));
         g.comm+=MPI_Wtime()-clock;
         reflector_scalar<<<1,1>>>(statistics.p,g.pr,scalars.p,dd.p,ee.p,tt.p,k);
-        form_vector<<<(padded+255)/256,256>>>(v.p,rows.p,g.nr,padded,k,scalars.p,tt.p);
-        transpose(v,vc);
-        HIP(hipMemsetAsync(w.p,0,padded*sizeof(T)));
+        gather(v);
+        form_vectors<<<(std::max(padded,g.nc)+255)/256,256>>>(v.p,vc.p,w.p,packed.p,rows.p,cols.p,g.nr,g.nc,padded,g.b,g.pr,k,scalars.p,tt.p);
         if (r0<g.nr && c0<g.nc) gemv(h,false,g.nr-r0,g.nc-c0,g.nr,
             a.p+r0+size_t(c0)*g.nr,vc.p+c0,w.p+r0);
         g.device_sum(w,g.row);
@@ -423,8 +426,8 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
         clock=MPI_Wtime();
         CCL(ncclAllReduce(scalars.p+4,scalars.p+4,1,ncclFloat64,ncclSum,g.ccl_col,nullptr));
         g.comm+=MPI_Wtime()-clock;
-        correct_w<<<(padded+255)/256,256>>>(w.p,v.p,padded,scalars.p,tt.p,k);
-        transpose(w,wc);
+        gather(w);
+        correct_vectors<<<(std::max(padded,g.nc)+255)/256,256>>>(w.p,wc.p,v.p,vc.p,packed.p,cols.p,g.nc,padded,g.b,g.pr,scalars.p,tt.p,k);
         int mr=g.nr-r0, mc=g.nc-c0;
         if (mr && mc) local_rank2<<<dim3((mr+127)/128,(mc+1)/2),dim3(128,2)>>>(a.p,v.p,w.p,vc.p,wc.p,g.nr,g.nc,r0,c0);
         if (g.c==owner) HIP(hipMemcpyAsync(a.p+size_t(g.li(k,g.pc))*g.nr,v.p,g.nr*sizeof(T),hipMemcpyDeviceToDevice));

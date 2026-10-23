@@ -270,6 +270,8 @@ Hypothesis: rank2 is the second-largest custom compute kernel in the trace. Its 
 
 - Snapshot `twod-eigh` SHAe7984d83d8509a4ec0601a0c3cb8d250306e533c1bbf6bb78868b6528f2428b6. Tiny2/31, FP64/32, CPU/GPU vectors all pass; FP32 random residual1.71e-7/orth2.12e-6. No performance claim yet.
 - Job5736758 submitted12min, suite `twod`:16 uneven rectangular checks, paired8192 CPU4x2/GPU1x8→tri8x1 against `basis-eigh`, then16384 updated candidates in both precisions with full ELPA2 reference. Latest source changes affect only rank2 indexing; frozen precision-study binary remains unchanged.
+- Completed9m18s onfrontier09155; all28 cases passed. Paired8192 warm medians before→after: CPU4x2 FP64 2.819→2.822s, FP32 1.987→1.988s; GPU1x8→tri8x1 FP64 2.534→2.543s, FP32 2.136→2.105s. This is essentially neutral, not a claimed speedup; retain direct rectangular indexing without claiming its theoretical instruction savings improved performance.
+- Updated16384 warm medians: CPU4x2 FP64/32 11.173/7.023s; GPU1x8→tri8x1 10.643/7.456s. GPU FP64 residual3.79e-15, orth1.79e-12, spectrum error1.65e-15. CPU FP32 residual1.99e-6, orth6.60e-4, spectrum error6.05e-7. These are independently validated against distributed FP64 ELPA2, not inferred from smaller tests.
 
 ### E19: gather scaled norm statistics once (candidate)
 
@@ -277,3 +279,10 @@ Hypothesis: the GPU-resident path pays collective and kernel latency for separat
 
 - Snapshot `fused-eigh` SHA4628d316d3b5385a7cc162c5c5b9ecd0fd9da09800f7e32510179a7adff4c5b7. Tiny31 random/lowrank/diagonal/indefinite FP64/32 all pass; random residual6.51e-16/1.71e-7 and orthogonality6.61e-15/2.12e-6. Not yet a measured performance selection.
 - `fused` suite gates uneven rectangular ownership and four matrix families, then pairs the frozen `twod-eigh` control with this candidate on three8192 grids and tests16384/main1x8→tri8x1. The allgather increases scalar payload slightly, so latency reduction is a hypothesis to measure rather than a guaranteed win.
+
+### E20: fuse row/column vector transformations (candidate)
+
+Hypothesis: form or correct both row- and column-oriented copies of each vector in one HIP kernel after gathering the raw vector, rather than launching formation, unpacking, and initialization separately. This removes three launches per reflector, including W zeroing, while preserving FP32 rounding of W before the rank2 update. Padding is never interpreted as a valid global element. It does not alter communication payload or the scalar algorithm.
+
+- Snapshot `vector-fusion-eigh` SHAffce00b7e454aed11ae6804e2921f26f8b5364882c465a7d11684137841a16ea. Tiny2/31 random/diagonal/lowrank/indefinite in FP64/32 pass. `vector-fusion` suite will compare this against frozen `fused-eigh`; not yet selected by multirank/performance evidence.
+- Staged GPU SOAP-basis job **5736815** submitted8min using frozen `basis-eigh`;90 compiled singleton solves, no compute-node Torch imports. Results still pending.
