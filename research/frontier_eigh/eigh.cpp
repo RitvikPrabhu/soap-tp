@@ -562,6 +562,7 @@ template<class T> Phases custom(Grid& g, rocblas_handle h, Device<T>& a,
 
 double entry(int i, int j, int n, const std::string& matrix) {
     if (!supplied_matrix.empty()) return supplied_matrix[i+size_t(j)*n];
+    if (matrix=="zero") return 0;
     if (matrix=="diagonal") return i==j ? double((i*17)%n)/n : 0;
     if (matrix=="clustered") return i==j ? 1.+1e-9*(i%3) : 0;
     if (matrix=="lowrank") {
@@ -863,8 +864,8 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
         g.bcast(rtop.data(),rtop.size(),0,MPI_COMM_WORLD);
         double diff=0,scale=0;
         for(int i=0;i<g.n;++i) { diff=std::max(diff,std::abs(ref[i]-eval[i])); scale=std::max(scale,std::abs(ref[i])); }
-        eigerr=diff/scale;
-        gap=width==g.n ? 1. : (ref[g.n-width]-ref[g.n-width-1])/scale;
+        eigerr=scale!=0 ? diff/scale : diff;
+        gap=width==g.n ? 1. : scale!=0 ? (ref[g.n-width]-ref[g.n-width-1])/scale : 0;
         if (ref.front()!=0) smallerr=std::abs(ref.front()-eval.front())/std::abs(ref.front());
     } else if (reference) {
         Device<double> ar(original.size()), qr(original.size()); ar.put(original);
@@ -872,8 +873,8 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
         rtop=top_columns(g,qr.get(),width);
         double diff=0,scale=0;
         for(int i=0;i<g.n;++i) { diff=std::max(diff,std::abs(ref[i]-eval[i])); scale=std::max(scale,std::abs(ref[i])); }
-        eigerr=diff/scale;
-        gap=width==g.n ? 1. : (ref[g.n-width]-ref[g.n-width-1])/scale;
+        eigerr=scale!=0 ? diff/scale : diff;
+        gap=width==g.n ? 1. : scale!=0 ? (ref[g.n-width]-ref[g.n-width-1])/scale : 0;
         if (ref.front()!=0) smallerr=std::abs(ref.front()-eval.front())/std::abs(ref.front());
     }
     if (gap>1e-12) {
@@ -889,12 +890,14 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
         }
         subspace=std::sqrt(err/norm);
     }
-    double residual=std::sqrt(sums[0]/sums[1]), orth=std::sqrt(sums[2]);
-    double input_residual=std::sqrt(sums[4]/sums[1]);
+    // Relative errors are undefined for the zero matrix; report absolute errors there.
+    double normalization=sums[1]!=0 ? sums[1] : 1;
+    double residual=std::sqrt(sums[0]/normalization), orth=std::sqrt(sums[2]);
+    double input_residual=std::sqrt(sums[4]/normalization);
     int negative=std::count_if(eval.begin(),eval.end(),[](double x){return x<0;});
     if (!g.rank) std::printf("RESULT solver=%s n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s setup=%.9g total=%.9g comm=%.9g residual=%.9g orthogonality=%.9g eig_rel_max=%.9g input_rel=%.9g eig_min=%.9g eig_max=%.9g input_residual=%.9g eig_small_rel=%.9g negative=%d top_width=%d top_subspace=%.9g top_gap=%.9g\n",
         solver.c_str(),g.n,g.pr,g.pc,g.b,std::is_same_v<T,double>?"fp64":"fp32",name.c_str(),quant.c_str(),setup,total,comm,
-        residual,orth,eigerr,std::sqrt(sums[3]/sums[1]),eval.front(),eval.back(),input_residual,smallerr,negative,width,subspace,gap);
+        residual,orth,eigerr,std::sqrt(sums[3]/normalization),eval.front(),eval.back(),input_residual,smallerr,negative,width,subspace,gap);
     BLAS(rocblas_destroy_handle(h));
     double tol=std::is_same_v<T,double>?1e-10:1e-4;
     if (!std::isfinite(residual) || !std::isfinite(input_residual) || input_residual>tol || !std::isfinite(orth) || orth>tol*std::sqrt(g.n)

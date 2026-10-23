@@ -367,7 +367,7 @@ elif [[ $1 == fused || $1 == vector-fusion || $1 == direct || $1 == merged ]]; t
     binaries=(twod-eigh fused-eigh)
     [[ $1 == vector-fusion ]] && binaries=(fused-eigh vector-fusion-eigh)
     [[ $1 == direct ]] && binaries=(fused-eigh vector-fusion-eigh direct-eigh)
-    [[ $1 == merged ]] && binaries=(direct-eigh merged-eigh)
+    [[ $1 == merged ]] && binaries=(direct-eigh checked-eigh)
     for grid in '1 8' '2 4' '4 2' '8 1'; do
         read -r pr pc <<< "$grid"
         for precision in fp64 fp32; do
@@ -377,6 +377,14 @@ elif [[ $1 == fused || $1 == vector-fusion || $1 == direct || $1 == merged ]]; t
     for matrix in diagonal lowrank indefinite clustered; do
         run 8 --n 97 --block 8 --pr 2 --pc 4 --matrix "$matrix" --precision fp64 --back-block 13 --device-vectors 1 --gpu-mpi 1 --rccl 1
     done
+    if [[ $1 == merged ]]; then
+        run 8 --n 97 --block 8 --pr 2 --pc 4 --matrix zero --back-block 13 --device-vectors 1 --gpu-mpi 1 --rccl 1
+        run 8 --n 97 --block 8 --pr 4 --pc 2 --matrix zero --precision fp32 --back-block 13 --device-vectors 1 --gpu-mpi 1 --rccl 1
+        for precision in fp64 fp32; do
+            run 8 --n 1025 --block 32 --pr 2 --pc 4 --matrix lowrank --precision "$precision" --back-block 128 --device-vectors 1 --gpu-mpi 1 --rccl 1 --reference 1
+            run 8 --n 1025 --block 32 --pr 4 --pc 2 --matrix indefinite --precision "$precision" --back-block 128 --device-vectors 1 --gpu-mpi 1 --rccl 1 --reference 1
+        done
+    fi
     for precision in fp64 fp32; do
         tridiag=elpa
         [[ $precision == fp32 ]] && tridiag=elpa32
@@ -424,6 +432,15 @@ elif [[ $1 == soap ]]; then
                 done
             done
         done
+    done
+elif [[ $1 == panel-target ]]; then
+    for precision in fp64 fp32; do
+        tridiag=elpa
+        [[ $precision == fp32 ]] && tridiag=elpa32
+        for panel in 1 8 32; do
+            run 8 --n 16384 --block 64 --pr 4 --pc 2 --precision "$precision" --panel "$panel" --tridiag "$tridiag" --back-block 128 --gpu-mpi 1 --rccl 1 --repeat 3 --reference 1
+        done
+        run 8 --n 16384 --block 64 --pr 4 --pc 2 --solver elpa1 --precision "$precision" --repeat 3 --reference 1
     done
 elif [[ $1 == case ]]; then
     shift

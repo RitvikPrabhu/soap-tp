@@ -317,3 +317,15 @@ Hypothesis: a separate one-thread kernel solely merging a few gathered norm stat
 
 - Snapshot `merged-eigh` SHA75c673ccedcf8e9435588345cf7eda83b6d12d4c26798570b113030d6b8bd969. Tiny31 four families/both precisions pass with unchanged metrics. Batch `merged` will gate uneven rectangles, pair direct→merged at8192, test16384, refresh1/2/4/8G scaling and same-node fullELPA1 controls. No performance claim yet.
 - Job **5736889**,14min, `direct` suite onfrontier02621 currently compares E20/E22 frozen snapshots. No snapshots are rebuilt while jobs use them.
+- Job5736889 COMPLETED8m36; all32 cases passed. E20/E22 are small improvements, not the main speedup. Warm8192 fused→vector-fusion→direct FP64/32:1x8→8x1 2.216→2.191→2.177 /1.799→1.749→1.750s;2x4 3.447→3.359→3.336 /2.718→2.630→2.608s;4x2 3.175→3.101→3.089 /2.162→2.064→2.036s. Keep both; direct-copy FP32/main1x8 is a tie, but other grids improve. Direct16384/main1x8 warm9.342/6.179s.
+
+### E24: zero-matrix validation regression
+
+An actual3×3 zero input decomposes to zero eigenvalues and an orthogonal basis, but the driver exits1 because relative residual and spectrum normalization compute0/0. Reproduced against frozen `merged-eigh` before changing validation; raw scratch log showed NaNs with orthogonality0. Fixed only normalization for zero matrices: use absolute error when the problem/spectrum norm is zero, and report a zero boundary gap for a proper subset of a fully degenerate spectrum. Added `--matrix zero` to retain a public regression case.
+
+- `checked-eigh` SHAe516a040f77070ff2d2aca6c98df27ab7b55dc59830c57ded9ea5c1fab97746f includes E23 plus this validation correction, with unchanged nonzero-problem formulas. The same3×3 input now exits0, residual/orthogonality/eigenvalue error0 in CPU/GPU-vector FP64/32;31×31 zero generator also passes both precisions and correctly skips a degenerate top-eight comparison.
+- Job **5736968**,15min, `merged` suite submitted with frozen `checked-eigh`:18 correctness gates (including zero and1025 lowrank/indefinite rectangular references), paired E23 timings,16384, scaling and same-nodeELPA1 controls. `merged-eigh` remains immutable; pair uses `direct-eigh` versus `checked-eigh`.
+
+### E25: revisit delayed updates only at the larger target (prepared)
+
+Hypothesis: the panel approach that lost at8192 may cross a bandwidth/latency break-even at16384, where trailing-matrix traffic is much larger. No new algorithm is implemented. `panel-target` tests existing correct panel1/8/32 at16384/4x2 in both precisions, with an ELPA1 control and distributed FP64 ELPA2 references. This directly tests a size-dependent alternative rather than extrapolating the smaller-case loss. Not yet submitted.
