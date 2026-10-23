@@ -171,7 +171,7 @@ template<class T> void gemm(rocblas_handle h, bool trans, int m, int n, int k,
     else BLAS(rocblas_sgemm(h,op,opb,m,n,k,&alpha,a,lda,b,ldb,&beta,c,ldc));
 }
 
-int half_bulk=0;
+int half_bulk=0, bf16_bulk=0;
 bool elpa_times=false;
 int band_width=0;
 bool device_vectors=false;
@@ -187,22 +187,38 @@ template<class T> __global__ void to_half(__half* out, const T* in, int rows, in
         if (parts==2) out[z+size_t(rows)*cols]=__float2half((x-__half2float(out[z]))*4096.f);
     }
 }
+template<class T> __global__ void to_bfloat16(rocblas_bfloat16* out, const T* in,
+    int rows, int cols, int ld, int parts) {
+    size_t z=blockIdx.x*size_t(blockDim.x)+threadIdx.x;
+    if (z<size_t(rows)*cols) {
+        float x=float(in[z%rows+(z/rows)*ld]);
+        out[z]=rocblas_bfloat16(x);
+        if (parts==2) out[z+size_t(rows)*cols]=rocblas_bfloat16(x-float(out[z]));
+    }
+}
 template<class T> void bulk_gemm(rocblas_handle h, bool trans, int m, int n, int k,
     T alpha, T* a, int lda, T* b, int ldb, T beta, T* c, int ldc, bool transb=false) {
-    if (!half_bulk) { gemm(h,trans,m,n,k,alpha,a,lda,b,ldb,beta,c,ldc,transb); return; }
+    if (!half_bulk && !bf16_bulk) { gemm(h,trans,m,n,k,alpha,a,lda,b,ldb,beta,c,ldc,transb); return; }
     int ar=trans?k:m, ac=trans?m:k, br=transb?n:k, bc=transb?k:n;
     size_t an=size_t(ar)*ac, bn=size_t(br)*bc;
-    Device<__half> ah(an*half_bulk), bh(bn*half_bulk);
-    to_half<<<(an+255)/256,256>>>(ah.p,a,ar,ac,lda,half_bulk);
-    to_half<<<(bn+255)/256,256>>>(bh.p,b,br,bc,ldb,half_bulk);
+    int parts=half_bulk ? half_bulk : bf16_bulk;
+    Device<uint16_t> ah(an*parts), bh(bn*parts);
+    if (half_bulk) {
+        to_half<<<(an+255)/256,256>>>(reinterpret_cast<__half*>(ah.p),a,ar,ac,lda,parts);
+        to_half<<<(bn+255)/256,256>>>(reinterpret_cast<__half*>(bh.p),b,br,bc,ldb,parts);
+    } else {
+        to_bfloat16<<<(an+255)/256,256>>>(reinterpret_cast<rocblas_bfloat16*>(ah.p),a,ar,ac,lda,parts);
+        to_bfloat16<<<(bn+255)/256,256>>>(reinterpret_cast<rocblas_bfloat16*>(bh.p),b,br,bc,ldb,parts);
+    }
     HIP(hipGetLastError());
     // Two-part mode omits only A_low B_low; accumulators and matrix state remain FP32.
-    for (int term=0;term<(half_bulk==2?3:1);++term) {
-        T add=term?T(1):beta, factor=term?alpha/T(4096):alpha;
+    auto datatype=half_bulk ? rocblas_datatype_f16_r : rocblas_datatype_bf16_r;
+    for (int term=0;term<(parts==2?3:1);++term) {
+        T add=term?T(1):beta, factor=term && half_bulk ? alpha/T(4096) : alpha;
         BLAS(rocblas_gemm_ex(h,trans?rocblas_operation_transpose:rocblas_operation_none,
             transb?rocblas_operation_transpose:rocblas_operation_none,m,n,k,
-            &factor,ah.p+(term==2?an:0),rocblas_datatype_f16_r,ar,
-            bh.p+(term==1?bn:0),rocblas_datatype_f16_r,br,
+            &factor,ah.p+(term==2?an:0),datatype,ar,
+            bh.p+(term==1?bn:0),datatype,br,
             &add,c,rocblas_datatype_f32_r,ldc,c,rocblas_datatype_f32_r,ldc,
             rocblas_datatype_f32_r,rocblas_gemm_algo_standard,0,0));
     }
@@ -824,10 +840,10 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
         } else throw std::runtime_error("unknown solver");
         total=g.maximum(g.tick()-start);
         double peak_mib=g.maximum(device_peak_bytes/1048576.);
-        if (g.rank==0) std::printf("TIMING solver=%s trial=%d n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s total=%.9g reduction=%.9g tridiag=%.9g back=%.9g back_block=%d gpu_mpi=%d panel=%d tridiag_backend=%s rccl=%d half_bulk=%d band=%d cpu_qr=%.9g managed_gpu_peak_mib=%.9g device_vectors=%d tridiag_grid=%dx%d retile=%.9g\n",
+        if (g.rank==0) std::printf("TIMING solver=%s trial=%d n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s total=%.9g reduction=%.9g tridiag=%.9g back=%.9g back_block=%d gpu_mpi=%d panel=%d tridiag_backend=%s rccl=%d half_bulk=%d band=%d cpu_qr=%.9g managed_gpu_peak_mib=%.9g device_vectors=%d tridiag_grid=%dx%d retile=%.9g bf16_bulk=%d\n",
             solver.c_str(),trial,g.n,g.pr,g.pc,g.b,std::is_same_v<T,double>?"fp64":"fp32",name.c_str(),quant.c_str(),total,
             phases.reduction,phases.tridiag,phases.back,back_block,int(g.gpu_mpi),panel,band_width?"elpa_banded":tridiag.c_str(),int(g.rccl),int(half_bulk),band_width,phases.cpu_qr,peak_mib,int(device_vectors),
-            tridiagonal_grid?tridiagonal_grid->pr:g.pr,tridiagonal_grid?tridiagonal_grid->pc:g.pc,phases.retile);
+            tridiagonal_grid?tridiagonal_grid->pr:g.pr,tridiagonal_grid?tridiagonal_grid->pc:g.pc,phases.retile,bf16_bulk);
     }
     double comm=g.maximum(g.comm); g.comm=0;
     auto qt=q.get(); std::vector<double> qd(qt.begin(),qt.end());
@@ -943,12 +959,15 @@ int main(int argc,char** argv) {
         band_width=std::stoi(arg("--band","0"));
         elpa_times=arg("--elpa-times","0")=="1";
         half_bulk=std::stoi(arg("--half-bulk","0"));
+        bf16_bulk=std::stoi(arg("--bf16-bulk","0"));
         device_vectors=arg("--device-vectors","0")=="1";
         if (device_vectors && (arg("--rccl","0")!="1" || arg("--gpu-mpi","0")!="1" ||
             std::stoi(arg("--panel","1"))!=1 || band_width || arg("--solver","custom")!="custom"))
             throw std::runtime_error("--device-vectors 1 requires --solver custom --rccl 1 --gpu-mpi 1 --panel 1 and is incompatible with --band");
         if (half_bulk<0 || half_bulk>2) throw std::runtime_error("half bulk must be 0, 1, or 2");
         if (half_bulk && precision!="fp32") throw std::runtime_error("half bulk experiment requires FP32 state");
+        if (bf16_bulk<0 || bf16_bulk>2 || (bf16_bulk && (precision!="fp32" || half_bulk)))
+            throw std::runtime_error("BF16 bulk requires mode 0/1/2, FP32 state, and no FP16 bulk");
         {
             Grid g(n,b,pr,pc,arg("--gpu-mpi","0")=="1",arg("--rccl","0")=="1");
             std::string tridiag=arg("--tridiag","scalapack");

@@ -450,6 +450,42 @@ elif [[ $1 == finish ]]; then
             run 8 --n "$n" --block 64 --pr 4 --pc 2 --solver elpa1 --precision "$precision" --repeat 3 --reference 1
         done
     done
+elif [[ $1 == low-compute ]]; then
+    for grid in '2 4' '4 2'; do
+        read -r pr pc <<< "$grid"
+        for matrix in random lowrank indefinite; do
+            for mode in 1 2; do
+                if run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --matrix "$matrix" --precision fp32 --tridiag elpa32 --back-block 13 --device-vectors 1 --gpu-mpi 1 --rccl 1 --bf16-bulk "$mode"; then
+                    echo "BF16_CHECK PASSED mode=$mode grid=$grid matrix=$matrix"
+                else
+                    echo "BF16_CHECK FAILED mode=$mode grid=$grid matrix=$matrix"
+                fi
+            done
+        done
+    done
+    run 8 --n 8192 --block 64 --pr 1 --pc 8 --tri-pr 8 --tridiag elpa --back-block 128 --device-vectors 1 --gpu-mpi 1 --rccl 1 --repeat 3 --reference 1
+    for mode in fp32 split-half split-bf16; do
+        extra=()
+        [[ $mode == split-half ]] && extra=(--half-bulk 2)
+        [[ $mode == split-bf16 ]] && extra=(--bf16-bulk 2)
+        if run 8 --n 8192 --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --back-block 128 --device-vectors 1 --gpu-mpi 1 --rccl 1 --repeat 3 --reference 1 "${extra[@]}"; then
+            echo "COMPUTE_CHECK PASSED variant=$mode"
+        else
+            echo "COMPUTE_CHECK FAILED variant=$mode"
+        fi
+    done
+    for mode in 0 2; do
+        if run 8 --n 257 --block 16 --pr 2 --pc 4 --precision fp32 --band 16 --back-block 32 --gpu-mpi 1 --rccl 1 --bf16-bulk "$mode" --matrix lowrank; then
+            echo "BAND_BF16_CHECK PASSED mode=$mode"
+        else
+            echo "BAND_BF16_CHECK FAILED mode=$mode"
+        fi
+        if run 8 --n 2048 --block 64 --pr 4 --pc 2 --precision fp32 --band 64 --back-block 128 --gpu-mpi 1 --rccl 1 --bf16-bulk "$mode" --repeat 3 --reference 1; then
+            echo "BAND_BF16_CHECK PASSED mode=$mode"
+        else
+            echo "BAND_BF16_CHECK FAILED mode=$mode"
+        fi
+    done
 elif [[ $1 == case ]]; then
     shift
     ranks=$1; shift
