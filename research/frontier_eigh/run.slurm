@@ -653,6 +653,84 @@ elif [[ $1 == panel-dot ]]; then
             run 8 --n 16384 --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --panel "$panel" --half-bulk "$half" --back-block 128 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference output/custom-eigh/torch-large/n16384
         done
     done
+elif [[ $1 == bulk-back ]]; then
+    for grid in '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --precision "$precision" --matrix indefinite --panel 7 --back-block 13 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1
+        done
+        run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --precision fp32 --matrix lowrank --panel 7 --back-block 13 --half-bulk 2 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1
+    done
+    for n in 8192 16384; do
+        panel=1; [[ $n == 16384 ]] && panel=32
+        for binary in panel-dot-eigh joint-half-eigh device-t-eigh; do
+            for half in 0 2; do
+                EIGH_BIN="build/custom-eigh/$binary" run 8 --n "$n" --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --panel "$panel" --half-bulk "$half" --back-block 128 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference "output/custom-eigh/torch-large/n$n"
+            done
+        done
+    done
+    for back in 256 512; do
+        for half in 0 2; do
+            run 8 --n 16384 --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --panel 32 --half-bulk "$half" --back-block "$back" --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference output/custom-eigh/torch-large/n16384
+        done
+    done
+elif [[ $1 == lds ]]; then
+    for grid in '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --precision "$precision" --matrix indefinite --panel 7 --back-block 13 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1
+        done
+    done
+    for binary in joint-half-eigh lds-t-eigh; do
+        for half in 0 2; do
+            EIGH_BIN="build/custom-eigh/$binary" run 8 --n 8192 --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --half-bulk "$half" --back-block 128 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference output/custom-eigh/torch-large/n8192
+        done
+    done
+    for back in 128 256; do
+        for half in 0 2; do
+            run 8 --n 16384 --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --panel 32 --half-bulk "$half" --back-block "$back" --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference output/custom-eigh/torch-large/n16384
+        done
+    done
+    passed=1
+    for grid in '2 4' '4 2'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            if EIGH_BIN=build/custom-eigh/jacobi-diagonal-eigh run 8 --solver jacobi --n 97 --block 8 --pr "$pr" --pc "$pc" --precision "$precision" --jacobi-pivot64 1 --gpu-mpi 1 --rccl 1 --async-alloc 1; then
+                echo "DIAGONAL_CHECK PASSED tiny"
+            else
+                echo "DIAGONAL_CHECK FAILED tiny"; passed=0
+            fi
+        done
+    done
+    if [[ $passed == 1 ]]; then
+        for pivot64 in 0 1; do
+            for half in 0 2; do
+                if EIGH_BIN=build/custom-eigh/jacobi-diagonal-eigh run 8 --solver jacobi --n 2048 --block 256 --pr 1 --pc 8 --precision fp32 --jacobi-pivot64 "$pivot64" --half-bulk "$half" --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --reference 1; then
+                    echo "DIAGONAL_CHECK PASSED pivot64=$pivot64 half=$half"
+                else
+                    echo "DIAGONAL_CHECK FAILED pivot64=$pivot64 half=$half"
+                fi
+            done
+        done
+    fi
+elif [[ $1 == rccl-tune ]]; then
+    for config in default LL LL128 Simple LL-c1 LL-c4 Simple-c1 Ring-LL-c1; do
+        unset NCCL_PROTO NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS NCCL_ALGO
+        case "$config" in
+            LL|LL128|Simple) export NCCL_PROTO="$config" ;;
+            LL-c1|LL-c4|Ring-LL-c1)
+                export NCCL_PROTO=LL NCCL_MIN_NCHANNELS=1 NCCL_MAX_NCHANNELS=1
+                if [[ $config == LL-c4 ]]; then export NCCL_MIN_NCHANNELS=4 NCCL_MAX_NCHANNELS=4; fi
+                if [[ $config == Ring-LL-c1 ]]; then export NCCL_ALGO=Ring; fi ;;
+            Simple-c1) export NCCL_PROTO=Simple NCCL_MIN_NCHANNELS=1 NCCL_MAX_NCHANNELS=1 ;;
+        esac
+        echo "RCCL_CONFIG $config"
+        if run 8 --n 8192 --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --back-block 128 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference output/custom-eigh/torch-large/n8192; then
+            echo "RCCL_CHECK PASSED config=$config"
+        else
+            echo "RCCL_CHECK FAILED config=$config"
+        fi
+    done
 elif [[ $1 == case ]]; then
     shift
     ranks=$1; shift

@@ -422,3 +422,21 @@ Added LAPACK DSTEMR/SSTEMR subset-vector MRRR as an independent tridiagonal path
 ### E33: use the smaller communicator for delayed-panel coefficients
 
 Hypothesis: on1x8, row-layout V/W already contains the full vectors, so computing `[W^T v,V^T v]` directly avoids one coefficient AllReduce per reflector. `panel_dot` uses FP64 scalar reductions and selects row-layout when pr<pc; otherwise the existing column-layout GEMV remains. No dense replication added. Candidate `panel-dot-eigh` SHA f4b1d2bb5294c526cc1c970ebe9a3b5a2931e63403f9b40a979cd63c1801dece; tiny singleton FP64/32 controls pass. Job5738499 gates all rectangular grids then pairs old/new panel32 at8192/16384 and native/splitFP16 panel8/64 at16384. All eight tiny gates passed so far; performance pending.
+
+E33 outcome: job5738499 completed4m02, all16cases passed. At8192 panel32 old/new reduction1.705→1.414s, final warm total2.150→1.839s; at16384 reduction4.390→3.945s,total5.724→5.283s. Keep the smaller-communicator coefficient formulation. Panel1 still wins8192. At16384 new panel8/32/64 native totals5.449/5.283/5.662s (final warm trials); splitFP16 panel8/64 takes6.341/5.890s and remains slower. All relative Q-norm errors≤4.17e-8. Raw `panel-dot.csv`.
+
+### E34: two-launch split-FP16 correction
+
+Hypothesis: pack high/low parts along the contraction dimension, allowing `[A_hi A_lo][B_lo; B_hi]` to combine both correction products. The first GEMM still computes high×high; the second applies both cross terms with the4096 inverse scale for FP16. State/accumulation remain FP32; robust scalars FP64. This is genuine FP16 operand computation, not FP16 basis storage. Packing supports transpose and nontranspose operands and existing noncontiguous source leading dimensions. `joint-half-eigh` SHA678efb1acce5827fb4ddfc000817a61f5063a730a013d4935e6605dbc6d8fc63 passes tiny33 random/lowrank/indefinite/zero FP16-split controls. Native/splitBF16 remains insufficient for the stronger accuracy target: tiny lowrank splitBF16 Q-norm9.8e-7 fails the guard. No further target-size BF16 measurement is justified.
+
+Job5738542 pairs old/new/next-GPU-T at8192/16384. Preliminary8192 split back .111→.109s is too small to establish a meaningful speed win; warm totals vary with tridiagonal timing. Do not select based on the smaller kernel count alone.
+
+### E35: GPU compact-WY triangular factor
+
+Hypothesis: avoid each backtransform panel's small Gram D2H and T H2D synchronization by building T on the GPU with FP64 intermediate arithmetic. Rows of T are independent; each depends only on earlier entries in its own row. An initial global-scratch kernel (`device-t-eigh` SHA04d66069a458b67a5232e3647a8ebddfa44df0eb812a2d46a1b296430ab84a48) **loses**8192 back .084→.158s. Twelve tiny33 same-input ROCm torch FP64/FP32/splitFP16 solves pass all stronger metrics, and12 rectangular97 gates pass, so this is a performance failure, not an accuracy failure.
+
+Focused follow-up moves row histories to at most64KiB LDS per CTA, without weakening FP64 intermediate arithmetic; candidate `lds-t-eigh` SHA2a68627b7643645f0a9b94091717e2e739efaa1260e4b734ba216d6d49350d11. Tiny33 FP64/FP32/splitFP16 controls pass; no performance claim until the `lds` suite. GPU T has an explicit8192 maximum panel width from the64KiB single-row limit; practical tested widths are13–512. Reject the GPU path if this memory-locality correction does not win.
+
+### E36: install the exact Jacobi diagonal pivot
+
+Hypothesis: after all frozen right and left updates, the principal pivot is mathematically diagonal; retaining GEMM cancellation noise there creates a false off-diagonal floor. Install the local solver's eigenvalues and zero only that pivot, after the complete matching update. This does not change the Jacobi transformation in exact arithmetic, and the independent original-A residual remains mandatory. `jacobi-diagonal-eigh` SHAeefa69b77f99575fe2984691c88b8b06003ba32ba09fdce2b13f9a5ed860a308 built; distributed tiny gates and2048 native/split with FP32/FP64 pivots are pending. Norm alone still cannot select the method.

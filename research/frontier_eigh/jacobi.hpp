@@ -21,6 +21,14 @@ template<class T> __global__ void pivot(T* u, const T* panels, int n,
                .5*double(panels[rj+size_t(i)*n]));
     }
 }
+template<class T> __global__ void diagonal_pivot(T* a, const T* d, int n, int w,
+    int lo, int hi, int wl, int m, int offset) {
+    size_t z=blockIdx.x*size_t(blockDim.x)+threadIdx.x;
+    if (z<size_t(m)*w) {
+        int i=z%m, j=z/m, row=i<wl?lo+i:hi+i-wl;
+        a[row+size_t(j)*n]=i==offset+j ? d[i] : T(0);
+    }
+}
 template<class T> __global__ void rows(T* packed, T* a, int n, int w,
                                      int lo, int hi, int wl, int m, bool unpack) {
     size_t z=blockIdx.x*size_t(blockDim.x)+threadIdx.x;
@@ -143,6 +151,7 @@ template<class T> Phases jacobi(Grid& original, rocblas_handle h, Device<T>& inp
                 BLAS(rocsolver_dsyevd(h,rocblas_evect_original,
                     rocblas_fill_lower,m,precise.p,m,precise_d.p,precise_e.p,info.p));
                 cast<<<(size_t(m)*m+255)/256,256>>>(u.p,precise.p,size_t(m)*m);
+                cast<<<(m+255)/256,256>>>(d.p,precise_d.p,m);
             } else BLAS(rocsolver_ssyevd(h,rocblas_evect_original,
                 rocblas_fill_lower,m,u.p,m,d.p,e.p,info.p));
             int bad=info.get()[0]!=0;
@@ -150,7 +159,7 @@ template<class T> Phases jacobi(Grid& original, rocblas_handle h, Device<T>& inp
             if (bad) throw std::runtime_error("Jacobi local SYEVD info != 0");
             normalize_columns<<<m,256>>>(u.p,m);
             solve_time+=MPI_Wtime()-t;
-            // All rotations are now frozen; no diagonal eigenvalues are installed.
+            // Freeze all rotations before the two-sided update.
             t=MPI_Wtime();
             bulk_gemm(h,false,n,g.nc,m,T(1),pa.p,n,u.p+size_t(offset)*m,m,T(0),scratch.p,n);
             HIP(hipMemcpyAsync(a.p,scratch.p,a.n*sizeof(T),hipMemcpyDeviceToDevice));
@@ -175,6 +184,10 @@ template<class T> Phases jacobi(Grid& original, rocblas_handle h, Device<T>& inp
                 rows<<<(size_t(mm)*g.nc+255)/256,256>>>(left.p,a.p,n,g.nc,x*b,y*b,wx,mm,true);
                 HIP(hipGetLastError()); sync(); rotation_time+=MPI_Wtime()-t;
             }
+            // In exact arithmetic this principal block is diag(d). Avoid retaining
+            // GEMM cancellation noise as the next sweep's off-diagonal floor.
+            diagonal_pivot<<<(size_t(m)*g.nc+255)/256,256>>>(a.p,d.p,n,g.nc,lo*b,hi*b,wl,m,offset);
+            HIP(hipGetLastError());
             int last=circle.back();
             for (int k=p-1;k>1;--k) circle[k]=circle[k-1];
             circle[1]=last;

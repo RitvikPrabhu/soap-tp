@@ -196,22 +196,31 @@ Grid* tridiagonal_grid=nullptr;
 std::vector<double> supplied_matrix;
 std::string basis_file;
 std::string torch_reference;
-template<class T> __global__ void to_half(__half* out, const T* in, int rows, int cols, int ld, int parts) {
+template<class T> __global__ void to_half(__half* out, const T* in, int rows, int cols,
+    int ld, int parts, bool stack_rows, bool swap) {
     size_t z=blockIdx.x*size_t(blockDim.x)+threadIdx.x;
     if (z<size_t(rows)*cols) {
         float x=float(in[z%rows+(z/rows)*ld]);
         // MI200 MFMA flushes FP16 subnormals. Route them through the scaled low part.
-        out[z]=__float2half(parts==2 && fabsf(x)<0x1p-14f ? 0.f : x);
-        if (parts==2) out[z+size_t(rows)*cols]=__float2half((x-__half2float(out[z]))*4096.f);
+        __half high=__float2half(parts==2 && fabsf(x)<0x1p-14f ? 0.f : x);
+        size_t hi=parts==2 && stack_rows ? z%rows+2*(z/rows)*rows : z;
+        size_t lo=hi+(stack_rows?rows:size_t(rows)*cols);
+        if (parts==2 && swap) { size_t t=hi; hi=lo; lo=t; }
+        out[hi]=high;
+        if (parts==2) out[lo]=__float2half((x-__half2float(high))*4096.f);
     }
 }
 template<class T> __global__ void to_bfloat16(rocblas_bfloat16* out, const T* in,
-    int rows, int cols, int ld, int parts) {
+    int rows, int cols, int ld, int parts, bool stack_rows, bool swap) {
     size_t z=blockIdx.x*size_t(blockDim.x)+threadIdx.x;
     if (z<size_t(rows)*cols) {
         float x=float(in[z%rows+(z/rows)*ld]);
-        out[z]=rocblas_bfloat16(x);
-        if (parts==2) out[z+size_t(rows)*cols]=rocblas_bfloat16(x-float(out[z]));
+        rocblas_bfloat16 high(x);
+        size_t hi=parts==2 && stack_rows ? z%rows+2*(z/rows)*rows : z;
+        size_t lo=hi+(stack_rows?rows:size_t(rows)*cols);
+        if (parts==2 && swap) { size_t t=hi; hi=lo; lo=t; }
+        out[hi]=high;
+        if (parts==2) out[lo]=rocblas_bfloat16(x-float(high));
     }
 }
 template<class T> void bulk_gemm(rocblas_handle h, bool trans, int m, int n, int k,
@@ -222,21 +231,24 @@ template<class T> void bulk_gemm(rocblas_handle h, bool trans, int m, int n, int
     int parts=half_bulk ? half_bulk : bf16_bulk;
     Device<uint16_t> ah(an*parts), bh(bn*parts);
     if (half_bulk) {
-        to_half<<<(an+255)/256,256>>>(reinterpret_cast<__half*>(ah.p),a,ar,ac,lda,parts);
-        to_half<<<(bn+255)/256,256>>>(reinterpret_cast<__half*>(bh.p),b,br,bc,ldb,parts);
+        to_half<<<(an+255)/256,256>>>(reinterpret_cast<__half*>(ah.p),a,ar,ac,lda,parts,trans,false);
+        to_half<<<(bn+255)/256,256>>>(reinterpret_cast<__half*>(bh.p),b,br,bc,ldb,parts,!transb,true);
     } else {
-        to_bfloat16<<<(an+255)/256,256>>>(reinterpret_cast<rocblas_bfloat16*>(ah.p),a,ar,ac,lda,parts);
-        to_bfloat16<<<(bn+255)/256,256>>>(reinterpret_cast<rocblas_bfloat16*>(bh.p),b,br,bc,ldb,parts);
+        to_bfloat16<<<(an+255)/256,256>>>(reinterpret_cast<rocblas_bfloat16*>(ah.p),a,ar,ac,lda,parts,trans,false);
+        to_bfloat16<<<(bn+255)/256,256>>>(reinterpret_cast<rocblas_bfloat16*>(bh.p),b,br,bc,ldb,parts,!transb,true);
     }
     HIP(hipGetLastError());
-    // Two-part mode omits only A_low B_low; accumulators and matrix state remain FP32.
+    // [A_hi A_lo] [B_lo; B_hi] combines both correction products in one GEMM.
+    // Only A_lo B_lo is omitted; accumulation and matrix state remain FP32.
     auto datatype=half_bulk ? rocblas_datatype_f16_r : rocblas_datatype_bf16_r;
-    for (int term=0;term<(parts==2?3:1);++term) {
+    int la=parts==2 && trans ? 2*ar : ar, lb=parts==2 && !transb ? 2*br : br;
+    size_t bhi=parts==2 ? (transb?bn:br) : 0;
+    for (int term=0;term<parts;++term) {
         T add=term?T(1):beta, factor=term && half_bulk ? alpha/T(4096) : alpha;
         BLAS(rocblas_gemm_ex(h,trans?rocblas_operation_transpose:rocblas_operation_none,
-            transb?rocblas_operation_transpose:rocblas_operation_none,m,n,k,
-            &factor,ah.p+(term==2?an:0),datatype,ar,
-            bh.p+(term==1?bn:0),datatype,br,
+            transb?rocblas_operation_transpose:rocblas_operation_none,m,n,term?2*k:k,
+            &factor,ah.p,datatype,la,
+            bh.p+(term?0:bhi),datatype,lb,
             &add,c,rocblas_datatype_f32_r,ldc,c,rocblas_datatype_f32_r,ldc,
             rocblas_datatype_f32_r,rocblas_gemm_algo_standard,0,0));
     }
@@ -297,9 +309,28 @@ template<class T> std::vector<T> compact_t(const std::vector<T>& gram,
     return std::vector<T>(t.begin(),t.end());
 }
 
+template<class T> __global__ void compact_t_device(T* out, const T* gram,
+    const double* tau, int start, int width) {
+    extern __shared__ double t[];
+    // Each row depends only on its own earlier entries; rows are independent.
+    int j=blockIdx.x*blockDim.x+threadIdx.x;
+    if (j<width) {
+        for (int i=0;i<width;++i) {
+            double sum=0;
+            if (j==i) sum=tau[start+i];
+            else if (j<i) for (int l=j;l<i;++l)
+                sum+=t[threadIdx.x+size_t(l)*blockDim.x]*(-tau[start+i]*double(gram[l+size_t(i)*width]));
+            t[threadIdx.x+size_t(i)*blockDim.x]=sum;
+            out[j+size_t(i)*width]=T(sum);
+        }
+    }
+}
+
 template<class T> void backtransform(Grid& g, rocblas_handle h, Device<T>& a,
     Device<T>& q, const std::vector<double>& tau, int block) {
     // H_start ... H_end = I - V T V^T. V is row-distributed, replicated over process columns.
+    if (std::min(block,g.n-1)>8192) throw std::runtime_error("GPU compact-WY requires panel width <= 8192");
+    Device<double> dtau(tau.size()); dtau.put(tau);
     for (int end=g.n-1;end>0;) {
         int start=((end-1)/block)*block, width=end-start;
         Device<T> v(size_t(g.nr)*width), gram(size_t(width)*width), dt(size_t(width)*width);
@@ -309,8 +340,10 @@ template<class T> void backtransform(Grid& g, rocblas_handle h, Device<T>& a,
             int take=std::min(end-k,g.b-k%g.b), owner=(k/g.b)%g.pc;
             size_t offset=size_t(k-start)*g.nr, count=size_t(take)*g.nr;
             T* buf=g.gpu_mpi?v.p+offset:hostv.data()+offset;
-            if (g.c==owner) HIP(hipMemcpy(buf,a.p+size_t(g.li(k,g.pc))*g.nr,count*sizeof(T),
-                g.gpu_mpi?hipMemcpyDeviceToDevice:hipMemcpyDeviceToHost));
+            if (g.c==owner) {
+                if (g.gpu_mpi) HIP(hipMemcpyAsync(buf,a.p+size_t(g.li(k,g.pc))*g.nr,count*sizeof(T),hipMemcpyDeviceToDevice));
+                else HIP(hipMemcpy(buf,a.p+size_t(g.li(k,g.pc))*g.nr,count*sizeof(T),hipMemcpyDeviceToHost));
+            }
             if (g.gpu_mpi && !g.rccl) HIP(hipDeviceSynchronize());
             if (g.gpu_mpi) g.device_bcast(buf,count,owner,g.row);
             else g.bcast(buf,count,owner,g.row);
@@ -319,7 +352,9 @@ template<class T> void backtransform(Grid& g, rocblas_handle h, Device<T>& a,
         if (!g.gpu_mpi) v.put(hostv);
         gemm(h,true,width,width,g.nr,T(1),v.p,g.nr,v.p,g.nr,T(0),gram.p,width);
         g.device_sum(gram,g.col);
-        dt.put(compact_t(gram.get(),tau,start,width));
+        int threads=64;
+        while (size_t(threads)*width*sizeof(double)>65536) threads/=2;
+        compact_t_device<<<(width+threads-1)/threads,threads,size_t(threads)*width*sizeof(double)>>>(dt.p,gram.p,dtau.p,start,width);
         bulk_gemm(h,true,width,g.nc,g.nr,T(1),v.p,g.nr,q.p,g.nr,T(0),y.p,width);
         g.device_sum(y,g.col);
         gemm(h,false,width,g.nc,width,T(1),dt.p,width,y.p,width,T(0),ty.p,width);
