@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -31,6 +32,12 @@ void pdgemr2d_(const int*, const int*, const double*, const int*, const int*, co
               double*, const int*, const int*, const int*, const int*);
 void dsyev_(const char*, const char*, const int*, double*, const int*, double*,
             double*, const int*, int*);
+void dstemr_(const char*, const char*, const int*, double*, double*, const double*, const double*,
+             const int*, const int*, int*, double*, double*, const int*, const int*, int*, int*,
+             double*, const int*, int*, const int*, int*);
+void sstemr_(const char*, const char*, const int*, float*, float*, const float*, const float*,
+             const int*, const int*, int*, float*, float*, const int*, const int*, int*, int*,
+             float*, const int*, int*, const int*, int*);
 void dgemv_(const char*, const int*, const int*, const double*, const double*,
             const int*, const double*, const int*, const double*, double*, const int*);
 void dger_(const int*, const int*, const double*, const double*, const int*,
@@ -141,6 +148,7 @@ struct Grid {
         return out;
     }
     template<class T> void device_sum(Device<T>& d, MPI_Comm comm_) {
+        if ((comm_==row ? pc : pr)==1) return;
         if (rccl) {
             double t=MPI_Wtime();
             CCL(ncclAllReduce(d.p,d.p,d.n,std::is_same_v<T,double>?ncclFloat64:ncclFloat32,
@@ -180,9 +188,14 @@ int half_bulk=0, bf16_bulk=0;
 bool elpa_times=false;
 int band_width=0;
 bool device_vectors=false;
+bool lower_triangle=false;
+int jacobi_sweeps=8;
+double jacobi_tol=0;
+bool jacobi_pivot64=false;
 Grid* tridiagonal_grid=nullptr;
 std::vector<double> supplied_matrix;
 std::string basis_file;
+std::string torch_reference;
 template<class T> __global__ void to_half(__half* out, const T* in, int rows, int cols, int ld, int parts) {
     size_t z=blockIdx.x*size_t(blockDim.x)+threadIdx.x;
     if (z<size_t(rows)*cols) {
@@ -270,6 +283,7 @@ template<class T> void store_column(Grid& g, Device<T>& a, int k, const std::vec
 struct Phases { double reduction=0, tridiag=0, back=0, cpu_qr=0, retile=0; };
 
 template<class T> double tridiagonal_elpa(Grid&, std::vector<double>&, std::vector<double>&, std::vector<double>&);
+template<class T> double tridiagonal_mrrr(Grid&, std::vector<double>&, std::vector<double>&, std::vector<double>&);
 
 template<class T> std::vector<T> compact_t(const std::vector<T>& gram,
     const std::vector<double>& tau, int start, int width) {
@@ -314,9 +328,16 @@ template<class T> void backtransform(Grid& g, rocblas_handle h, Device<T>& a,
     }
 }
 
+__device__ void write_reflector(double norm, double alpha, double diagonal, double* s,
+    double* d, double* e, double* tau, int k) {
+    double beta=norm!=0 ? -copysign(hypot(alpha,norm),alpha) : alpha;
+    d[k]=diagonal; e[k]=beta; tau[k]=norm!=0 ? (beta-alpha)/beta : 0;
+    s[5]=alpha-beta;
+}
+
 // Gather local scaled norm pairs once, rather than globally reducing max then sum.
 template<class T> __global__ void local_statistics(const T* v, int nr, int tail,
-    int diagonal, int alpha, double* s) {
+    int diagonal, int alpha, double* s, double* d, double* e, double* tau, int k, bool single) {
     __shared__ double partial[256];
     __shared__ double scale;
     int t=threadIdx.x;
@@ -340,6 +361,7 @@ template<class T> __global__ void local_statistics(const T* v, int nr, int tail,
         s[0]=scale; s[1]=partial[0];
         s[2]=alpha<0 ? 0 : double(v[alpha]);
         s[3]=diagonal<0 ? 0 : double(v[diagonal]);
+        if (single) write_reflector(scale*sqrt(partial[0]),s[2],s[3],s,d,e,tau,k);
     }
 }
 
@@ -352,10 +374,7 @@ __global__ void reflector_scalar(const double* gathered, int pr, double* s,
         sum+=gathered[4*r+1]*ratio*ratio;
         alpha+=gathered[4*r+2]; diagonal+=gathered[4*r+3];
     }
-    double norm=scale*sqrt(sum);
-    double beta=norm!=0 ? -copysign(hypot(alpha,norm),alpha) : alpha;
-    d[k]=diagonal; e[k]=beta; tau[k]=norm!=0 ? (beta-alpha)/beta : 0;
-    s[5]=alpha-beta;
+    write_reflector(scale*sqrt(sum),alpha,diagonal,s,d,e,tau,k);
 }
 
 template<class T> __global__ void vector_dot(const T* v, T* w, int nr, int start,
@@ -374,7 +393,7 @@ template<class T> __global__ void vector_dot(const T* v, T* w, int nr, int start
     if (!t) s[4]=partial[0];
 }
 
-template<class T> __global__ void form_vectors(T* v, T* vc, T* w, T* column, const T* packed,
+template<class T> __global__ void form_vectors(T* v, T* vc, T* w, T* column, const T* raw, const T* packed,
     const int* rows, const int* cols, int nr, int nc, int padded, int b, int pr,
     int k, const double* s, const double* tau) {
     int i=blockIdx.x*blockDim.x+threadIdx.x;
@@ -382,7 +401,7 @@ template<class T> __global__ void form_vectors(T* v, T* vc, T* w, T* column, con
         w[i]=0;
         if (i>=nr || rows[i]<=k) v[i]=0;
         else if (rows[i]==k+1) v[i]=1;
-        else if (tau[k]!=0) v[i]=T(double(v[i])/s[5]);
+        else v[i]=tau[k]!=0 ? T(double(raw[i])/s[5]) : raw[i];
         if (column && i<nr) column[i]=v[i];
     }
     if (i<nc) {
@@ -392,11 +411,11 @@ template<class T> __global__ void form_vectors(T* v, T* vc, T* w, T* column, con
     }
 }
 
-template<class T> __global__ void correct_vectors(T* w, T* wc, const T* v,
+template<class T> __global__ void correct_vectors(T* w, T* wc, const T* input, const T* v,
     const T* vc, const T* packed, const int* cols, int nc, int padded, int b,
     int pr, const double* s, const double* tau, int k) {
     int i=blockIdx.x*blockDim.x+threadIdx.x;
-    if (i<padded) w[i]-=T(.5*tau[k]*s[4]*double(v[i]));
+    if (i<padded) w[i]=input[i]-T(.5*tau[k]*s[4]*double(v[i]));
     if (i<nc) {
         int r=cols[i];
         T value=packed[size_t((r/b)%pr)*padded+(r/b/pr)*b+r%b];
@@ -405,55 +424,145 @@ template<class T> __global__ void correct_vectors(T* w, T* wc, const T* v,
 }
 
 template<class T> __global__ void local_rank2(T* a, const T* v, const T* w,
-    const T* vc, const T* wc, int nr, int nc, int r0, int c0) {
+    const T* vc, const T* wc, int nr, int nc, int r0, int c0,
+    const int* rows=nullptr, const int* cols=nullptr) {
     int i=r0+blockIdx.x*blockDim.x+threadIdx.x;
     int j=c0+blockIdx.y*blockDim.y+threadIdx.y;
-    if (i<nr && j<nc) {
+    if (i<nr && j<nc && (!rows || rows[i]>=cols[j])) {
         a[i+size_t(j)*nr]-=v[i]*wc[j]+w[i]*vc[j];
     }
 }
 
+template<class T> __global__ void symmetric_av(const T* a, const T* v, const T* vc,
+    T* out, const int* rows, const int* cols, int nr, int nc, int r0, int c0) {
+    __shared__ T partial[8][32];
+    int x=threadIdx.x, y=threadIdx.y;
+    int i=r0+32*blockIdx.x+x, j0=c0+32*blockIdx.y;
+    if (rows[min(nr-1,r0+32*int(blockIdx.x)+31)]<cols[j0]) return;
+    T sum=0;
+    for (int t=0;t<32;t+=8) {
+        int j=j0+y+t;
+        T column=0;
+        if (i<nr && j<nc && rows[i]>=cols[j]) {
+            T value=a[i+size_t(j)*nr];
+            sum+=value*vc[j];
+            if (rows[i]!=cols[j]) column=value*v[i];
+        }
+        for (int delta=16;delta;delta/=2) column+=__shfl_down(column,delta,32);
+        if (!x && j<nc && column!=T(0)) atomicAdd(out+cols[j],column);
+    }
+    partial[y][x]=sum; __syncthreads();
+    if (!y && i<nr) {
+        for (int t=1;t<8;++t) sum+=partial[t][x];
+        if (sum!=T(0)) atomicAdd(out+rows[i],sum);
+    }
+}
+
+template<class T> __global__ void local_rows(T* out, const T* full, const int* rows, int nr) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if (i<nr) out[i]=full[rows[i]];
+}
+
+template<class T> __global__ void retain_panel(T* u, T* cross, const T* v, const T* w,
+    const T* vc, const T* wc, int nr, int nc, int pos, int panel) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if (i<nr) { u[i+size_t(pos)*nr]=v[i]; u[i+size_t(pos+panel)*nr]=w[i]; }
+    if (i<nc) { cross[i+size_t(pos)*nc]=wc[i]; cross[i+size_t(pos+panel)*nc]=vc[i]; }
+}
+
+template<class T> __global__ void panel_dot(T* coeff, const T* u, const T* v, int nr, int panel) {
+    __shared__ double partial[256];
+    int t=threadIdx.x, j=(blockIdx.x+panel)%(2*panel);
+    double sum=0;
+    for (int i=t;i<nr;i+=256) sum+=double(u[i+size_t(j)*nr])*double(v[i]);
+    partial[t]=sum; __syncthreads();
+    for (int stride=128;stride;stride/=2) {
+        if (t<stride) partial[t]+=partial[t+stride];
+        __syncthreads();
+    }
+    if (!t) coeff[blockIdx.x]=T(partial[0]);
+}
+
 template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T>& a,
     Device<int>& rows, Device<int>& cols, std::vector<double>& d,
-    std::vector<double>& e, std::vector<double>& tau) {
+    std::vector<double>& e, std::vector<double>& tau, int panel) {
     int padded=((g.n+g.b*g.pr-1)/(g.b*g.pr))*g.b;
     Device<T> v(padded), w(padded), vc(g.nc), wc(g.nc), packed(size_t(padded)*g.pr);
+    Device<T> full_w(lower_triangle ? g.n : 1);
+    Device<T> u(size_t(g.nr)*2*panel), cross(size_t(g.nc)*2*panel), coeff(2*panel);
     Device<double> scalars(6), statistics(4*g.pr), dd(g.n), ee(g.n), tt(g.n-1);
     HIP(hipMemsetAsync(dd.p,0,dd.n*sizeof(double)));
     HIP(hipMemsetAsync(ee.p,0,ee.n*sizeof(double)));
     auto gather=[&](Device<T>& local) {
         double clock=MPI_Wtime();
-        CCL(ncclAllGather(local.p,packed.p,padded,std::is_same_v<T,double>?ncclFloat64:ncclFloat32,g.ccl_col,nullptr));
+        if (g.pr==1) HIP(hipMemcpyAsync(packed.p,local.p,padded*sizeof(T),hipMemcpyDeviceToDevice));
+        else CCL(ncclAllGather(local.p,packed.p,padded,std::is_same_v<T,double>?ncclFloat64:ncclFloat32,g.ccl_col,nullptr));
         g.comm+=MPI_Wtime()-clock;
     };
     for (int k=0;k<g.n-1;++k) {
         int owner=(k/g.b)%g.pc;
         T* column=g.c==owner ? a.p+size_t(g.li(k,g.pc))*g.nr : nullptr;
+        if (panel>1) {
+            if (k%panel==0) {
+                HIP(hipMemsetAsync(u.p,0,u.n*sizeof(T)));
+                HIP(hipMemsetAsync(cross.p,0,cross.n*sizeof(T)));
+            } else if (column) {
+                correct_column<<<(g.nr+255)/256,256>>>(a.p,u.p,cross.p,g.nr,g.nc,g.li(k,g.pc),panel);
+            }
+        }
         double clock=MPI_Wtime();
-        CCL(ncclBroadcast(column ? column : v.p,v.p,g.nr,std::is_same_v<T,double>?ncclFloat64:ncclFloat32,owner,g.ccl_row,nullptr));
+        T* raw=g.pr==1 ? packed.p : v.p;
+        if (g.pc==1) HIP(hipMemcpyAsync(raw,column,g.nr*sizeof(T),hipMemcpyDeviceToDevice));
+        else CCL(ncclBroadcast(column ? column : raw,raw,g.nr,std::is_same_v<T,double>?ncclFloat64:ncclFloat32,owner,g.ccl_row,nullptr));
         g.comm+=MPI_Wtime()-clock;
         int r0=std::upper_bound(g.rows.begin(),g.rows.end(),k)-g.rows.begin();
         int c0=std::upper_bound(g.cols.begin(),g.cols.end(),k)-g.cols.begin();
         int diagonal=(k/g.b)%g.pr==g.r ? g.li(k,g.pr) : -1;
         int alpha=((k+1)/g.b)%g.pr==g.r ? g.li(k+1,g.pr) : -1;
-        local_statistics<<<1,256>>>(v.p,g.nr,r0+(alpha>=0),diagonal,alpha,scalars.p);
+        local_statistics<<<1,256>>>(raw,g.nr,r0+(alpha>=0),diagonal,alpha,scalars.p,dd.p,ee.p,tt.p,k,g.pr==1);
         clock=MPI_Wtime();
-        CCL(ncclAllGather(scalars.p,statistics.p,4,ncclFloat64,g.ccl_col,nullptr));
+        if (g.pr>1) CCL(ncclAllGather(scalars.p,statistics.p,4,ncclFloat64,g.ccl_col,nullptr));
         g.comm+=MPI_Wtime()-clock;
-        reflector_scalar<<<1,1>>>(statistics.p,g.pr,scalars.p,dd.p,ee.p,tt.p,k);
-        gather(v);
-        form_vectors<<<(std::max(padded,g.nc)+255)/256,256>>>(v.p,vc.p,w.p,column,packed.p,rows.p,cols.p,g.nr,g.nc,padded,g.b,g.pr,k,scalars.p,tt.p);
-        if (r0<g.nr && c0<g.nc) gemv(h,false,g.nr-r0,g.nc-c0,g.nr,
-            a.p+r0+size_t(c0)*g.nr,vc.p+c0,w.p+r0);
-        g.device_sum(w,g.row);
+        if (g.pr>1) {
+            reflector_scalar<<<1,1>>>(statistics.p,g.pr,scalars.p,dd.p,ee.p,tt.p,k);
+            gather(v);
+        }
+        form_vectors<<<(std::max(padded,g.nc)+255)/256,256>>>(v.p,vc.p,w.p,column,raw,packed.p,rows.p,cols.p,g.nr,g.nc,padded,g.b,g.pr,k,scalars.p,tt.p);
+        if (lower_triangle) {
+            HIP(hipMemsetAsync(full_w.p,0,full_w.n*sizeof(T)));
+            if (r0<g.nr && c0<g.nc)
+                symmetric_av<<<dim3((g.nr-r0+31)/32,(g.nc-c0+31)/32),dim3(32,8)>>>(a.p,v.p,vc.p,full_w.p,rows.p,cols.p,g.nr,g.nc,r0,c0);
+            g.device_sum(full_w,g.row); g.device_sum(full_w,g.col);
+            local_rows<<<(g.nr+255)/256,256>>>(w.p,full_w.p,rows.p,g.nr);
+        } else {
+            if (r0<g.nr && c0<g.nc) gemv(h,false,g.nr-r0,g.nc-c0,g.nr,
+                a.p+r0+size_t(c0)*g.nr,vc.p+c0,w.p+r0);
+            g.device_sum(w,g.row);
+        }
+        if (panel>1 && k%panel) {
+            if (g.pr<g.pc) {
+                panel_dot<<<2*panel,256>>>(coeff.p,u.p,v.p,g.nr,panel);
+                g.device_sum(coeff,g.col);
+            } else {
+                gemv(h,true,g.nc,2*panel,g.nc,cross.p,vc.p,coeff.p);
+                g.device_sum(coeff,g.row);
+            }
+            gemv(h,false,g.nr,2*panel,g.nr,u.p,coeff.p,w.p,T(-1),T(1));
+        }
         vector_dot<<<1,256>>>(v.p,w.p,g.nr,r0,k,scalars.p,tt.p);
         clock=MPI_Wtime();
-        CCL(ncclAllReduce(scalars.p+4,scalars.p+4,1,ncclFloat64,ncclSum,g.ccl_col,nullptr));
+        if (g.pr>1) CCL(ncclAllReduce(scalars.p+4,scalars.p+4,1,ncclFloat64,ncclSum,g.ccl_col,nullptr));
         g.comm+=MPI_Wtime()-clock;
-        gather(w);
-        correct_vectors<<<(std::max(padded,g.nc)+255)/256,256>>>(w.p,wc.p,v.p,vc.p,packed.p,cols.p,g.nc,padded,g.b,g.pr,scalars.p,tt.p,k);
+        if (g.pr>1) gather(w);
+        T* corrected=g.pr==1 ? packed.p : w.p;
+        correct_vectors<<<(std::max(padded,g.nc)+255)/256,256>>>(corrected,wc.p,w.p,v.p,vc.p,g.pr==1 ? w.p : packed.p,cols.p,g.nc,padded,g.b,g.pr,scalars.p,tt.p,k);
         int mr=g.nr-r0, mc=g.nc-c0;
-        if (mr && mc) local_rank2<<<dim3((mr+127)/128,(mc+1)/2),dim3(128,2)>>>(a.p,v.p,w.p,vc.p,wc.p,g.nr,g.nc,r0,c0);
+        if (panel>1) {
+            retain_panel<<<(std::max(g.nr,g.nc)+255)/256,256>>>(u.p,cross.p,v.p,corrected,vc.p,wc.p,g.nr,g.nc,k%panel,panel);
+            if (mr && mc && ((k+1)%panel==0 || k==g.n-2))
+                bulk_gemm(h,false,mr,mc,2*panel,T(-1),u.p+r0,g.nr,cross.p+c0,g.nc,
+                    T(1),a.p+r0+size_t(c0)*g.nr,g.nr,true);
+        } else if (mr && mc) local_rank2<<<dim3((mr+127)/128,(mc+1)/2),dim3(128,2)>>>(a.p,v.p,corrected,vc.p,wc.p,g.nr,g.nc,r0,c0,lower_triangle?rows.p:nullptr,cols.p);
         HIP(hipGetLastError());
     }
     d=dd.get(); e=ee.get(); tau=tt.get();
@@ -470,7 +579,7 @@ template<class T> Phases custom(Grid& g, rocblas_handle h, Device<T>& a,
     HIP(hipMemset(vy.p,0,vy.n*sizeof(T)));
     std::vector<double> d(g.n), e(g.n,0), tau(g.n-1);
     double start=g.tick();
-    if (device_vectors) reduce_device_vectors(g,h,a,dr,dc,d,e,tau);
+    if (device_vectors) reduce_device_vectors(g,h,a,dr,dc,d,e,tau,panel);
     else for (int k=0;k<g.n-1;++k) {
         if (panel>1) {
             if (k%panel==0) {
@@ -547,9 +656,14 @@ template<class T> Phases custom(Grid& g, rocblas_handle h, Device<T>& a,
     }
     d.back()=column(g,a,g.n-1).back();
     times.reduction=g.tick()-start;
-    // Distributed divide-and-conquer. Only O(n) d/e are replicated.
+    // Distributed tridiagonal eigensolution. Only O(n) d/e are replicated.
     std::vector<double> z(size_t(g.nr)*g.nc);
     if (tridiag=="elpa") times.retile=tridiagonal_elpa<double>(g,d,e,z);
+    else if (tridiag=="mrrr") times.retile=tridiagonal_mrrr<double>(g,d,e,z);
+    else if (tridiag=="mrrr32") {
+        if constexpr(std::is_same_v<T,double>) throw std::runtime_error("mrrr32 requires FP32 dense state");
+        times.retile=tridiagonal_mrrr<float>(g,d,e,z);
+    }
     else if (tridiag=="elpa32") {
         if constexpr(std::is_same_v<T,double>) throw std::runtime_error("elpa32 requires FP32 dense state");
         times.retile=tridiagonal_elpa<float>(g,d,e,z);
@@ -687,6 +801,34 @@ template<class T> double tridiagonal_elpa(Grid& g, std::vector<double>& d, std::
     }
     return retile;
 }
+template<class T> double tridiagonal_mrrr(Grid& g, std::vector<double>& d,
+    std::vector<double>& e, std::vector<double>& z) {
+    int p=g.pr*g.pc, chunk=(g.n+p-1)/p;
+    if ((p-1)*chunk>=g.n) throw std::runtime_error("MRRR layout requires a nonempty final column block");
+    Grid target(g.n,chunk,1,p,false,false);
+    int first=g.rank*chunk+1, last=std::min(g.n,first+chunk-1), count=last-first+1;
+    std::vector<T> diag(d.begin(),d.end()), off(e.begin(),e.end()), values(g.n);
+    std::vector<T> vectors(size_t(g.n)*count), work(18*g.n);
+    std::vector<int> support(2*count), iwork(10*g.n);
+    int m=0, nzc=count, lwork=work.size(), liwork=iwork.size(), tryrac=1, info=0;
+    T unused=0;
+    if constexpr(std::is_same_v<T,double>) dstemr_("V","I",&g.n,diag.data(),off.data(),&unused,&unused,
+        &first,&last,&m,values.data(),vectors.data(),&g.n,&nzc,support.data(),&tryrac,
+        work.data(),&lwork,iwork.data(),&liwork,&info);
+    else sstemr_("V","I",&g.n,diag.data(),off.data(),&unused,&unused,
+        &first,&last,&m,values.data(),vectors.data(),&g.n,&nzc,support.data(),&tryrac,
+        work.data(),&lwork,iwork.data(),&liwork,&info);
+    if (info || m!=count) throw std::runtime_error("STEMR failed: info="+std::to_string(info)+", m="+std::to_string(m));
+    std::fill(d.begin(),d.end(),0);
+    for (int j=0;j<count;++j) d[first-1+j]=values[j];
+    g.sum(d.data(),g.n,MPI_COMM_WORLD);
+    std::vector<double> local(vectors.begin(),vectors.end());
+    double begin=MPI_Wtime(); int one=1;
+    pdgemr2d_(&g.n,&g.n,local.data(),&one,&one,target.desc,
+        z.data(),&one,&one,g.desc,&g.ctxt);
+    return g.maximum(MPI_Wtime()-begin);
+}
+
 template<class T> void elpa_solve(Grid& g, Device<T>& a, Device<T>& q,
                                   std::vector<double>& eigenvalues, int solver, int bandwidth=0) {
     auto e=elpa_handle(g,solver,bandwidth); int error;
@@ -813,11 +955,13 @@ std::vector<double> top_columns(Grid& g, const std::vector<double>& a, int width
     return top;
 }
 
+#include "jacobi.hpp"
+
 template<class T> void run(Grid& g, const std::string& solver, const std::string& name,
     const std::string& quant, bool reference, int repeat, int back_block, int panel, const std::string& tridiag) {
     if (repeat<1 || back_block<1 || panel<1) throw std::runtime_error("repeat and block widths must be positive");
-    if (tridiag!="scalapack" && tridiag!="elpa" && tridiag!="elpa32")
-        throw std::runtime_error("tridiag must be scalapack, elpa, or elpa32");
+    if (tridiag!="scalapack" && tridiag!="elpa" && tridiag!="elpa32" && tridiag!="mrrr" && tridiag!="mrrr32")
+        throw std::runtime_error("tridiag must be scalapack, elpa, elpa32, mrrr, or mrrr32");
     rocblas_handle h; BLAS(rocblas_create_handle(&h));
     double begin=g.tick();
     auto original=matrix(g,name,"none"), input=matrix(g,name,quant);
@@ -830,6 +974,10 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
     for (int trial=0;trial<repeat;++trial) {
         a.put(at); g.comm=0; device_peak_bytes=device_live_bytes; double start=g.tick();
         if (solver=="custom") phases=band_width ? custom_band(g,h,a,q,eval,back_block) : custom(g,h,a,q,eval,back_block,panel,tridiag);
+        else if (solver=="jacobi") {
+            if (band_width) throw std::runtime_error("Jacobi is incompatible with --band");
+            phases=jacobi(g,h,a,q,eval,jacobi_sweeps,jacobi_tol);
+        }
         else if (solver=="elpa1" || solver=="elpa2")
             elpa_solve(g,a,q,eval,solver=="elpa1"?ELPA_SOLVER_1STAGE:ELPA_SOLVER_2STAGE);
         else if (solver=="rocsolver") {
@@ -845,10 +993,10 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
         } else throw std::runtime_error("unknown solver");
         total=g.maximum(g.tick()-start);
         double peak_mib=g.maximum(device_peak_bytes/1048576.);
-        if (g.rank==0) std::printf("TIMING solver=%s trial=%d n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s total=%.9g reduction=%.9g tridiag=%.9g back=%.9g back_block=%d gpu_mpi=%d panel=%d tridiag_backend=%s rccl=%d half_bulk=%d band=%d cpu_qr=%.9g managed_gpu_peak_mib=%.9g device_vectors=%d tridiag_grid=%dx%d retile=%.9g bf16_bulk=%d async_alloc=%d\n",
+        if (g.rank==0) std::printf("TIMING solver=%s trial=%d n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s total=%.9g reduction=%.9g tridiag=%.9g back=%.9g back_block=%d gpu_mpi=%d panel=%d tridiag_backend=%s rccl=%d half_bulk=%d band=%d cpu_qr=%.9g managed_gpu_peak_mib=%.9g device_vectors=%d tridiag_grid=%dx%d retile=%.9g bf16_bulk=%d async_alloc=%d lower_triangle=%d\n",
             solver.c_str(),trial,g.n,g.pr,g.pc,g.b,std::is_same_v<T,double>?"fp64":"fp32",name.c_str(),quant.c_str(),total,
-            phases.reduction,phases.tridiag,phases.back,back_block,int(g.gpu_mpi),panel,band_width?"elpa_banded":tridiag.c_str(),int(g.rccl),int(half_bulk),band_width,phases.cpu_qr,peak_mib,int(device_vectors),
-            tridiagonal_grid?tridiagonal_grid->pr:g.pr,tridiagonal_grid?tridiagonal_grid->pc:g.pc,phases.retile,bf16_bulk,int(async_alloc));
+            phases.reduction,phases.tridiag,phases.back,back_block,int(g.gpu_mpi),panel,solver=="jacobi"?"jacobi":band_width?"elpa_banded":tridiag.c_str(),int(g.rccl),int(half_bulk),band_width,phases.cpu_qr,peak_mib,int(device_vectors),
+            tridiagonal_grid?tridiagonal_grid->pr:g.pr,tridiagonal_grid?tridiagonal_grid->pc:g.pc,phases.retile,bf16_bulk,int(async_alloc),int(lower_triangle));
     }
     double comm=g.maximum(g.comm); g.comm=0;
     auto qt=q.get(); std::vector<double> qd(qt.begin(),qt.end());
@@ -858,7 +1006,7 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
     int one=1; double alpha=1, beta=0;
     pdtran_(&g.n,&g.n,&alpha,qd.data(),&one,&one,g.desc,&beta,trans.data(),&one,&one,g.desc);
     auto gram=product(g,h,trans,qd);
-    double sums[5]={};
+    double sums[6]={};
     for (int j=0;j<g.nc;++j) for (int i=0;i<g.nr;++i) {
         size_t z=i+size_t(j)*g.nr;
         double diff=aq[z]-qd[z]*eval[g.cols[j]];
@@ -867,13 +1015,30 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
         sums[3]+=(input[z]-original[z])*(input[z]-original[z]);
         double di=aiq[z]-qd[z]*eval[g.cols[j]];
         sums[4]+=di*di;
+        sums[5]+=qd[z]*qd[z];
     }
-    g.sum(sums,5,MPI_COMM_WORLD);
+    g.sum(sums,6,MPI_COMM_WORLD);
     int width=std::min(8,g.n);
     std::vector<double> rtop(size_t(g.n)*width);
+    std::vector<double> ref(g.n);
     double eigerr=-1, smallerr=-1, gap=-1, subspace=-1;
-    if (g.n<=512) {
-        std::vector<double> ref(g.n);
+    bool have_reference=g.n<=512 || reference || !torch_reference.empty();
+    if (!torch_reference.empty()) {
+        if (!g.rank) {
+            auto read=[&](const char* suffix, std::vector<double>& values) {
+                auto path=torch_reference+suffix;
+                auto file=std::fopen(path.c_str(),"rb");
+                if (!file) throw std::runtime_error("cannot open torch reference: "+path);
+                bool ok=std::fread(values.data(),sizeof(double),values.size(),file)==values.size();
+                ok=std::fgetc(file)==EOF && ok;
+                std::fclose(file);
+                if (!ok) throw std::runtime_error("torch reference size mismatch: "+path);
+            };
+            read(".values.bin",ref); read(".top.bin",rtop);
+        }
+        g.bcast(ref.data(),g.n,0,MPI_COMM_WORLD);
+        g.bcast(rtop.data(),rtop.size(),0,MPI_COMM_WORLD);
+    } else if (g.n<=512) {
         if (!g.rank) {
             std::vector<double> dense(size_t(g.n)*g.n);
             for (int j=0;j<g.n;++j) for (int i=0;i<g.n;++i) dense[i+size_t(j)*g.n]=entry(i,j,g.n,name);
@@ -884,15 +1049,12 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
         }
         g.bcast(ref.data(),g.n,0,MPI_COMM_WORLD);
         g.bcast(rtop.data(),rtop.size(),0,MPI_COMM_WORLD);
-        double diff=0,scale=0;
-        for(int i=0;i<g.n;++i) { diff=std::max(diff,std::abs(ref[i]-eval[i])); scale=std::max(scale,std::abs(ref[i])); }
-        eigerr=scale!=0 ? diff/scale : diff;
-        gap=width==g.n ? 1. : scale!=0 ? (ref[g.n-width]-ref[g.n-width-1])/scale : 0;
-        if (ref.front()!=0) smallerr=std::abs(ref.front()-eval.front())/std::abs(ref.front());
     } else if (reference) {
         Device<double> ar(original.size()), qr(original.size()); ar.put(original);
-        std::vector<double> ref(g.n); elpa_solve(g,ar,qr,ref,ELPA_SOLVER_2STAGE);
+        elpa_solve(g,ar,qr,ref,ELPA_SOLVER_2STAGE);
         rtop=top_columns(g,qr.get(),width);
+    }
+    if (have_reference) {
         double diff=0,scale=0;
         for(int i=0;i<g.n;++i) { diff=std::max(diff,std::abs(ref[i]-eval[i])); scale=std::max(scale,std::abs(ref[i])); }
         eigerr=scale!=0 ? diff/scale : diff;
@@ -917,12 +1079,15 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
     double residual=std::sqrt(sums[0]/normalization), orth=std::sqrt(sums[2]);
     double input_residual=std::sqrt(sums[4]/normalization);
     int negative=std::count_if(eval.begin(),eval.end(),[](double x){return x<0;});
-    if (!g.rank) std::printf("RESULT solver=%s n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s setup=%.9g total=%.9g comm=%.9g residual=%.9g orthogonality=%.9g eig_rel_max=%.9g input_rel=%.9g eig_min=%.9g eig_max=%.9g input_residual=%.9g eig_small_rel=%.9g negative=%d top_width=%d top_subspace=%.9g top_gap=%.9g\n",
+    double qnorm=std::sqrt(sums[5]), qnorm_rel=std::abs(qnorm-std::sqrt(double(g.n)))/std::sqrt(double(g.n));
+    if (!g.rank) std::printf("RESULT solver=%s n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s setup=%.9g total=%.9g comm=%.9g residual=%.9g orthogonality=%.9g eig_rel_max=%.9g input_rel=%.9g eig_min=%.9g eig_max=%.9g input_residual=%.9g eig_small_rel=%.9g negative=%d top_width=%d top_subspace=%.9g top_gap=%.9g qnorm=%.9g qnorm_rel=%.9g\n",
         solver.c_str(),g.n,g.pr,g.pc,g.b,std::is_same_v<T,double>?"fp64":"fp32",name.c_str(),quant.c_str(),setup,total,comm,
-        residual,orth,eigerr,std::sqrt(sums[3]/normalization),eval.front(),eval.back(),input_residual,smallerr,negative,width,subspace,gap);
+        residual,orth,eigerr,std::sqrt(sums[3]/normalization),eval.front(),eval.back(),input_residual,smallerr,negative,width,subspace,gap,qnorm,qnorm_rel);
     BLAS(rocblas_destroy_handle(h));
     double tol=std::is_same_v<T,double>?1e-10:1e-4;
+    double norm_tol=std::numeric_limits<T>::epsilon()*(std::is_same_v<T,double>?64*std::sqrt(double(g.n)):8);
     if (!std::isfinite(residual) || !std::isfinite(input_residual) || input_residual>tol || !std::isfinite(orth) || orth>tol*std::sqrt(g.n)
+        || !std::isfinite(qnorm_rel) || qnorm_rel>norm_tol
         || (quant=="none" && (!std::isfinite(eigerr) || eigerr>tol)))
         throw std::runtime_error("numerical validation failed");
     if (!basis_file.empty()) {
@@ -948,8 +1113,12 @@ int main(int argc,char** argv) {
         int n=std::stoi(arg("--n","64")), b=std::stoi(arg("--block","16"));
         int pr=std::stoi(arg("--pr","1")), pc=std::stoi(arg("--pc","1"));
         std::string precision=arg("--precision","fp64");
+        jacobi_sweeps=std::stoi(arg("--jacobi-sweeps","8"));
+        jacobi_tol=std::stod(arg("--jacobi-tol",precision=="fp64"?"1e-13":"2e-6"));
+        jacobi_pivot64=arg("--jacobi-pivot64","0")=="1";
         std::string input_file=arg("--input","");
         basis_file=arg("--export-basis","");
+        torch_reference=arg("--torch-reference","");
         if ((!input_file.empty() || !basis_file.empty()) && (n<2 || n>512))
             throw std::runtime_error("dense input/basis export is restricted to tiny tests, 2<=n<=512");
         if (!input_file.empty()) {
@@ -966,9 +1135,12 @@ int main(int argc,char** argv) {
         half_bulk=std::stoi(arg("--half-bulk","0"));
         bf16_bulk=std::stoi(arg("--bf16-bulk","0"));
         device_vectors=arg("--device-vectors","0")=="1";
+        lower_triangle=arg("--lower-triangle","0")=="1";
+        if (lower_triangle && (!device_vectors || std::stoi(arg("--panel","1"))!=1))
+            throw std::runtime_error("--lower-triangle requires --device-vectors 1 --panel 1");
         if (device_vectors && (arg("--rccl","0")!="1" || arg("--gpu-mpi","0")!="1" ||
-            std::stoi(arg("--panel","1"))!=1 || band_width || arg("--solver","custom")!="custom"))
-            throw std::runtime_error("--device-vectors 1 requires --solver custom --rccl 1 --gpu-mpi 1 --panel 1 and is incompatible with --band");
+            band_width || arg("--solver","custom")!="custom"))
+            throw std::runtime_error("--device-vectors 1 requires --solver custom --rccl 1 --gpu-mpi 1 and is incompatible with --band");
         if (half_bulk<0 || half_bulk>2) throw std::runtime_error("half bulk must be 0, 1, or 2");
         if (half_bulk && precision!="fp32") throw std::runtime_error("half bulk experiment requires FP32 state");
         if (bf16_bulk<0 || bf16_bulk>2 || (bf16_bulk && (precision!="fp32" || half_bulk)))

@@ -367,3 +367,58 @@ Frozen **`pool-eigh` SHA418dae0168f10d5054f4e18ed8ba25c966f7d0220259027a966f5a42
 Keep the allocation option: consistent backtransform gains, small end-to-end gains, unchanged numerical errors within each pair. The8192splitFP16/nativeFP32 total tie **does not establish a half-compute speedup**: mixed back remains slower, and unrelated tridiagonal timing differs. At16384splitFP16 clearly remains slower than nativeFP32. Select nativeFP64/FP32 plus the pool option for the practical custom path; retain mixed modes as bounded accuracy/performance alternatives.
 
 Last experimentation/job finished21:07EDT, inside the original21:35deadline. Reporting resumed at00:00EDT after a usage-limit pause; no further experiments were started after the budget expired. All674 parsed solves:664pass,10expected naive FP16/BF16 failures. No running/submitted jobs remain.
+
+## Second authorized research loop: October23 00:15–04:15 EDT
+
+Goal: improve actual FP32/FP16 distributed computation while matching same-input PyTorch accuracy. Explicitly measure `abs(normF(Q)-sqrt(n))/sqrt(n)`, residual, normalized orthogonality and invariant eigenspaces, not the basis norm alone. Existing development code remains untouched.
+
+### E28: GPU-resident delayed panels
+
+Hypothesis: batched rank2 updates reduce matrix traffic enough to offset the extra panel GEMVs/reduction. Ported the already validated CPU-panel recurrence directly into the GPU-vector path: keep local V/W panels, correct the next column, subtract pending low-rank updates from AV, and apply one GEMM at panel boundaries. No per-reflector host vectors.
+
+`device-panel-eigh` SHA8fefe950ff7a8f2d516dcfb2ea459b8f598a9427ca09d75fa4dc930454363892; job5738285 completed00:23:44, all24cases passed (16uneven97 rectangular gates, eight8192 benchmarks). FP32 warm medians on1x8 /4x2, tri8x1, block64, back128:
+
+| Panel | 1x8 seconds | 4x2 seconds |
+|---:|---:|---:|
+|1|1.733|2.240|
+|8|2.059|2.543|
+|16|2.116|2.595|
+|32|2.206|2.713|
+
+Panels reduce residual from1.42e-6 to7.01e-7, but increase total time. All8192 relative Q-norm errors2.46e-8–3.69e-8, below FP32 epsilon. Do not select panels at8192. A single16384 follow-up is justified by the previous loop's observed size-dependent CPU-panel crossover. Raw `loop2-panel.csv`, job stdout/stderr.
+
+### E29: remove single-rank collective work; establish ROCm torch comparison
+
+Hypothesis: explicitly bypass identity collectives on singleton process rows/columns, using same-stream D2D copies where layout conversion needs a snapshot. No arithmetic changes. `local-collectives-eigh` SHA0c0eda2a0a0b08fb33187e4aae0f497d023107b30697846c219c7c45f14fe66d. Tiny33 SPD FP64/FP32/splitFP16 pass direct same-input ROCm torch gates. Native FP32 residual3.37e-7 versus torch4.41e-7; normalized orth7.21e-7 versus5.48e-7; relative Q-norm1.22e-7 versus9.40e-8. No performance claim yet. Job5738338 submitted for97, four families, three seeds, FP64/FP32/splitFP16 on2x4.
+
+The installed torch is actually2.10.0+rocm7.0, HIP7.0.51831; actual GPU tiny comparisons now run. Earlier loop tables were CPU torch comparisons. Native torch FP16 eigh rejects Half, so mixed custom FP16 compute must be compared to torch FP32, not a fictitious torch Half baseline. `torch_compare.py` uses exactly FP32-representable symmetric inputs and CPU FP64 references on the same input, with precision-bounded torch-relative gates and gap-aware cluster comparisons. Relative Q-norm gate is at most8*FP32epsilon; this is an explicit bounded policy, not a guarantee that every error must be below exactly one epsilon.
+
+### Next algorithmic hypothesis
+
+Investigate block Jacobi: independent pair-pivot eigensolves and right/left GEMMs may exploit MI250X MFMA better than sequential Householder GEMV. Evidence: rocSOLVER open `syevj/heevj` applies right updates then left updates; Demmel–Luo–Schneider–Wang parallel block-Jacobi Algorithm5 and paper-linked RecursiveJacobi/BlockJacobi.m show pivot eigensolutions and two-sided updates. Freeze all disjoint pivots for a matching, complete right updates before left updates, and validate against original A. Pair coverage alone is not a general convergence proof; local sorted vectors can cause poor block pivots. A bounded prototype must fail clearly on stagnation/nonconvergence, not silently fall back. Native FP32 first; genuine FP16 split-GEMM only after correctness.
+
+E29 outcome: job5738338 completed in3m14s; all36 custom FP64/FP32/splitFP16 solves across four families and three seeds on2x4 passed the stronger measured ROCm torch gates. Job5738359 completed in4m58s, all16 solver cases passed. Paired8192 FP32 totals old/singleton-bypass/direct-layout **1.737/1.728/1.662s**, reduction1.341/1.328/1.267s. Direct layout broadcasts raw columns into the existing scratch buffer, avoids two D2D snapshots and fuses scalar formation into the singleton norm kernel; no arithmetic change. Keep this improvement. At16384 direct-layout panel1/8/32 gives **5.994/5.893/5.765s**, with reduction4.608/4.501/4.376s; the larger-size crossover is real, so retain GPU panels as an explicit16384 option, not an8192 default. At8192/4x2 splitFP16 panel1/8 totals2.240/2.589s; no panel/mixed win there. All target-size relative Q-norm errors≤3.97e-8, below eps32.
+
+### E30: bounded block-Jacobi baseline
+
+`jacobi-eigh` SHA977a65f6e4ccee3292941fc10cb49911bd0206e7016bb36ae97013b81af1b20e, job5738389. Own principal two-block pivot SYEVDs, pairwise GPU-aware MPI panels, RCCL rotation broadcasts, two-sided GEMMs and distributed final sorting; optional distributed retile from any input rectangular grid. Only narrow/two-block panels are replicated; no full dense gather. P<4/odd P are explicitly rejected for this experiment; standard Householder remains available on1/2 ranks.
+
+All15 tiny cases pass the original loose solver checks, but **six nontrivial FP32 cases fail the new Q-norm requirement**: relative norm errors1.19e-6–2.19e-6 exceed8eps32. FP32 residuals3.93e-6–5.65e-6 also trail Householder/torch. Both2048 native/split-half attempts explicitly exhaust eight sweeps without reaching2e-6 offdiag tolerance; native/split residual floors are around2.3e-6. These are rejected outcomes, not successful accuracy/performance results. Source now enforces the Q-norm bound directly, and the next candidate normalizes each pivot eigenvector using FP64 norms before applying the rotation, with optional FP64 local pivot solves (`--jacobi-pivot64 1`). This is mixed FP64-pivot/FP32-state computation, not a native FP32 eigensolve claim. Candidate `jacobi-pivot-eigh` SHAc87640c321c79a260318213bf09165bcc21f4bf85ff04e068148075a6f300531 compiled; runtime gates pending.
+
+### E31: lower-triangle-only reduction
+
+Hypothesis: halve matrix traffic by updating only the lower triangle and accumulating both symmetric AV contributions from32x32 tiles. Custom HIP tile reductions/atomics plus RCCL row-then-column AllReduce maintain O(n) vector replication and rectangular ownership. Full dense state allocation is unchanged; upper entries are simply unused. This is FP32/FP64 arithmetic, not FP16. `lower-eigh` SHA919abf5d4b9b74b8a454995cd71ba92c1c044a49a772f02e242bfafa79eb3f6b passes eight tiny31 FP64/32 random/lowrank/indefinite/zero cases. No performance claim before distributed gates and4096 paired measurement. `reference-eigh` SHA f3d3b9ae6de4ce9d117abaf060e935c032fa5f15749941e784fbc0d238a07cad adds the stronger norm guard and torch reference reader.
+
+### E32: target-size same-matrix ROCm torch controls
+
+`torch_benchmark.py` independently generates the exact C++ random family, benchmarks one-GCD native torch FP64/FP32, measures FP64 diagnostics outside solver timing, and exports only eigenvalues/top-eight reference vectors. This does not gather any custom distributed state. Small31 CPU/GPU controls and scalar hash crosschecks passed. C++ `--torch-reference PREFIX` consumes the thin reference without gathering Q; tiny31 roundtrip passes. Job5738408 is running for8192/16384. Preliminary8192 torch FP32 warm1/2 **1.506/1.507s**, residual7.16e-7, normalized orth4.03e-6, relative Q-norm3.67e-8. No native Half torch eigh exists in this installed backend; FP16 custom computation remains a mixed-precision experiment.
+
+E32 outcome: job5738408 completed2m33. Torch16384 FP32 warm13.614/13.616s; FP64 warm23.591/23.623s. FP32 residual8.74e-7, raw orth6.96e-4, relative Q-norm4.62e-8. Compare eight-GCD custom16384 panel32 5.765s, residual9.31e-7, raw orth8.98e-4, Q-norm3.69e-8; these are different GPU counts, not an eight-GPU torch benchmark. Custom8192 is still slower than single-GCD torch. Raw metrics and backend evidence: `output/custom-eigh/torch-large/`.
+
+E30/E31 component outcomes, job5738479 (`components-v2`, completed3m30): lower-only4096 .657s versus full .573s; reject as a performance improvement. Native Jacobi still exhausts eight2048 sweeps at~2.44e-6 offdiag. FP64 pivots converge in five sweeps, but native/split rotations give residual8.40e-6/2.66e-6 and eigenvalue errors1.93e-5/8.89e-6; Q-norm1.69e-8/3.40e-8 alone looks good but does not establish torch accuracy. Do not select either Jacobi variant. Small normalized pivot cases pass the norm guard but still need stronger torch comparison. Diagonal installation is a possible next algorithmic correction; no tolerance relaxation is justified.
+
+Added LAPACK DSTEMR/SSTEMR subset-vector MRRR as an independent tridiagonal path: only d/e replicated; O(n*n/P) vectors per rank followed by distributed retile. FP64 MRRR8192 passes residual/orth checks but takes~2.99s tridiagonal versus~.3s ELPA32; reject as a speed improvement. FP32 MRRR has poor orthogonality (tiny97 raw~2e-4) and fails two lowrank gates; no target-size FP32 MRRR run was justified. Keep these explicit experimental controls for algorithmic evidence, never as selected defaults. Job5738463 was canceled after48s because a duplicate suite name selected an old suite; no candidate conclusion is drawn from it.
+
+### E33: use the smaller communicator for delayed-panel coefficients
+
+Hypothesis: on1x8, row-layout V/W already contains the full vectors, so computing `[W^T v,V^T v]` directly avoids one coefficient AllReduce per reflector. `panel_dot` uses FP64 scalar reductions and selects row-layout when pr<pc; otherwise the existing column-layout GEMV remains. No dense replication added. Candidate `panel-dot-eigh` SHA f4b1d2bb5294c526cc1c970ebe9a3b5a2931e63403f9b40a979cd63c1801dece; tiny singleton FP64/32 controls pass. Job5738499 gates all rectangular grids then pairs old/new panel32 at8192/16384 and native/splitFP16 panel8/64 at16384. All eight tiny gates passed so far; performance pending.

@@ -514,6 +514,145 @@ elif [[ $1 == pool ]]; then
             run 8 --n 16384 --block 64 --pr 1 --pc 8 --tri-pr 8 --precision "$precision" --tridiag "$tridiag" --back-block 128 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc "$pool" --repeat 3 --reference 1 "${extra[@]}"
         done
     done
+elif [[ $1 == device-panel ]]; then
+    for grid in '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            for panel in 3 8; do
+                run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --precision "$precision" --panel "$panel" --back-block 13 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1
+            done
+        done
+    done
+    for panel in 1 8 16 32; do
+        for grid in '1 8' '4 2'; do
+            read -r pr pc <<< "$grid"
+            run 8 --n 8192 --block 64 --pr "$pr" --pc "$pc" --tri-pr 8 --precision fp32 --tridiag elpa32 --panel "$panel" --back-block 128 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --reference 1
+        done
+    done
+elif [[ $1 == direct-layout ]]; then
+    for grid in '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --precision "$precision" --panel 3 --back-block 13 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1
+        done
+    done
+    for binary in device-panel-eigh local-collectives-eigh direct-layout-eigh; do
+        EIGH_BIN="build/custom-eigh/$binary" run 8 --n 8192 --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --back-block 128 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --reference 1
+    done
+    for panel in 1 8 32; do
+        run 8 --n 16384 --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --panel "$panel" --back-block 128 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --reference 1
+    done
+    for panel in 1 8; do
+        if run 8 --n 8192 --block 64 --pr 4 --pc 2 --tri-pr 8 --precision fp32 --tridiag elpa32 --panel "$panel" --half-bulk 2 --back-block 128 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --reference 1; then
+            echo "PANEL_HALF_CHECK PASSED panel=$panel"
+        else
+            echo "PANEL_HALF_CHECK FAILED panel=$panel"
+        fi
+    done
+elif [[ $1 == jacobi-smoke ]]; then
+    passed=1
+    for grid in '2 4' '4 2'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            for matrix in random lowrank indefinite; do
+                if run 8 --solver jacobi --n 97 --block 8 --pr "$pr" --pc "$pc" --precision "$precision" --matrix "$matrix" --gpu-mpi 1 --rccl 1 --async-alloc 1; then
+                    echo "JACOBI_CHECK PASSED"
+                else
+                    echo "JACOBI_CHECK FAILED"; passed=0
+                fi
+            done
+        done
+    done
+    for matrix in zero diagonal clustered; do
+        if run 8 --solver jacobi --n 97 --block 8 --pr 2 --pc 4 --precision fp32 --matrix "$matrix" --gpu-mpi 1 --rccl 1 --async-alloc 1; then
+            echo "JACOBI_CHECK PASSED"
+        else
+            echo "JACOBI_CHECK FAILED"; passed=0
+        fi
+    done
+    if [[ $passed == 1 ]]; then
+        for half in 0 2; do
+            if run 8 --solver jacobi --n 2048 --block 64 --pr 1 --pc 8 --precision fp32 --half-bulk "$half" --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --reference 1; then
+                echo "JACOBI_CHECK PASSED"
+            else
+                echo "JACOBI_CHECK FAILED"
+            fi
+        done
+    fi
+elif [[ $1 == lower ]]; then
+    for grid in '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --precision "$precision" --matrix indefinite --back-block 13 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --lower-triangle 1
+        done
+    done
+    for lower in 0 1; do
+        run 8 --n 4096 --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --back-block 128 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --lower-triangle "$lower" --repeat 3 --reference 1
+    done
+elif [[ $1 == components-v2 ]]; then
+    for grid in '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --precision fp32 --matrix indefinite --back-block 13 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --lower-triangle 1
+    done
+    for lower in 0 1; do
+        run 8 --n 4096 --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --back-block 128 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --lower-triangle "$lower" --repeat 3 --reference 1
+    done
+    for tri in mrrr mrrr32; do
+        passed=1
+        for grid in '2 4' '4 2'; do
+            read -r pr pc <<< "$grid"
+            for matrix in random lowrank zero clustered; do
+                if run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --precision fp32 --matrix "$matrix" --tridiag "$tri" --back-block 13 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1; then
+                    echo "MRRR_CHECK PASSED backend=$tri"
+                else
+                    echo "MRRR_CHECK FAILED backend=$tri"; passed=0
+                fi
+            done
+        done
+        if [[ $passed == 1 ]]; then
+            if run 8 --n 8192 --block 64 --pr 1 --pc 8 --precision fp32 --tridiag "$tri" --back-block 128 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference output/custom-eigh/torch-large/n8192; then
+                echo "MRRR_CHECK PASSED backend=$tri"
+            else
+                echo "MRRR_CHECK FAILED backend=$tri"
+            fi
+        fi
+    done
+    for pivot64 in 0 1; do
+        passed=1
+        for matrix in random lowrank indefinite; do
+            if run 8 --solver jacobi --n 97 --block 8 --pr 2 --pc 4 --precision fp32 --matrix "$matrix" --jacobi-pivot64 "$pivot64" --gpu-mpi 1 --rccl 1 --async-alloc 1; then
+                echo "PIVOT_CHECK PASSED pivot64=$pivot64"
+            else
+                echo "PIVOT_CHECK FAILED pivot64=$pivot64"; passed=0
+            fi
+        done
+        if [[ $passed == 1 ]]; then
+            for half in 0 2; do
+                if run 8 --solver jacobi --n 2048 --block 256 --pr 1 --pc 8 --precision fp32 --jacobi-pivot64 "$pivot64" --half-bulk "$half" --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --reference 1; then
+                    echo "PIVOT_CHECK PASSED pivot64=$pivot64 half=$half"
+                else
+                    echo "PIVOT_CHECK FAILED pivot64=$pivot64 half=$half"
+                fi
+            done
+        fi
+    done
+elif [[ $1 == panel-dot ]]; then
+    for grid in '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --precision "$precision" --matrix indefinite --panel 7 --back-block 13 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1
+        done
+    done
+    for n in 8192 16384; do
+        for binary in direct-layout-eigh panel-dot-eigh; do
+            EIGH_BIN="build/custom-eigh/$binary" run 8 --n "$n" --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --panel 32 --back-block 128 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference "output/custom-eigh/torch-large/n$n"
+        done
+    done
+    for panel in 8 64; do
+        for half in 0 2; do
+            run 8 --n 16384 --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --panel "$panel" --half-bulk "$half" --back-block 128 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference output/custom-eigh/torch-large/n16384
+        done
+    done
 elif [[ $1 == case ]]; then
     shift
     ranks=$1; shift
