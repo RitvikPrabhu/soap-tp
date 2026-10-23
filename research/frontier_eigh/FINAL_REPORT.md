@@ -1,10 +1,10 @@
 # Frontier distributed eigh: research outcome
 
-## Third loop update: actual FP16 throughput (in progress)
+## Final third-loop report: actual FP16 throughput
 
-The authorized third window is October23,08:29–12:29EDT, on dedicated local branch `research/custom-eigh-fp16-20261023`, based on fc09aa3. No production SOAP files were changed, and nothing was pushed or merged. A usage-limit pause interrupted work around09:26–10:09; the deadline was not extended.
+The authorized third window was October 23, 08:29–12:29 EDT, on dedicated local branch `research/custom-eigh-fp16-20261023`, based on fc09aa3. Experiments stopped at 10:53, within the up-to-four-hour budget (2h24 wall-clock, including a usage pause around 09:26–10:09). No further large runs were justified by the small, variable remaining gains. No production SOAP files were changed, and nothing was pushed or merged.
 
-**Current conclusion:** FP16 arithmetic is implemented and tested, but FP32 remains the fastest accurate custom mode. A tuned **native FP32** panel kernel gives the useful new speed improvement. It is not evidence for full-FP16 eigh or a robust half-compute speedup.
+**Conclusion:** corrected FP16 **panel updates** are practical and nearly match tuned FP32 performance while retaining the tested FP32-level accuracy. At 16384, order-reversed repeats favor selective FP16 by 0.84% (4.602 versus 4.641 seconds), but timing ranges overlap and the earlier width scan slightly favors native FP32. This is a modest candidate, not a robust large speedup or full-FP16 eigh. At 8192, retain native FP32. Using half precision for every bulk GEMM still loses.
 
 ### Algorithm, ownership and hardware execution
 
@@ -27,7 +27,7 @@ The selected algorithm is unchanged: power-of-two normalization, our one-stage d
                           └───────────────────────┘
 ```
 
-One rank per MI250X GCD; all batch experiments use at most one Frontier node. ScaLAPACK2D block-cyclic storage supports1×8,2×4,4×2,8×1, including uneven tile counts. Main1×8 / tridiagonal8×1, tile64 and backtransform256 remain the target configurations. At8192 use panel1. At16384 the new candidate is panel16 with explicit installed rocBLAS solution `-606624864`. IDs are backend/version-specific, not portable tuning constants: support is checked per shrinking descriptor, unsupported edges use the standard kernel, and actual selected/default counts are printed. No numerical precision changes in this optimization.
+One rank per MI250X GCD; all batch experiments use at most one Frontier node. ScaLAPACK 2D block-cyclic storage supports 1×8, 2×4, 4×2 and 8×1, including uneven tile counts. Main 1×8 / tridiagonal 8×1, tile 64 and backtransform 256 remain the target configurations. At 8192 use panel 1/native FP32. At 16384 use panel 16: `--half-panel 1` is the lowest-precision competitive candidate; native `--panel-solution -606624864` is the more accurate control. These options are mutually exclusive. Native solution IDs are backend/version-specific, not portable constants: support is checked per shrinking descriptor, unsupported edges use the standard kernel, and selected/default counts are printed. Mixed computation remains opt-in; the CLI precision default is still FP64.
 
 HIP owns matrix/vector kernels and robust FP64 reduction scalars; rocBLAS supplies FP32/FP64 GEMV/GEMM. Same-stream RCCL handles GPU vector/panel collectives, with GPU-aware MPI and LibSci/ScaLAPACK handling other distributed work and redistribution. CPU FP64 DTRMV constructs compact-T. rocSOLVER is used for local controls/experimental Jacobi pivots, not our selected dense reduction. No native FP16 tridiagonal eigensolver is claimed.
 
@@ -42,19 +42,33 @@ Job5742774 passes all26cases (16uneven-grid gates and ten paired target-size/con
 |16384 /16|4.7926|**4.6730**|**4.4311**|
 |16384 /32|4.8406|4.7652|same control|
 
-Panel1 remains the better8192 configuration (prior baseline1.519s); do not select a losing tuned panel merely because its isolated GEMM wins. At16384, panel16 kernel selection reduces matched total by2.5%. FullELPA1 remains faster. Fresh selected-source scaling and mixed controls are pending in E52, not established by the historical scaling curve below.
+Panel 1 remains better at 8192 (fresh 1.5194 s); an isolated GEMM win does not justify a slower full solve. At 16384, native panel-16 kernel selection reduces matched total by 2.5%. E52 repeats heuristic/selected/selective-half/all-bulk-split at 4.8068/4.6743/4.6430/5.0524 s. E53 then tests widths 8/16/24/32 and half/native/native/half order controls, all 12 configurations passing. The width-scan native/half totals are 4.7622/4.7354, 4.6768/4.6926, 4.7400/4.6846 and 4.7496/4.7896 s. Keep panel 16 for both modes.
+
+In the order-reversed controls (eight warm samples per mode), native/half pooled medians are **4.64073/4.60187 s**, ranges 4.6161–4.7349 / 4.5988–4.6991. Both half case medians beat both native case medians, but overlapping ranges and the reversed scan result limit the conclusion to a small, variable lead. Median reduction native/half is 3.7594/3.7241 s, tridiagonal .6175/.6257 s and backtransform .2538/.2552 s. A full ELPA1 control measured 4.4311 s in E51, not in this ABBA allocation; no superiority to ELPA is established.
 
 The16384 selected-panel16 final trial has reduction3.7556s, tridiagonal.6120s including retile.1369s, backtransform.2542s; managed GPU peak279.2MiB/GCD excludes library internals/pool reservations/host arrays. Setup1.1543s is outside total. Host-enqueue communication timing is not isolated network/device time. Warm total range4.6220–4.7241s (two samples, not a confidence interval).
 
-Original-A residual9.846e-7, raw Frobenius orthogonality8.978e-4 (normalized7.014e-6), relative Q-norm error3.568e-8, max eigenvalue error/spectral radius8.262e-7. These are unchanged at printed precision versus the heuristic with the same panel. Same-input ROCm torch gates for selected source are pending; prior mixed-panel gates passed4/4 ordinary-scale2×4 cases and12/12 opposite-grid scale-stress cases. Extreme-scale torch itself fails/is inaccurate, so those cases use CPUFP64 plus explicit precision floors, not a claimed measured torch match.
+Fresh selected-source8192 scaling, job5742867 (all19configured cases pass):
+
+| GCDs / main grid | Native FP32 seconds | All-bulk split-FP16 seconds |
+|---|---:|---:|
+|1 /1×1|3.3885|3.4455|
+|2 /1×2|2.6311|2.6582|
+|4 /1×4|1.8082|1.8285|
+|8 /1×8|1.5194|1.5335|
+
+Native speedup is 2.23× at 8 GCDs, 27.9% parallel efficiency. At 8 GCDs, main 1×8/2×4/4×2/8×1 totals are 1.5194/2.5766/2.0573/2.1705 s. Rectangular grids work; 1×8 is faster here and avoids column-group collectives needed when process rows exceed one. Four final-source FP64 uneven-grid regressions have residual ≤1.464e-15. No multi-node scaling is claimed.
+
+Native panel-16 original-A residual is 9.846e-7, raw Frobenius orthogonality 8.978e-4 (normalized 7.014e-6), relative Q-norm error 3.568e-8, and max eigenvalue error/spectral radius 8.262e-7. Selective half gives residual 1.837e-6, raw orthogonality 9.003e-4, Q-norm error 4.233e-8 and max scaled eigenvalue error 7.117e-7: about 1.9× native residual, still within unchanged target-size gates. Same-input ROCm torch selected-native 2×4 and half-panel16 4×2 each pass 4/4 families. The latter's maximum relative Q-norm error is 1.367e-7, within the bounded 8eps policy, not always one epsilon. Earlier mixed-panel gates also passed 4/4 ordinary-scale 2×4 and 12/12 opposite-grid scale-stress cases. Extreme-scale torch itself fails/is inaccurate, so those cases use CPU FP64 plus explicit precision floors, not a claimed measured torch match.
 
 ### What actual lower precision achieved
 
 - Split-FP16 uses FP16 operands/MFMA, FP32 accumulation/state and three algebraic products in two GEMM launches. It is **computation**, not just FP16 storage, but not a fully FP16 eigensolver. Prior8192/16384 totals1.520/5.002s do not beat native1.519/4.818s.
-- New fused rocWMMA correction kernels retain FP32 accumulation and use one C epilogue. Shared64×64 tiling makes16384 panel GEMM.512ms versus defaultSGEMM.866ms, but tuned nativeFP32 is **.284ms**. Selective-half panel32 full solve4.806s versus native4.837s is only0.6%, and does not beat selected-native panel16. Backtransform fused-half kernels lose. No half-speed victory is selected.
+- New fused rocWMMA correction kernels retain FP32 accumulation and use one C epilogue. Shared 64×64 tiling makes the panel32 micro GEMM .512 ms versus default SGEMM .866 ms, but tuned native FP32 is .284 ms on that descriptor. Full-solver panel16 behaves differently: selective half is competitive, with the small ABBA lead above. The kernel stages high/low operands in LDS and avoids global packed buffers; managed memory stays 279.2 MiB/GCD, versus 423.2 MiB for all-bulk split-half at panel16. Fused-half backtransforms lose and are not selected.
 - One-launch K3 concatenation improves the split implementation but loses native backtransform. Its bounded packing can overflow beyond|high|≈1023.5 and omits low×low; no generic dynamic-range claim or solver integration.
 - Native one-product FP16/BF16 did not meet retained FP32-level gates. Split-BF16 also fails a stronger Q-norm case. Lowest operand precision demonstrated under the bounded strict gates is corrected FP16; fastest supported state/solve precision remains FP32. Ill-conditioned SOAP application evidence still favors FP64 solve→FP32 basis storage.
 - Public cuSOLVERMp documents FP32/FP64 SYEVD/SYTRD/STEDC, not a native half eigensolver. Actual repository SOAP initialization uses FP64 ELPA then FP32 storage. ROCm torch Half eigh is unsupported. There is no verified CUDA-half baseline to claim parity with.
+- Frontier's gfx90a has no native FP8 MFMA path in this toolchain: the same five-line FP8 builtin probe is rejected for missing `fp8-insts` on gfx90a and compiles on gfx942. Installed rocWMMA FP8 specializations likewise target gfx942, not gfx90a. Logs contain source and commands in `.amp/in/artifacts/fp8-{gfx90a,gfx942}-compile.log`; no GPU execution or FP8 solver is claimed. FP16/BF16 are the relevant lower native floating-point matrix formats, not FP8 storage emulation or an unexplored integer-quantized solver.
 
 ### Rejected experiments and decision
 
@@ -66,7 +80,15 @@ The dominant limitation remains sequential reduction/GEMV/collective dependencie
 
 ### Reproduction and delivery
 
-Current selected-source snapshot: `build/custom-eigh/selected-panel-eigh`, SHA256 `4b802180e912b3da52bca189c08e1dd8e92f2b0685db2673f1ddcc188c3d505e`. Build/commands are in README; E44–E52 in RESULTS record hypotheses, failures and exact raw paths. Final job/file/commit inventories and refreshed scaling are still pending. All remaining work must stop by12:29EDT; no background resume or renewed budget is implied.
+Selected-source snapshot: `build/custom-eigh/selected-panel-eigh`, SHA256 `4b802180e912b3da52bca189c08e1dd8e92f2b0685db2673f1ddcc188c3d505e`. The final rebuild is byte-identical; shell/Python/whitespace checks pass. README gives commands; RESULTS E44–E54 preserves hypotheses, negative results and exact raw paths.
+
+The third loop submitted **20 one-node jobs**, totaling 36m34 of allocation elapsed time: 18 COMPLETED, 2 FAILED. Job5741720 rejects the unnormalized lowrank pivot experiment;5742221 exposes extreme-scale torch reference failures while all12custom cases pass. Job5741930 completed but its tuning claims are invalidated separately. All research jobs are settled; no research workers or recurring schedules remain. [jobs.csv](jobs.csv) inventories every job's state, elapsed time, suite, accepted custom counts and stdout/stderr. Across all three loops it contains63jobs. Main-suite metrics have1129RESULT records (1118passed/11explicit rejected cases);171new-loop rows all pass, but failed calls before RESULT are not counted. The third-loop same-input comparison jobs add24/24accepted custom rows separately.
+
+New tracked files are `half_fused.hpp`, `half_micro.cpp`, `half_micro_build.sh`, `half_micro.slurm` and `gemv.hpp`, all under this directory. Existing driver, batch suite, torch comparison, reports/checkpoint and evidence manifests were updated; the losing `jacobi.hpp` refinement survives in history but is absent from the final net diff. No production files changed. Raw artifacts and frozen binaries are indexed by [artifacts.tsv](artifacts.tsv) and [binaries.sha256](binaries.sha256).
+
+Local implementation commits before final reporting:8c977dc (graphs),0e3dec3 (fused-half/pivot evidence),1018375 (correct selectors/GEMV),a903493 (native panel selection). Full commit IDs, subjects and per-commit file lists, including final consolidation, are generated after committing in `output/custom-eigh/loop3-commits.tsv`, `loop3-commit-files.txt` and `loop3-files.txt`. Reproduce with `git log --reverse --format='%H%x09%s' fc09aa3..HEAD`, `git log --reverse --format='%H %s' --name-status fc09aa3..HEAD` and `git diff --name-status fc09aa3..HEAD`. These are local experimental commits, not pushed or merged work.
+
+Delivery is a standalone **real symmetric** research solver and an implementation path, not complex Hermitian support, Python/SOAP integration, full-FP16 state/solve, multi-node scaling or a proof of best-possible performance. The lowest competitive tested operand format is corrected FP16, with FP32 state/accumulation and FP64 stability scalars. Continue custom work for algorithm ownership; prefer tuning/extending ELPA1 for immediate application use. A new research budget is needed before further experimentation; nothing resumes automatically.
 
 ## Historical final update: second research loop, FP32 / actual FP16 computation
 

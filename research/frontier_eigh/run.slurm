@@ -930,6 +930,18 @@ elif [[ $1 == loop3-scaling ]]; then
         if [[ $mode == split_half ]]; then half=2; fi
         run 8 --n 16384 --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --panel 16 --back-block 256 --panel-solution "$solution" --half-panel "$fused" --half-bulk "$half" --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference output/custom-eigh/torch-large/n16384
     done
+elif [[ $1 == loop3-panel-repeat ]]; then
+    for panel in 8 16 24 32; do
+        for fused in 0 1; do
+            solution=0; if [[ $fused == 0 ]]; then solution=-606624864; fi
+            run 8 --n 16384 --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --panel "$panel" --back-block 256 --panel-solution "$solution" --half-panel "$fused" --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference output/custom-eigh/torch-large/n16384
+        done
+    done
+    # Reversed order controls drift: half/native/native/half, four warm trials each.
+    for fused in 1 0 0 1; do
+        solution=0; if [[ $fused == 0 ]]; then solution=-606624864; fi
+        run 8 --n 16384 --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --panel 16 --back-block 256 --panel-solution "$solution" --half-panel "$fused" --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 5 --torch-reference output/custom-eigh/torch-large/n16384
+    done
 elif [[ $1 == case ]]; then
     shift
     ranks=$1; shift
