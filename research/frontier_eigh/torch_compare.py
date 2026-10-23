@@ -63,7 +63,6 @@ def main():
     p.add_argument("--pr", type=int, default=1)
     p.add_argument("--pc", type=int, default=1)
     p.add_argument("--panel", type=int, default=1)
-    p.add_argument("--fused-av", type=int, choices=[0, 1], default=0)
     p.add_argument("--solver", choices=["custom", "jacobi"], default="custom")
     p.add_argument("--jacobi-pivot64", type=int, choices=[0, 1], default=0)
     p.add_argument("--jacobi-local", choices=["dc", "jacobi"], default="dc")
@@ -83,7 +82,6 @@ def main():
                 "gpu_available": torch.cuda.is_available(), "requested_backend": args.device,
                 "python": sys.executable, "numpy": np.__version__,
                 "custom_solver": args.solver, "custom_panel": args.panel, "jacobi_pivot64": args.jacobi_pivot64,
-                "fused_av": args.fused_av,
                 "scales": args.scales, "jacobi_local": args.jacobi_local,
                 "note": "correctness only; torch FP16 eigh is probed, never silently promoted"}
     device = "cpu"
@@ -169,7 +167,7 @@ def main():
                         "elpa" if variant == "fp64" else "elpa32", "--input", str(input_path.resolve()),
                         "--export-basis", str(export.resolve()),
                         "--gpu-mpi", "1", "--rccl", "1", "--async-alloc", "1",
-                        "--panel", str(args.panel), "--fused-av", str(args.fused_av)] + extra
+                        "--panel", str(args.panel)] + extra
                     print(shlex.join(cmd), flush=True)
                     try:
                         run = subprocess.run(cmd, capture_output=True, text=True, timeout=120)

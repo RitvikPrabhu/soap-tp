@@ -1,5 +1,107 @@
 # Frontier distributed eigh: research outcome
 
+## Final update: second research loop, FP32 / actual FP16 computation
+
+**Recommendation:** retain the custom native-FP32 path as the fastest measured custom mode. Mixed split-FP16 computation meets the tested accuracy gates but is not consistently faster. Do not claim a full-FP16 eigensolver, universal PyTorch equivalence, or superiority to a tuned distributed ELPA1 backend. The existing SOAP backend is unchanged.
+
+The second authorized window was October23,00:15–04:15EDT. A usage-limit pause interrupted active work around02:08; the last queued job finished02:11:20. The scheduled resume after05:03 was used only for reporting, removing rejected/unmeasured candidates and verifying the selected build, not restarting experimentation. Consequently the full four-hour active research opportunity was not used. All work remains on local branch `research/custom-eigh-frontier-20261022`; nothing was pushed or merged.
+
+### Best implementation and hardware
+
+- **Eight MI250X GCDs on one Frontier node**, one MPI rank/GCD: four physical MI250X packages. Earlier scaling also used1/2/4GCDs; no multi-node jobs. Tiny login-node checks used an MI210 and are not performance evidence.
+- Real symmetric FP64/FP32, full distributed eigenvectors. ScaLAPACK2D block-cyclic, block64; fastest main grid1×8, independent tridiagonal grid8×1, backtransform block256. At8192 use panel1; at16384 use delayed panel32. Correctness includes1×8,2×4,4×2,8×1 and unequal local block counts. No full A/Q gather except tiny≤512 references/exports.
+- Exact power-of-two normalization → custom GPU one-stage Householder A→T → ELPA **tridiagonal-only** distributed divide-and-conquer → precision-preserving distributed Z redistribution → custom compact-WY backtransform → restored eigenvalue scale. Delayed panel32 remains one-stage, not A→B→T.
+- HIP kernels form robust FP64 norms/dots/scalars and requested-precision vectors/updates; rocBLAS GEMV and GEMM perform dense products. Same-stream RCCL broadcasts/AllReduce/AllGather handle device vectors/panels; GPU-aware MPI and LibSci BLACS/PSGEMR2D/PDGEMR2D handle other distributed work. Small Gram/T factors use host FP64 DTRMV: it beat all three custom GPU-T candidates. ELPA's public tridiagonal interface stages host-local arrays and executes its own distributed/GPU work internally. rocSOLVER supplies local reference and experimental Jacobi pivots, not the selected dense reduction.
+- Selected immutable executable `build/custom-eigh/blas-t-eigh`, SHA256 `d7b05fc3b2123527870b9b9528434dd3a6b50b970592a1f1c63c6a569dd013b1`. Final `build.sh` rebuild is byte-identical; see `.amp/in/artifacts/selected-build.log`. Exact commands are in [README](README.md).
+
+### Performance, phases and scaling
+
+Seconds, one cold plus two warm trials per case; custom entries are warm medians. The two-sample ranges are not confidence intervals. Setup, reference solves and validation are excluded; per-solve workspaces/ELPA handles are included. Persistent grid/RCCL/outer rocBLAS setup is outside timing.
+
+| Mode | GCDs | n8192 | n16384 |
+|---|---:|---:|---:|
+| First-loop custom native FP32 |8|1.711|6.155|
+| **Selected custom native FP32** |**8**|**1.51895**|**4.81769**|
+| Selected mixed split-FP16 |8|1.51982|5.00233|
+| Actual ROCm torch FP32 |1|1.50559–1.50700|13.61405–13.61606|
+| Full ELPA1 FP32, earlier controls |8|1.561|4.440|
+
+Native FP32 improves the prior custom baseline by about11%/22%. The torch row is **not an equal-hardware speedup comparison**: custom uses eight GCDs, torch one. Custom still loses slightly to single-GCD torch at8192; it is about2.83× faster at16384 while using eight times as many GCDs. Full ELPA1 controls were not refreshed in a final paired job before the interruption, so no custom-versus-ELPA1 victory is established. Final FP64 target-size timing was not refreshed either; first-loop FP64 is historical below.
+
+Selected final-trial phases from job5738707:
+
+| n / mode | Reduction | Tridiagonal, including retile | Retile subset | Backtransform | Driver-managed peak MiB/GCD |
+|---|---:|---:|---:|---:|---:|
+|8192 FP32|1.2660|.1835|.0416|.0606|74.8|
+|8192 split-FP16|1.2634|.1769|.0419|.0805|114.8|
+|16384 FP32|3.9094|.6062|.1358|.2547|281.5|
+|16384 split-FP16|3.9980|.6284|.1353|.3245|425.5|
+
+Do not add retile again to tridiagonal time. Phase values are the final trial, not phase medians; totals above are warm medians. Memory excludes library/RCCL internals, host arrays and cached HIP pool reservation. Asynchronous `comm` is host enqueue/MPI call time, not isolated device-network duration.
+
+Earlier first-loop n8192 FP32 strong scaling1/2/4/8GCD: **3.753/3.052/2.062/1.787s** (~2.10× at8GCD,26%parallel efficiency). This is an older configuration, not a fresh scaling curve of the final winner. No new multi-node or final-winner scaling claim is made.
+
+### Accuracy against real ROCm PyTorch
+
+Actual torch is2.10.0+rocm7.0, HIP7.0.51831, MI250X on compute nodes. Its Half eigh is unsupported (`linalg_eigh_cuda not implemented for Half`; the CUDA-named error is ROCm's compatibility API, not an NVIDIA build).
+
+For an orthonormal n×n eigenvector matrix, its Frobenius norm is √n, not1. We measure relative norm error `abs(||Q||F−√n)/√n`, plus original-input residual, normalized orthogonality `||QᵀQ−I||F/√n`, eigenvalue error and sign/rotation-invariant eigenspaces. Norm agreement alone cannot validate eigenvectors. Target-size checks use the same deterministic matrix and thin FP64 torch spectrum/top-eight reference; no distributed full-Q gather.
+
+| n / mode | Relative residual | Orthogonality / √n | Relative Q norm error |
+|---|---:|---:|---:|
+|8192 torch FP32|7.16e-7|4.03e-6|3.67e-8|
+|8192 custom FP32|1.42e-6|5.26e-6|3.04e-8|
+|8192 custom split-FP16|1.37e-6|4.06e-6|3.05e-8|
+|16384 torch FP32|8.74e-7|5.44e-6|4.62e-8|
+|16384 custom FP32|9.32e-7|7.03e-6|3.83e-8|
+|16384 custom split-FP16|1.74e-6|5.21e-6|3.82e-8|
+
+All target-size Q-norm errors are below FP32 epsilon (~1.19e-7). Custom residual/orthogonality is comparable, not numerically identical to torch (up to about2× these residuals). Custom max eigenvalue error scaled by spectral radius is4.49e-7/6.60e-7(native8192/16384), versus torch9.39e-7/1.27e-6. This differs from relative Frobenius eigenvalue error; do not compare unlike columns. Top-eight leakage custom native5.44e-5/2.12e-4 is reported with separating gaps, not judged against epsilon.
+
+Tiny same-input tests independently compare CPU FP64 torch and real ROCm FP32 torch on exactly FP32-representable inputs, including repeated/clustered eigenvalues. Job5738338: four families×three seeds×FP64/FP32/split-half, **36/36accepted on2×4**. Scale-stress jobs5738675(2×4,seed42) and5738814(4×2,seed43): each **36/36custom accepted** across four families×scales1e-20/1/1e20. Across the two, native/split max residual1.06e-6/1.15e-6 and max relative Q norm1.67e-7/1.51e-7. The latter can exceed one epsilon; the documented policy is bounded by8eps32 plus measured torch-relative gates, not a universal one-epsilon promise. Eigenspace leakage can reach~.009 in sensitive clustered/ill-conditioned cases and is gap-aware.
+
+At extreme scales torch itself returns inaccurate FP32 solutions at1e-20 and fails convergence at1e20 on all four tested families. These custom cases are checked against CPU FP64 with explicit precision-floor limits and **do not claim a measured torch match**. Comparison jobs correctly exit nonzero to flag reference problems. Ordinary-scale cases establish the torch-relative comparison. Our reproduced n33 small-scale custom residual.732 was isolated to FP32 tridiagonal work and fixed by normalization (2.57e-7 afterward); exact internal ELPA failure mechanism remains unproven.
+
+### Computation precision, not just storage
+
+| Mode | A/Q state | GEMV / scalar / tridiagonal | Bulk GEMM computation | Outcome |
+|---|---|---|---|---|
+|Native FP64|FP64|FP64 / FP64 / FP64|FP64|Correct baseline|
+|Native FP32|FP32|FP32 / FP64 / FP32|FP32|Fastest measured custom mode|
+|Split-FP16|FP32|FP32 / FP64 / FP32|FP16 operands, FP32 accumulation, three algebraic products in two launches|Tested accuracy, no robust total speed win|
+|Naive FP16/BF16|FP32|Higher-precision core as above|One low-precision product|Fails accuracy; not selected|
+|Split-BF16|FP32|Higher-precision core as above|BF16 high+residual, FP32 accumulation|Earlier normwise checks pass; stronger Q-norm case fails; not selected|
+
+Split-half stores high plus4096-scaled-low operands; packing combines both cross terms into the second GEMM, omitting low×low. It explicitly addresses MI200 FP16 MFMA subnormal flushing. At16384 panel32 this is genuine lower-precision reduction-update computation as well as backtransform computation. It is **not fully FP16 state, reduction or tridiagonal solving**, and is not a guarantee for arbitrary dynamic range. `--quant` and post-solve basis casts are separately labeled input/storage-only controls. SOAP accuracy still requires application-level evidence: previous sensitive frozen-basis updates favor FP64 solve→FP32 storage, even when solver norms pass.
+
+### Experiments that changed the decision
+
+- Retained direct GPU column/layout reuse, smaller-communicator panel coefficients and panel32 at16384. At8192 panel1 remains faster.
+- Native FP32 redistribution removes FP64 conversion buffers;16384 retile .222→.139s and measured tridiagonal .878→.629s. Exact power-of-two normalization fixes scale sensitivity.
+- Joint split-half packing improves16384 mixed warm5.622→5.506s in its paired test, but native5.339s in that job still wins.
+- CPU FP64 DTRMV beats global/LDS/shared-Gram GPU compact-T; selected back256. Do not preserve GPU residency at the cost of measured speed.
+- RCCL default versus LL8192 is1.620/1.603s, too small/variable to force a policy. Simple loses; LL128 Broadcast fails. Retain automatic defaults and same-stream execution, not a claim of completed asynchronous look-ahead.
+- Block Jacobi with FP64 pivots and installed analytic pivot diagonals reaches accurate2048 native/split~.573s; FP32 pivots are less accurate, localSYEVJ takes~3.147s. Not a target-size winner. Lower-only reduction, MRRR, fused update+AV and threaded LibSci also lose or fail accuracy. Fused-AV source removed; frozen binaries preserve the experiment. Unbenchmarked cache candidate removed.
+- Existing genuine custom A→B plus ELPA B→T/Q2 prototype loses badly at16384 (FP32~14.860s). A GEMM-rich first stage alone is insufficient. SLATE was studied, not benchmarked, because its inspected square-grid/root-band design conflicts with the required ownership constraints.
+
+The main bottleneck remains the sequential bandwidth-heavy reduction and per-reflector collectives (about81–83%of the selected final-trial phases). The most promising substantial custom follow-up is a competitive complete two-stage B→T/Q2 path, using the working A→B boundary; first profile the band chase and Q2 schedule rather than assume tensor throughput fixes them. A cheaper next measurement is a final-winner scaling/paired ELPA1 refresh before investing further.
+
+cuSOLVERMp's public SYTRD/STEDC/ORMTR stage separation, distributed eigenvectors and2D ownership translate well. Its proprietary implementation and NCCL tuning do not translate literally to ROCm; no undocumented two-stage cuSOLVERMp claim is made. RCCL/device layout and precision-preserving redistribution help here, whereas low-precision peak GEMM rates do not address the dominant GEMV/collective dependency.
+
+### Jobs, files, commits and final delivery
+
+[jobs.csv](jobs.csv) inventories **all43 submitted one-node jobs across both loops** (24first loop,19second):37COMPLETED,3FAILED,2TIMEOUT,1CANCELLED. The three failed comparison jobs expose torch-reference problems, not failed accepted custom results.5738463 was canceled for a duplicate suite selection, not a numerical result. Two earlier timeouts are explained in the first-loop history below. No job remains active.958main-suite RESULT rows include947passed and11explicit rejected native-half/BF16/MRRR cases; failed Jacobi calls may terminate before RESULT and are documented separately. The three complete tiny comparison suites add108/108accepted custom rows; do not count these as main-suite RESULT rows.
+
+Every job's state, elapsed time, suite and raw stdout/stderr path is in jobs.csv; [RESULTS](RESULTS.md) records E0–E43 hypotheses and outcomes. Main records, binary hashes and raw artifact inventory are refreshed in [metrics.csv](metrics.csv), [binaries.sha256](binaries.sha256), [artifacts.tsv](artifacts.tsv). Torch comparison/reference CSVs and backend/acceptance JSON remain under `output/custom-eigh/torch-loop2/` and `output/custom-eigh/torch-large/`. No generated raw binaries/matrices are committed.
+
+All created tracked files are `RESEARCH_CHECKPOINT.md` and these under `research/frontier_eigh/`: `eigh.cpp`, `jacobi.hpp`, `build.sh`, `run.slurm`, `summarize.py`, `soap_precision.py`, `torch_compare.py`, `torch.slurm`, `torch_benchmark.py`, `torch_benchmark.slurm`, `README.md`, `RESULTS.md`, `FINAL_REPORT.md`, `metrics.csv`, `jobs.csv`, `soap_precision.csv`, `soap_gpu_precision.csv`, `binaries.sha256`, `artifacts.tsv`. Complete local commit and file inventories (including the final commit) are generated after committing in `output/custom-eigh/commits.tsv` and `files.txt`; regenerate with `git log --reverse --format='%H%x09%s' 505abff..HEAD` and `git diff --name-status 505abff..HEAD`. Loop2 implementation commits before final consolidation:95863f4,8a04e96,264ef64. Scope is only the research directory/checkpoint; unrelated dirty scripts/tests/core remain untouched.
+
+This delivers a standalone research implementation and reproducible evidence, **not** Python/SOAP integration, complex Hermitian support, full training equivalence, best-possible solver proof, or multi-node scaling. Practical adoption still favors tuning/extending ELPA1; custom native FP32 is worth retaining for controlled algorithm research, but mixed FP16 currently gives no measured reason to replace it.
+
+---
+
+## First-loop report (historical configurations and measurements)
+
 Research window: October 22, 2026, 17:35–21:35 EDT maximum. The last experiment finished21:07EDT; reporting resumed00:00EDT after a usage-limit pause, with no further experiments. Work is confined to local branch `research/custom-eigh-frontier-20261022`, based on `505abff`. No push, merge, deployment, or modification of the existing SOAP solver was performed.
 
 ## 1. Outcome and recommendation

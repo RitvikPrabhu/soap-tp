@@ -735,7 +735,23 @@ elif [[ $1 == native-components ]]; then
             run 8 --n 16384 --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --panel 32 --half-bulk "$half" --back-block "$back" --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference output/custom-eigh/torch-large/n16384
         done
     done
+elif [[ $1 == threaded ]]; then
+    for grid in '2 4' '4 2'; do
+        read -r pr pc <<< "$grid"
+        for precision in fp64 fp32; do
+            tri=elpa; [[ $precision == fp32 ]] && tri=elpa32
+            OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --tri-pr 8 --precision "$precision" --tridiag "$tri" --matrix indefinite --panel 7 --back-block 13 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1
+        done
+    done
+    EIGH_BIN=build/custom-eigh/fused-av-eigh run 8 --n 16384 --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --panel 32 --back-block 256 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference output/custom-eigh/torch-large/n16384
+    export OMP_PROC_BIND=close OMP_PLACES=cores
+    for threads in 1 2 4 7; do
+        export OMP_NUM_THREADS=$threads OPENBLAS_NUM_THREADS=$threads
+        run 8 --n 16384 --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --panel 32 --back-block 256 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference output/custom-eigh/torch-large/n16384
+    done
 elif [[ $1 == fused-av ]]; then
+    # Rejected candidate; source is retained in commit 264ef64, not current eigh.cpp.
+    EIGH_BIN=build/custom-eigh/fused-av-eigh
     for grid in '1 8' '2 4' '4 2' '8 1'; do
         read -r pr pc <<< "$grid"
         for precision in fp64 fp32; do

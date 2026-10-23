@@ -193,7 +193,6 @@ bool elpa_times=false;
 int band_width=0;
 bool device_vectors=false;
 bool lower_triangle=false;
-bool fused_av=false;
 int jacobi_sweeps=8;
 double jacobi_tol=0;
 bool jacobi_pivot64=false;
@@ -454,36 +453,6 @@ template<class T> __global__ void local_rank2(T* a, const T* v, const T* w,
     }
 }
 
-template<class T> __global__ void pending_column(T* column, const T* v, const T* w,
-    const T* vc, const T* wc, int nr, int first, int j) {
-    int i=first+blockIdx.x*blockDim.x+threadIdx.x;
-    if (i<nr) column[i]-=v[i]*wc[j]+w[i]*vc[j];
-}
-
-template<class T> __global__ void update_av(T* a, const T* oldv, const T* oldw,
-    const T* oldvc, const T* oldwc, const T* vc, T* out, int nr, int nc, int r0, int c0) {
-    __shared__ T partial[8][32];
-    int x=threadIdx.x, y=threadIdx.y, i=r0+32*blockIdx.x+x;
-    T sum=0;
-    if (i<nr) for (int j=c0+y;j<nc;j+=8) {
-        T value=a[i+size_t(j)*nr]-(oldv[i]*oldwc[j]+oldw[i]*oldvc[j]);
-        a[i+size_t(j)*nr]=value;
-        sum+=value*vc[j];
-    }
-    partial[y][x]=sum; __syncthreads();
-    if (!y && i<nr) {
-        for (int t=1;t<8;++t) sum+=partial[t][x];
-        out[i]=sum;
-    }
-}
-
-template<class T> __global__ void save_vectors(T* oldv, T* oldw, T* oldvc, T* oldwc,
-    const T* v, const T* w, const T* vc, const T* wc, int nr, int nc) {
-    int i=blockIdx.x*blockDim.x+threadIdx.x;
-    if (i<nr) { oldv[i]=v[i]; oldw[i]=w[i]; }
-    if (i<nc) { oldvc[i]=vc[i]; oldwc[i]=wc[i]; }
-}
-
 template<class T> __global__ void symmetric_av(const T* a, const T* v, const T* vc,
     T* out, const int* rows, const int* cols, int nr, int nc, int r0, int c0) {
     __shared__ T partial[8][32];
@@ -540,8 +509,6 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
     int padded=((g.n+g.b*g.pr-1)/(g.b*g.pr))*g.b;
     Device<T> v(padded), w(padded), vc(g.nc), wc(g.nc), packed(size_t(padded)*g.pr);
     Device<T> full_w(lower_triangle ? g.n : 1);
-    Device<T> oldv(fused_av ? g.nr : 1), oldw(oldv.n);
-    Device<T> oldvc(fused_av ? g.nc : 1), oldwc(oldvc.n);
     Device<T> u(size_t(g.nr)*2*panel), cross(size_t(g.nc)*2*panel), coeff(2*panel);
     Device<double> scalars(6), statistics(4*g.pr), dd(g.n), ee(g.n), tt(g.n-1);
     HIP(hipMemsetAsync(dd.p,0,dd.n*sizeof(double)));
@@ -555,11 +522,6 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
     for (int k=0;k<g.n-1;++k) {
         int owner=(k/g.b)%g.pc;
         T* column=g.c==owner ? a.p+size_t(g.li(k,g.pc))*g.nr : nullptr;
-        if (fused_av && k && column) {
-            int first=std::lower_bound(g.rows.begin(),g.rows.end(),k)-g.rows.begin();
-            if (first<g.nr) pending_column<<<(g.nr-first+255)/256,256>>>(column,
-                oldv.p,oldw.p,oldvc.p,oldwc.p,g.nr,first,g.li(k,g.pc));
-        }
         if (panel>1) {
             if (k%panel==0) {
                 HIP(hipMemsetAsync(u.p,0,u.n*sizeof(T)));
@@ -593,12 +555,8 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
             g.device_sum(full_w,g.row); g.device_sum(full_w,g.col);
             local_rows<<<(g.nr+255)/256,256>>>(w.p,full_w.p,rows.p,g.nr);
         } else {
-            if (r0<g.nr && c0<g.nc) {
-                if (fused_av && k) update_av<<<(g.nr-r0+31)/32,dim3(32,8)>>>(a.p,
-                    oldv.p,oldw.p,oldvc.p,oldwc.p,vc.p,w.p,g.nr,g.nc,r0,c0);
-                else gemv(h,false,g.nr-r0,g.nc-c0,g.nr,
-                    a.p+r0+size_t(c0)*g.nr,vc.p+c0,w.p+r0);
-            }
+            if (r0<g.nr && c0<g.nc) gemv(h,false,g.nr-r0,g.nc-c0,g.nr,
+                a.p+r0+size_t(c0)*g.nr,vc.p+c0,w.p+r0);
             g.device_sum(w,g.row);
         }
         if (panel>1 && k%panel) {
@@ -624,11 +582,7 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
             if (mr && mc && ((k+1)%panel==0 || k==g.n-2))
                 bulk_gemm(h,false,mr,mc,2*panel,T(-1),u.p+r0,g.nr,cross.p+c0,g.nc,
                     T(1),a.p+r0+size_t(c0)*g.nr,g.nr,true);
-        } else {
-            if (fused_av && k<g.n-2) save_vectors<<<(std::max(g.nr,g.nc)+255)/256,256>>>(
-                oldv.p,oldw.p,oldvc.p,oldwc.p,v.p,corrected,vc.p,wc.p,g.nr,g.nc);
-            else if (mr && mc) local_rank2<<<dim3((mr+127)/128,(mc+1)/2),dim3(128,2)>>>(a.p,v.p,corrected,vc.p,wc.p,g.nr,g.nc,r0,c0,lower_triangle?rows.p:nullptr,cols.p);
-        }
+        } else if (mr && mc) local_rank2<<<dim3((mr+127)/128,(mc+1)/2),dim3(128,2)>>>(a.p,v.p,corrected,vc.p,wc.p,g.nr,g.nc,r0,c0,lower_triangle?rows.p:nullptr,cols.p);
         HIP(hipGetLastError());
     }
     d=dd.get(); e=ee.get(); tau=tt.get();
@@ -1239,9 +1193,6 @@ int main(int argc,char** argv) {
         bf16_bulk=std::stoi(arg("--bf16-bulk","0"));
         device_vectors=arg("--device-vectors","0")=="1";
         lower_triangle=arg("--lower-triangle","0")=="1";
-        fused_av=arg("--fused-av","0")=="1";
-        if (fused_av && (!device_vectors || lower_triangle || std::stoi(arg("--panel","1"))!=1))
-            throw std::runtime_error("--fused-av requires --device-vectors 1 --panel 1 and full triangle");
         if (lower_triangle && (!device_vectors || std::stoi(arg("--panel","1"))!=1))
             throw std::runtime_error("--lower-triangle requires --device-vectors 1 --panel 1");
         if (device_vectors && (arg("--rccl","0")!="1" || arg("--gpu-mpi","0")!="1" ||
