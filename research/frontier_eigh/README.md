@@ -29,7 +29,7 @@ Batch scripts use account `gen150`, one node, one rank per GCD, seven CPU cores 
 python3 research/frontier_eigh/summarize.py output/custom-eigh/job-*.out > results.csv
 ```
 
-The CSV extractor keeps each case's final-trial phases and numerical metrics, plus cold timing and the median/min/max of subsequent warm trials. Single-trial correctness cases have no warm statistics. Raw stdout preserves every trial. Native-half expected-failure rows are not successful solves: consult the `*_CHECK FAILED` markers and stderr. Earlier jobs predate some metadata fields.
+The CSV extractor keeps each case's final-trial phases and numerical metrics, plus cold timing and the median/min/max of subsequent warm trials. Single-trial correctness cases have no warm statistics. Raw stdout preserves every trial. `check` marks explicit expected failures, successful continuation/completion, or an unconfirmed final case in an incomplete log. Native-half failure rows are not successful solves. Earlier jobs predate some metadata fields.
 
 Tested stack: ROCm7.0.2/gfx90a, Cray MPICH9.1, LibSci26.03, ELPA2026.02.002. Link tracing confirms CPU PDSTEDC/BLACS/BLAS resolve to **LibSci**, despite reference ScaLAPACK/OpenBLAS archives also being on the link line. Login-node MI210 runs are tiny debugging tests only; all performance evidence is compute-node MI250X GCDs.
 
@@ -77,5 +77,7 @@ EIGH_BIN=build/custom-eigh/eigh sbatch --time=00:08:00 research/frontier_eigh/ru
 # After JOBID completes:
 PYTHONPATH=src .venv/bin/python research/frontier_eigh/soap_precision.py --bases output/custom-eigh/soap-JOBID
 ```
+
+Job5736815 supplied90 validated GPU bases; `soap_gpu_precision.csv` contains81 update-study rows, including FP64-solve bases rounded afterward to FP32/FP16/BF16. This separates solve accuracy from basis-storage accuracy. At condition1e9, median final update error is.328 for an FP32 solve versus4.73e-5 for FP64 solve→FP32 basis storage. FP16 basis storage gives.298. These controls retain FP64 update arithmetic and do not establish low-precision projection throughput or training equivalence. See RESULTS E21 for all conditions and worst-step errors.
 
 Tiny test I/O is explicitly restricted to2≤n≤512: `--input path` reads exactly n² native FP64 column-major values; `--export-basis path` writes n ascending FP64 eigenvalues followed by n² FP64 column-major eigenvectors **after** numerical validation. Dense input replication and full-Q export are prohibited for larger problems. Normal distributed solves do not use these paths.

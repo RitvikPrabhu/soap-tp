@@ -286,3 +286,26 @@ Hypothesis: form or correct both row- and column-oriented copies of each vector 
 
 - Snapshot `vector-fusion-eigh` SHAffce00b7e454aed11ae6804e2921f26f8b5364882c465a7d11684137841a16ea. Tiny2/31 random/diagonal/lowrank/indefinite in FP64/32 pass. `vector-fusion` suite will compare this against frozen `fused-eigh`; not yet selected by multirank/performance evidence.
 - Staged GPU SOAP-basis job **5736815** submitted8min using frozen `basis-eigh`;90 compiled singleton solves, no compute-node Torch imports. Results still pending.
+
+### E21: separate solve precision from basis storage precision
+
+Job5736815 COMPLETED1m23 onfrontier01375; all90 GPU solves passed. Login-CPU analysis of the exported bases produces81 rows in `soap_gpu_precision.csv`:20 frozen-basis updates, seeds42/43/44,96×64 gradients, actual Adam primitive. No training-loss claim. Signed/permuted controls agree within1.61e-13. Median final update errors across three seeds:
+
+| Basis source/storage | condition100 | condition1e6 | condition1e9 |
+|---|---:|---:|---:|
+| Custom FP32 solve |6.22e-6|.07798|.32797|
+| Split-half bulk, FP32 state |6.24e-6|.07798|.32798|
+| FP16-rounded input / FP32 solve |.00382|.43509|.87806|
+| BF16-rounded input / FP32 solve |.02935|.67733|.99348|
+| **Custom FP64 solve, FP32 basis storage** |**8.89e-8**|**2.76e-6**|**4.73e-5**|
+| Custom FP64 solve, FP16 basis storage |.000710|.02392|.29772|
+| Custom FP64 solve, BF16 basis storage |.005625|.17792|.74815|
+
+FP32 basis storage after an FP64 solve is materially safer here than solving in FP32; this directly supports the existing SOAP cast-after-solve boundary rather than assuming all stages need FP64. Maximum error over any of the20 updates for FP64→FP32 storage reaches1.54e-4 at condition1e9. FP16 storage reaches.379 and BF16.808 there. These storage controls round exported bases and compute updates in FP64, isolating storage error; they are not native low-precision GPU projection benchmarks. FP32 input matrices are the same in every variant, and their smallest eigenvalues may already be negative at condition1e9.
+
+### E22: remove reflector column copy round-trips (candidate)
+
+Hypothesis: broadcast the owner GPU's matrix column directly into V, and store the completed reflector as part of vector formation. Column k is already excluded from the active GEMV/rank2 update, so early storage does not change that update's inputs. This removes two D2D copy submissions per reflector on the owning process column, with unchanged RCCL communication and arithmetic.
+
+- Snapshot `direct-eigh` SHAc7f313e14282f2e37cab2629269871e609077284692ceac70a07511280076801. Tiny31 four families/both precisions pass with identical numerical metrics to the norm-fused control. `direct` suite will gate97 rectangles/families then compare `fused-eigh`, `vector-fusion-eigh`, and `direct-eigh` on the same node, isolating E20 and E22 separately. Not yet a performance selection.
+- E19 job **5736836** currently running; all12 correctness gates passed. Initial paired8192 FP64 main1x8→tri8x1 warm2.551→2.219s confirms scalar-collective fusion helps. Full FP32/16384 outcomes pending. This justifies continuing launch/collective overhead work rather than implementing a speculative new eigensolver stage.

@@ -14,11 +14,20 @@ for path in map(Path, sys.argv[1:]):
     timing = {}
     trials = []
     binary = digest = command = ""
+    case = None
     for line in path.read_text().splitlines():
         if line.startswith("COMMAND "):
+            if case is not None and case["check"] == "unconfirmed":
+                case["check"] = "passed"
+            case = None
             command = line[len("COMMAND "):]
             timing = {}
             trials = []
+        elif line.startswith("FINISHED ") and case is not None:
+            if case["check"] == "unconfirmed":
+                case["check"] = "passed"
+        elif "_CHECK " in line and case is not None:
+            case["check"] = "failed" if "FAILED" in line else "passed"
         elif re.match(r"^[a-f0-9]{64}  ", line):
             digest, binary = line.split()
         elif line.startswith(("TIMING ", "RESULT ")):
@@ -29,10 +38,11 @@ for path in map(Path, sys.argv[1:]):
             else:
                 warm = trials[1:]
                 rows.append(dict(job=path.stem[len("job-"):], binary=binary,
-                                 sha256=digest, command=command, trials=len(trials),
+                                 sha256=digest, command=command, trials=len(trials), check="unconfirmed",
                                  cold_total=trials[0], warm_median=median(warm) if warm else "",
                                  warm_min=min(warm) if warm else "", warm_max=max(warm) if warm else "",
                                  **{**timing, **fields}))
+                case = rows[-1]
 if not rows:
     raise SystemExit("No RESULT records found")
 writer = csv.DictWriter(sys.stdout, list(dict.fromkeys(k for row in rows for k in row)), lineterminator="\n")

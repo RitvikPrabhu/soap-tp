@@ -353,7 +353,7 @@ template<class T> __global__ void vector_dot(const T* v, T* w, int nr, int start
     if (!t) s[4]=partial[0];
 }
 
-template<class T> __global__ void form_vectors(T* v, T* vc, T* w, const T* packed,
+template<class T> __global__ void form_vectors(T* v, T* vc, T* w, T* column, const T* packed,
     const int* rows, const int* cols, int nr, int nc, int padded, int b, int pr,
     int k, const double* s, const double* tau) {
     int i=blockIdx.x*blockDim.x+threadIdx.x;
@@ -362,6 +362,7 @@ template<class T> __global__ void form_vectors(T* v, T* vc, T* w, const T* packe
         if (i>=nr || rows[i]<=k) v[i]=0;
         else if (rows[i]==k+1) v[i]=1;
         else if (tau[k]!=0) v[i]=T(double(v[i])/s[5]);
+        if (column && i<nr) column[i]=v[i];
     }
     if (i<nc) {
         int r=cols[i];
@@ -406,19 +407,21 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
     };
     for (int k=0;k<g.n-1;++k) {
         int owner=(k/g.b)%g.pc;
-        if (g.c==owner) HIP(hipMemcpyAsync(v.p,a.p+size_t(g.li(k,g.pc))*g.nr,g.nr*sizeof(T),hipMemcpyDeviceToDevice));
-        g.device_bcast(v.p,g.nr,owner,g.row);
+        T* column=g.c==owner ? a.p+size_t(g.li(k,g.pc))*g.nr : nullptr;
+        double clock=MPI_Wtime();
+        CCL(ncclBroadcast(column ? column : v.p,v.p,g.nr,std::is_same_v<T,double>?ncclFloat64:ncclFloat32,owner,g.ccl_row,nullptr));
+        g.comm+=MPI_Wtime()-clock;
         int r0=std::upper_bound(g.rows.begin(),g.rows.end(),k)-g.rows.begin();
         int c0=std::upper_bound(g.cols.begin(),g.cols.end(),k)-g.cols.begin();
         int diagonal=(k/g.b)%g.pr==g.r ? g.li(k,g.pr) : -1;
         int alpha=((k+1)/g.b)%g.pr==g.r ? g.li(k+1,g.pr) : -1;
         local_statistics<<<1,256>>>(v.p,g.nr,r0+(alpha>=0),diagonal,alpha,scalars.p);
-        double clock=MPI_Wtime();
+        clock=MPI_Wtime();
         CCL(ncclAllGather(scalars.p,statistics.p,4,ncclFloat64,g.ccl_col,nullptr));
         g.comm+=MPI_Wtime()-clock;
         reflector_scalar<<<1,1>>>(statistics.p,g.pr,scalars.p,dd.p,ee.p,tt.p,k);
         gather(v);
-        form_vectors<<<(std::max(padded,g.nc)+255)/256,256>>>(v.p,vc.p,w.p,packed.p,rows.p,cols.p,g.nr,g.nc,padded,g.b,g.pr,k,scalars.p,tt.p);
+        form_vectors<<<(std::max(padded,g.nc)+255)/256,256>>>(v.p,vc.p,w.p,column,packed.p,rows.p,cols.p,g.nr,g.nc,padded,g.b,g.pr,k,scalars.p,tt.p);
         if (r0<g.nr && c0<g.nc) gemv(h,false,g.nr-r0,g.nc-c0,g.nr,
             a.p+r0+size_t(c0)*g.nr,vc.p+c0,w.p+r0);
         g.device_sum(w,g.row);
@@ -430,7 +433,6 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
         correct_vectors<<<(std::max(padded,g.nc)+255)/256,256>>>(w.p,wc.p,v.p,vc.p,packed.p,cols.p,g.nc,padded,g.b,g.pr,scalars.p,tt.p,k);
         int mr=g.nr-r0, mc=g.nc-c0;
         if (mr && mc) local_rank2<<<dim3((mr+127)/128,(mc+1)/2),dim3(128,2)>>>(a.p,v.p,w.p,vc.p,wc.p,g.nr,g.nc,r0,c0);
-        if (g.c==owner) HIP(hipMemcpyAsync(a.p+size_t(g.li(k,g.pc))*g.nr,v.p,g.nr*sizeof(T),hipMemcpyDeviceToDevice));
         HIP(hipGetLastError());
     }
     d=dd.get(); e=ee.get(); tau=tt.get();

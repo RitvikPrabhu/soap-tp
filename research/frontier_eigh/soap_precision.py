@@ -38,6 +38,11 @@ def eigenbasis(a, variant):
         if variant == "signed_permuted":
             w, q = eigenbasis(a, "fp64")
             return w.flip(0), q.flip(1) * (1 - 2 * (torch.arange(len(w)) % 2))
+        if variant.startswith("fp64_basis_"):
+            w, q = eigenbasis(a, "fp64")
+            dtype = {"fp64_basis_fp32": torch.float32, "fp64_basis_fp16": torch.float16,
+                     "fp64_basis_bf16": torch.bfloat16}[variant]
+            return w, q.to(dtype).double()
         n = len(a)
         values = np.fromfile(args.bases / f"{case_name}-n{n}-{variant}.bin", dtype=np.float64)
         w = torch.from_numpy(values[:n].copy()).flip(0)
@@ -80,7 +85,7 @@ for seed in (42, 43, 44):
         reference = []
         variants = ["fp64", "signed_permuted", "fp32", "fp16_input", "bf16_input"]
         if args.bases:
-            variants.append("split_half")
+            variants.extend(["split_half", "fp64_basis_fp32", "fp64_basis_fp16", "fp64_basis_bf16"])
         for variant in variants:
             pairs = [eigenbasis(a, variant) for a in matrices]
             left, right = [q for _, q in pairs]
