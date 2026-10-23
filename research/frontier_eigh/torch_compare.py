@@ -64,13 +64,15 @@ def main():
     p.add_argument("--pc", type=int, default=1)
     p.add_argument("--panel", type=int, default=1)
     p.add_argument("--half-panel", type=int, choices=[0, 1], default=0)
-    p.add_argument("--tiled-gemv", type=int, choices=[0, 1], default=0)
+    p.add_argument("--panel-solution", type=int, default=0)
     p.add_argument("--solver", choices=["custom", "jacobi"], default="custom")
     p.add_argument("--jacobi-pivot64", type=int, choices=[0, 1], default=0)
     p.add_argument("--jacobi-local", choices=["dc", "jacobi"], default="dc")
     p.add_argument("--variants", nargs="+", choices=["fp64", "fp32", "half", "split_half"],
                    default=["fp64", "fp32", "half", "split_half"])
     args = p.parse_args()
+    if args.panel_solution and (args.variants != ["fp32"] or args.half_panel or args.solver != "custom" or args.panel <= 1):
+        p.error("panel-solution requires native fp32 only, custom solver and panel>1")
     if not 2 <= args.n < 512:
         p.error("only tiny correctness matrices 2 <= n < 512 are permitted")
     if any(not math.isfinite(scale) or scale <= 0 for scale in args.scales):
@@ -84,8 +86,8 @@ def main():
                 "gpu_available": torch.cuda.is_available(), "requested_backend": args.device,
                 "python": sys.executable, "numpy": np.__version__,
                 "custom_solver": args.solver, "custom_panel": args.panel, "jacobi_pivot64": args.jacobi_pivot64,
-                "tiled_gemv": args.tiled_gemv,
                 "half_panel": args.half_panel,
+                "panel_solution": args.panel_solution,
                 "scales": args.scales, "jacobi_local": args.jacobi_local,
                 "note": "correctness only; torch FP16 eigh is probed, never silently promoted"}
     device = "cpu"
@@ -164,9 +166,11 @@ def main():
                 if args.run_custom:
                     export.unlink(missing_ok=True)  # A failed solve must not reuse a stale export.
                     extra = ["--half-bulk", {"half": "1", "split_half": "2"}[variant]] if variant in ("half", "split_half") else []
-                    extra += ["--device-vectors", "1", "--tiled-gemv", str(args.tiled_gemv)] if args.solver == "custom" else ["--solver", "jacobi", "--jacobi-pivot64", str(args.jacobi_pivot64), "--jacobi-local", args.jacobi_local]
+                    extra += ["--device-vectors", "1"] if args.solver == "custom" else ["--solver", "jacobi", "--jacobi-pivot64", str(args.jacobi_pivot64), "--jacobi-local", args.jacobi_local]
                     if args.half_panel and variant != "fp64":
                         extra += ["--half-panel", "1"]
+                    if args.panel_solution:
+                        extra += ["--panel-solution", str(args.panel_solution)]
                     cmd = shlex.split(args.launcher) + [str(args.binary.resolve()), "--n", str(n),
                         "--block", "16", "--back-block", "32", "--pr", str(args.pr), "--pc", str(args.pc),
                         "--precision", "fp64" if variant == "fp64" else "fp32", "--tridiag",

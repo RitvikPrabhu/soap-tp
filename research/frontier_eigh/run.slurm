@@ -876,6 +876,7 @@ elif [[ $1 == loop3-half-panel ]]; then
         done
     done
 elif [[ $1 == loop3-gemv ]]; then
+    EIGH_BIN=build/custom-eigh/tiled-gemv-eigh
     for grid in '1 8' '2 4' '4 2' '8 1'; do
         read -r pr pc <<< "$grid"
         for precision in fp64 fp32; do
@@ -907,6 +908,27 @@ elif [[ $1 == loop3-panel-solution ]]; then
             done
         done
         run 8 --n "$n" --block 64 --pr 4 --pc 2 --precision fp32 --solver elpa1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference "output/custom-eigh/torch-large/n$n"
+    done
+elif [[ $1 == loop3-scaling ]]; then
+    for grid in '1 8' '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        run 8 --n 97 --block 8 --pr "$pr" --pc "$pc" --tri-pr 8 --precision fp64 --tridiag elpa --matrix indefinite --panel 7 --back-block 13 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1
+    done
+    for ranks in 1 2 4 8; do
+        for half in 0 2; do
+            run "$ranks" --n 8192 --block 64 --pr 1 --pc "$ranks" --tri-pr "$ranks" --precision fp32 --tridiag elpa32 --panel 1 --back-block 256 --half-bulk "$half" --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference output/custom-eigh/torch-large/n8192
+        done
+    done
+    for grid in '2 4' '4 2' '8 1'; do
+        read -r pr pc <<< "$grid"
+        run 8 --n 8192 --block 64 --pr "$pr" --pc "$pc" --tri-pr 8 --precision fp32 --tridiag elpa32 --panel 1 --back-block 256 --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference output/custom-eigh/torch-large/n8192
+    done
+    for mode in heuristic selected half_panel split_half; do
+        solution=0; fused=0; half=0
+        if [[ $mode == selected ]]; then solution=-606624864; fi
+        if [[ $mode == half_panel ]]; then fused=1; fi
+        if [[ $mode == split_half ]]; then half=2; fi
+        run 8 --n 16384 --block 64 --pr 1 --pc 8 --tri-pr 8 --precision fp32 --tridiag elpa32 --panel 16 --back-block 256 --panel-solution "$solution" --half-panel "$fused" --half-bulk "$half" --device-vectors 1 --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --torch-reference output/custom-eigh/torch-large/n16384
     done
 elif [[ $1 == case ]]; then
     shift

@@ -1,6 +1,74 @@
 # Frontier distributed eigh: research outcome
 
-## Final update: second research loop, FP32 / actual FP16 computation
+## Third loop update: actual FP16 throughput (in progress)
+
+The authorized third window is October23,08:29–12:29EDT, on dedicated local branch `research/custom-eigh-fp16-20261023`, based on fc09aa3. No production SOAP files were changed, and nothing was pushed or merged. A usage-limit pause interrupted work around09:26–10:09; the deadline was not extended.
+
+**Current conclusion:** FP16 arithmetic is implemented and tested, but FP32 remains the fastest accurate custom mode. A tuned **native FP32** panel kernel gives the useful new speed improvement. It is not evidence for full-FP16 eigh or a robust half-compute speedup.
+
+### Algorithm, ownership and hardware execution
+
+The selected algorithm is unchanged: power-of-two normalization, our one-stage distributed Householder A→T, ELPA's **tridiagonal-only** distributed divide-and-conquer, precision-preserving redistribution, our compact-WY eigenvector backtransform, then eigenvalue rescaling. Delayed panels are still one-stage reduction, not a band/bulge-chasing algorithm. Full A and Q remain distributed; only tiny correctness exports gather them.
+
+```diagram
+┌────────────────────┐     ┌───────────────────────┐
+│ Distributed A      │────▶│ Our Householder A → T │
+│ HIP / block cyclic │     │ HIP + rocBLAS + RCCL  │
+└────────────────────┘     └──────────┬────────────┘
+                                     ▼
+                          ┌───────────────────────┐
+                          │ ELPA tridiagonal D&C  │
+                          │ Distributed Z and λ   │
+                          └──────────┬────────────┘
+                                     ▼
+                          ┌───────────────────────┐
+                          │ Our compact-WY QZ     │
+                          │ Distributed output Q  │
+                          └───────────────────────┘
+```
+
+One rank per MI250X GCD; all batch experiments use at most one Frontier node. ScaLAPACK2D block-cyclic storage supports1×8,2×4,4×2,8×1, including uneven tile counts. Main1×8 / tridiagonal8×1, tile64 and backtransform256 remain the target configurations. At8192 use panel1. At16384 the new candidate is panel16 with explicit installed rocBLAS solution `-606624864`. IDs are backend/version-specific, not portable tuning constants: support is checked per shrinking descriptor, unsupported edges use the standard kernel, and actual selected/default counts are printed. No numerical precision changes in this optimization.
+
+HIP owns matrix/vector kernels and robust FP64 reduction scalars; rocBLAS supplies FP32/FP64 GEMV/GEMM. Same-stream RCCL handles GPU vector/panel collectives, with GPU-aware MPI and LibSci/ScaLAPACK handling other distributed work and redistribution. CPU FP64 DTRMV constructs compact-T. rocSOLVER is used for local controls/experimental Jacobi pivots, not our selected dense reduction. No native FP16 tridiagonal eigensolver is claimed.
+
+### New measured evidence
+
+Job5742774 passes all26cases (16uneven-grid gates and ten paired target-size/control cases). Warm medians, seconds:
+
+| n / panel | Native heuristic | Native selected kernel | Full ELPA1,4×2 |
+|---|---:|---:|---:|
+|8192 /16|1.5855|1.5981|1.6086|
+|8192 /32|1.6527|1.6644|same control|
+|16384 /16|4.7926|**4.6730**|**4.4311**|
+|16384 /32|4.8406|4.7652|same control|
+
+Panel1 remains the better8192 configuration (prior baseline1.519s); do not select a losing tuned panel merely because its isolated GEMM wins. At16384, panel16 kernel selection reduces matched total by2.5%. FullELPA1 remains faster. Fresh selected-source scaling and mixed controls are pending in E52, not established by the historical scaling curve below.
+
+The16384 selected-panel16 final trial has reduction3.7556s, tridiagonal.6120s including retile.1369s, backtransform.2542s; managed GPU peak279.2MiB/GCD excludes library internals/pool reservations/host arrays. Setup1.1543s is outside total. Host-enqueue communication timing is not isolated network/device time. Warm total range4.6220–4.7241s (two samples, not a confidence interval).
+
+Original-A residual9.846e-7, raw Frobenius orthogonality8.978e-4 (normalized7.014e-6), relative Q-norm error3.568e-8, max eigenvalue error/spectral radius8.262e-7. These are unchanged at printed precision versus the heuristic with the same panel. Same-input ROCm torch gates for selected source are pending; prior mixed-panel gates passed4/4 ordinary-scale2×4 cases and12/12 opposite-grid scale-stress cases. Extreme-scale torch itself fails/is inaccurate, so those cases use CPUFP64 plus explicit precision floors, not a claimed measured torch match.
+
+### What actual lower precision achieved
+
+- Split-FP16 uses FP16 operands/MFMA, FP32 accumulation/state and three algebraic products in two GEMM launches. It is **computation**, not just FP16 storage, but not a fully FP16 eigensolver. Prior8192/16384 totals1.520/5.002s do not beat native1.519/4.818s.
+- New fused rocWMMA correction kernels retain FP32 accumulation and use one C epilogue. Shared64×64 tiling makes16384 panel GEMM.512ms versus defaultSGEMM.866ms, but tuned nativeFP32 is **.284ms**. Selective-half panel32 full solve4.806s versus native4.837s is only0.6%, and does not beat selected-native panel16. Backtransform fused-half kernels lose. No half-speed victory is selected.
+- One-launch K3 concatenation improves the split implementation but loses native backtransform. Its bounded packing can overflow beyond|high|≈1023.5 and omits low×low; no generic dynamic-range claim or solver integration.
+- Native one-product FP16/BF16 did not meet retained FP32-level gates. Split-BF16 also fails a stronger Q-norm case. Lowest operand precision demonstrated under the bounded strict gates is corrected FP16; fastest supported state/solve precision remains FP32. Ill-conditioned SOAP application evidence still favors FP64 solve→FP32 basis storage.
+- Public cuSOLVERMp documents FP32/FP64 SYEVD/SYTRD/STEDC, not a native half eigensolver. Actual repository SOAP initialization uses FP64 ELPA then FP32 storage. ROCm torch Half eigh is unsupported. There is no verified CUDA-half baseline to claim parity with.
+
+### Rejected experiments and decision
+
+HIP graphs pass20cases but8192 total14.28s versus1.51s: capture alone≈12.67s overwhelms replay. FP32 Jacobi pivots plus FP64 refinement pass after exact local seed normalization fixes a reproduced rocSOLVER scale problem, but2048≈1.91s versus FP64 pivots.572s;74full512clusters and382size256solves erase the intended savings. Both complex paths were removed from selected source, retained in experimental commits/binaries. Two-launch GEMV loses at both target sizes; a single-launch micro follow-up also loses large local shapes and was not integrated.
+
+An initial tuning job5741930 was invalid: our caller treated all negative IDs as default. Its apparent tuning gains are explicitly discarded. Corrected selectors were verified using actual rocprof dispatches in5742092, then timed uninstrumented in5742174 with independent sampled FP64 dot-product checks. Sampled micro accuracy is not substituted for full-solver validation.
+
+The dominant limitation remains sequential reduction/GEMV/collective dependencies (~81%of final phases), not bulk GEMM peak precision. cuSOLVERMp's stage separation,2D ownership and distributed backtransform translate well; proprietary kernels/NCCL tuning and undocumented half/two-stage assumptions do not. The promising substantial next step is a competitive complete two-stage band chase/Q2 schedule, not another unmeasured low-precision substitution. Earlier custom A→B plus ELPA B→T/Q2 was correct but slow (~14.86s at16384); SLATE was studied, not benchmarked, because the inspected grid/root-band design conflicts with requirements. Practical production adoption still favors tuning/extending ELPA1; retain custom code for algorithm control and research.
+
+### Reproduction and delivery
+
+Current selected-source snapshot: `build/custom-eigh/selected-panel-eigh`, SHA256 `4b802180e912b3da52bca189c08e1dd8e92f2b0685db2673f1ddcc188c3d505e`. Build/commands are in README; E44–E52 in RESULTS record hypotheses, failures and exact raw paths. Final job/file/commit inventories and refreshed scaling are still pending. All remaining work must stop by12:29EDT; no background resume or renewed budget is implied.
+
+## Historical final update: second research loop, FP32 / actual FP16 computation
 
 **Recommendation:** retain the custom native-FP32 path as the fastest measured custom mode. Mixed split-FP16 computation meets the tested accuracy gates but is not consistently faster. Do not claim a full-FP16 eigensolver, universal PyTorch equivalence, or superiority to a tuned distributed ELPA1 backend. The existing SOAP backend is unchanged.
 
