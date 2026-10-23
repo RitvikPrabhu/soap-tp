@@ -46,15 +46,20 @@ void dger_(const int*, const int*, const double*, const double*, const int*,
     std::string(#x) + ": " + ncclGetErrorString(s)); } while (0)
 
 size_t device_live_bytes=0, device_peak_bytes=0;
+bool async_alloc=false;
 template<class T> struct Device {
     T* p = nullptr;
     size_t n;
     explicit Device(size_t count): n(count) {
-        HIP(hipMalloc(&p, std::max(size_t(1), n)*sizeof(T)));
+        if (async_alloc) HIP(hipMallocAsync(&p,std::max(size_t(1),n)*sizeof(T),nullptr));
+        else HIP(hipMalloc(&p, std::max(size_t(1), n)*sizeof(T)));
         device_live_bytes+=std::max(size_t(1), n)*sizeof(T);
         device_peak_bytes=std::max(device_peak_bytes,device_live_bytes);
     }
-    ~Device() { hipFree(p); device_live_bytes-=std::max(size_t(1), n)*sizeof(T); }
+    ~Device() {
+        if (async_alloc) hipFreeAsync(p,nullptr); else hipFree(p);
+        device_live_bytes-=std::max(size_t(1), n)*sizeof(T);
+    }
     Device(const Device&) = delete;
     void put(const std::vector<T>& h) { HIP(hipMemcpy(p, h.data(), n*sizeof(T), hipMemcpyHostToDevice)); }
     std::vector<T> get() const {
@@ -840,10 +845,10 @@ template<class T> void run(Grid& g, const std::string& solver, const std::string
         } else throw std::runtime_error("unknown solver");
         total=g.maximum(g.tick()-start);
         double peak_mib=g.maximum(device_peak_bytes/1048576.);
-        if (g.rank==0) std::printf("TIMING solver=%s trial=%d n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s total=%.9g reduction=%.9g tridiag=%.9g back=%.9g back_block=%d gpu_mpi=%d panel=%d tridiag_backend=%s rccl=%d half_bulk=%d band=%d cpu_qr=%.9g managed_gpu_peak_mib=%.9g device_vectors=%d tridiag_grid=%dx%d retile=%.9g bf16_bulk=%d\n",
+        if (g.rank==0) std::printf("TIMING solver=%s trial=%d n=%d grid=%dx%d block=%d precision=%s matrix=%s quant=%s total=%.9g reduction=%.9g tridiag=%.9g back=%.9g back_block=%d gpu_mpi=%d panel=%d tridiag_backend=%s rccl=%d half_bulk=%d band=%d cpu_qr=%.9g managed_gpu_peak_mib=%.9g device_vectors=%d tridiag_grid=%dx%d retile=%.9g bf16_bulk=%d async_alloc=%d\n",
             solver.c_str(),trial,g.n,g.pr,g.pc,g.b,std::is_same_v<T,double>?"fp64":"fp32",name.c_str(),quant.c_str(),total,
             phases.reduction,phases.tridiag,phases.back,back_block,int(g.gpu_mpi),panel,band_width?"elpa_banded":tridiag.c_str(),int(g.rccl),int(half_bulk),band_width,phases.cpu_qr,peak_mib,int(device_vectors),
-            tridiagonal_grid?tridiagonal_grid->pr:g.pr,tridiagonal_grid?tridiagonal_grid->pc:g.pc,phases.retile,bf16_bulk);
+            tridiagonal_grid?tridiagonal_grid->pr:g.pr,tridiagonal_grid?tridiagonal_grid->pc:g.pc,phases.retile,bf16_bulk,int(async_alloc));
     }
     double comm=g.maximum(g.comm); g.comm=0;
     auto qt=q.get(); std::vector<double> qd(qt.begin(),qt.end());
@@ -968,6 +973,12 @@ int main(int argc,char** argv) {
         if (half_bulk && precision!="fp32") throw std::runtime_error("half bulk experiment requires FP32 state");
         if (bf16_bulk<0 || bf16_bulk>2 || (bf16_bulk && (precision!="fp32" || half_bulk)))
             throw std::runtime_error("BF16 bulk requires mode 0/1/2, FP32 state, and no FP16 bulk");
+        async_alloc=arg("--async-alloc","0")=="1";
+        if (async_alloc) {
+            hipMemPool_t pool; HIP(hipDeviceGetDefaultMemPool(&pool,0));
+            uint64_t threshold=~uint64_t(0);
+            HIP(hipMemPoolSetAttribute(pool,hipMemPoolAttrReleaseThreshold,&threshold));
+        }
         {
             Grid g(n,b,pr,pc,arg("--gpu-mpi","0")=="1",arg("--rccl","0")=="1");
             std::string tridiag=arg("--tridiag","scalapack");
@@ -987,6 +998,7 @@ int main(int argc,char** argv) {
             else throw std::runtime_error("precision must be fp64 or fp32");
             tridiagonal_grid=nullptr;
         }
+        if (async_alloc) HIP(hipDeviceSynchronize());
         MPI(MPI_Finalize()); return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr,"rank %d: %s\n",rank,e.what()); MPI_Abort(MPI_COMM_WORLD,1); return 1;

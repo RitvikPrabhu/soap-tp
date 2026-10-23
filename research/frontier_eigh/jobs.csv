@@ -18,4 +18,8 @@ job,suite,state,elapsed,start,end,nodes,result_rows,failure_markers,stdout,stder
 5736758,twod,COMPLETED,00:09:18,2026-10-22T19:53:57,2026-10-22T20:03:15,frontier09155,28,0,output/custom-eigh/job-5736758.out,output/custom-eigh/job-5736758.err
 5736815,soap,COMPLETED,00:01:23,2026-10-22T20:04:57,2026-10-22T20:06:20,frontier01375,90,0,output/custom-eigh/job-5736815.out,output/custom-eigh/job-5736815.err
 5736836,fused,COMPLETED,00:06:57,2026-10-22T20:06:57,2026-10-22T20:13:54,frontier01244,26,0,output/custom-eigh/job-5736836.out,output/custom-eigh/job-5736836.err
-5736889,direct,RUNNING,00:06:08,2026-10-22T20:14:58,Unknown,frontier02621,25,0,output/custom-eigh/job-5736889.out,output/custom-eigh/job-5736889.err
+5736889,direct,COMPLETED,00:08:36,2026-10-22T20:14:58,2026-10-22T20:23:34,frontier02621,32,0,output/custom-eigh/job-5736889.out,output/custom-eigh/job-5736889.err
+5736968,merged,COMPLETED,00:12:14,2026-10-22T20:25:58,2026-10-22T20:38:12,frontier03488,42,0,output/custom-eigh/job-5736968.out,output/custom-eigh/job-5736968.err
+5737042,finish,COMPLETED,00:13:40,2026-10-22T20:38:59,2026-10-22T20:52:39,frontier03637,24,0,output/custom-eigh/job-5737042.out,output/custom-eigh/job-5737042.err
+5737122,low-compute,COMPLETED,00:02:46,2026-10-22T20:54:00,2026-10-22T20:56:46,frontier01083,20,6,output/custom-eigh/job-5737122.out,output/custom-eigh/job-5737122.err
+5737139,pool,COMPLETED,00:08:58,2026-10-22T20:58:01,2026-10-22T21:06:59,frontier09260,22,0,output/custom-eigh/job-5737139.out,output/custom-eigh/job-5737139.err

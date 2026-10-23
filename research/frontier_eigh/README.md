@@ -2,7 +2,7 @@
 
 Experimental branch: `research/custom-eigh-frontier-20261022`. Existing SOAP implementations and behavior are unchanged. This standalone driver implements **real** FP64/FP32 symmetric eigendecomposition, not complex Hermitian eigendecomposition. It is not yet a Python/SOAP backend.
 
-The experiment-by-experiment evidence is in [RESULTS.md](RESULTS.md); restart state and the original four-hour budget are in [../../RESEARCH_CHECKPOINT.md](../../RESEARCH_CHECKPOINT.md). Performance decisions must follow those measurements, not the theoretical attractiveness of a kernel or transport.
+The final findings are in [FINAL_REPORT.md](FINAL_REPORT.md), with experiment-by-experiment evidence in [RESULTS.md](RESULTS.md); restart state and the original four-hour budget are in [../../RESEARCH_CHECKPOINT.md](../../RESEARCH_CHECKPOINT.md). Performance decisions must follow those measurements, not the theoretical attractiveness of a kernel or transport.
 
 ## Reproduce
 
@@ -15,15 +15,16 @@ bash research/frontier_eigh/build.sh
 mkdir -p output/custom-eigh
 EIGH_BIN=build/custom-eigh/eigh sbatch --time=00:05:00 \
     research/frontier_eigh/run.slurm case 8 \
-    --n 8192 --block 64 --pr 2 --pc 4 --back-block 128 \
-    --tridiag elpa --gpu-mpi 1 --rccl 1 --repeat 3 --reference 1
+    --n 8192 --block 64 --pr 1 --pc 8 --back-block 128 \
+    --tri-pr 8 --tridiag elpa --device-vectors 1 \
+    --gpu-mpi 1 --rccl 1 --async-alloc 1 --repeat 3 --reference 1
 ```
 
-For the two-stage candidate, add `--band 64`. Initially **bandwidth must equal the distribution block size**. Full ELPA controls use `--solver elpa1` or `--solver elpa2`; local rocSOLVER uses `--solver rocsolver` on one rank. `--elpa-times 1` prints internal stage profiles, but adds instrumentation/output overhead; do not substitute these totals for uninstrumented controls.
+This is the selected custom one-stage configuration, not a claim that it beats full ELPA. For rectangular controls, use `--pr 2 --pc 4` or `--pr 4 --pc 2`, with or without the separate tridiagonal grid. For the two-stage candidate, remove `--device-vectors 1 --tri-pr 8` and add `--band 64`. Initially **bandwidth must equal the distribution block size**. Full ELPA controls use `--solver elpa1` or `--solver elpa2` without device-vector/stage-grid options; local rocSOLVER uses `--solver rocsolver` on one rank. `--elpa-times 1` prints internal stage profiles, but adds instrumentation/output overhead; do not substitute these totals for uninstrumented controls.
 
 For FP32 dense state, use `--precision fp32`. `--tridiag elpa` retains FP64 tridiagonal work; explicit `--tridiag elpa32` tests the FP32 component. Normwise correctness does not guarantee accurate small eigenvalues or a stable SOAP basis in poorly separated subspaces.
 
-Batch scripts use account `gen150`, one node, one rank per GCD, seven CPU cores per rank, and one OpenMP/BLAS thread. They do not launch multi-node jobs. Matrices are deterministic functions of global indices (no external data or stochastic seed). Every `COMMAND` line records material configuration, followed by the executable SHA256 and all trial timings. First trials include library/kernel warmup; subsequent trials are the warm comparisons. Setup, input generation, exact validation and optional reference solves are outside `total`; per-call solver workspaces/handles are inside `total`.
+Batch scripts use account `gen150`, one node, one rank per GCD, seven CPU cores per rank, and one OpenMP/BLAS thread. They do not launch multi-node jobs. Matrices are deterministic functions of global indices (no external data or stochastic seed). Every `COMMAND` line records material configuration, followed by the executable SHA256 and all trial timings. First trials include library/kernel warmup; subsequent trials are the warm comparisons. Setup, input generation, exact validation and optional reference solves are outside `total`; per-call solver workspaces/handles are inside `total`. `setup` measures matrix generation, A/Q allocation and initial upload; persistent MPI/BLACS/RCCL grid initialization and the outer rocBLAS handle creation are outside both fields.
 
 ```bash
 python3 research/frontier_eigh/summarize.py output/custom-eigh/job-*.out > results.csv
@@ -45,7 +46,7 @@ There is no dense gather in a multi-rank solve. Replication is limited to vector
 
 **One stage:** custom Householder similarity reduction A→T; distributed divide-and-conquer for T; custom reverse compact-WY backtransform Q=H₀H₁…Z. The active trailing local GEMV uses rocBLAS; a fused HIP rank-2 kernel updates A. FP64 scalar formation is max-scaled; vectors and reflectors are retained with distributed A. `--tridiag scalapack` selects FP64 LibSci PDSTEDC, while `elpa` selects only ELPA's public FP64 distributed tridiagonal component. FP32 dense mode can instead select `elpa32` for FP32 tridiagonal work.
 
-`--device-vectors 1` is an optional one-stage reduction candidate requiring `--gpu-mpi 1 --rccl 1 --panel 1`. HIP kernels form scaled FP64 norms and scalars, requested-precision V/W, and the rank2 update. Padded RCCL AllGather transposes row-distributed vectors into column layout even with unequal local row counts. Per-reflector host copies disappear during reduction; d/e/tau and the final diagonal extraction return at the phase boundary. The shared backtransform still stages narrow reflector panels through the host. Whether this beats the CPU-vector baseline is an empirical question, not an automatic consequence of GPU residency.
+`--device-vectors 1` is an optional one-stage reduction candidate requiring `--gpu-mpi 1 --rccl 1 --panel 1`. HIP kernels form scaled FP64 norms and scalars, requested-precision V/W, and the rank2 update. Padded RCCL AllGather transposes row-distributed vectors into column layout even with unequal local row counts. Per-reflector host copies disappear during reduction; d/e/tau and the final diagonal extraction return at the phase boundary. With GPU communication enabled, the shared backtransform copies/broadcasts reflector panels directly on device; only small Gram/T factors pass through the host. Host-staged panel transport remains an independent control. Whether GPU vectors beat the CPU-vector baseline is an empirical question, not an automatic consequence of GPU residency.
 
 `--tri-pr 8` independently chooses eight process rows for ELPA's tridiagonal component, with process columns inferred from world size. The distributed Z then returns to the main grid through LibSci PDGEMR2D; neither A nor full Q is gathered. This tests whether a faster tridiagonal grid offsets the redistribution cost. `tridiag` includes this redistribution and `retile` separately measures its host elapsed time (packing/communication together). Main A/reflector/backtransform ownership remains unchanged. The optional stage grid is created once outside timed trials, like the main grid.
 
@@ -59,11 +60,15 @@ rocBLAS, HIP kernels and RCCL share the default HIP stream. RCCL collectives are
 
 ## Precision and correctness
 
-Every solve checks original-problem Frobenius residual, orthogonality, and reference eigenvalue agreement when available. Input quantization additionally reports the rounded-problem residual separately. Tiny references use LAPACK; larger `--reference 1` cases use distributed FP64 ELPA2. Global eigenvalue error and smallest-eigenvalue relative error are distinct. Reference comparison uses no elementwise eigenvector matching.
+Every solve checks original-problem Frobenius residual, orthogonality, and reference eigenvalue agreement when available. Input quantization additionally reports the rounded-problem residual separately. Tiny references use LAPACK; larger `--reference 1` cases use distributed FP64 ELPA2. Global eigenvalue error and smallest-eigenvalue relative error are distinct. Reference comparison uses no elementwise eigenvector matching. `--matrix zero` is an explicit regression: undefined relative zero-norm errors are reported as absolute errors, with no changed normalization for nonzero problems. Degenerate selected-subspace boundaries are skipped rather than compared elementwise.
 
 `top_subspace` is `||(I−RRᵀ)Qtop||F/||Qtop||F` for the eight dominant reference vectors. It is invariant to their signs and rotations within the selected subspace. `top_gap` reports the normalized separating eigengap; degenerate boundaries skip this comparison. Its accuracy depends strongly on that gap.
 
 `--quant fp16|bf16` rounds **input only**, retaining requested dense arithmetic. `--half-bulk 1` is actual FP16-input GEMM with FP32 accumulation/state and fails the strict tested accuracy criteria. `--half-bulk 2` represents operands as high plus4096-scaled low halves, computing three FP16-input/FP32-accumulate products; it omits low×low. MI200 flushes FP16 MFMA subnormals, so small high values are routed into the scaled low part. This is mixed arithmetic, not FP16 storage/compute throughout, and is not guaranteed for arbitrary dynamic range. Baseline GEMV and scalar work remain higher precision.
+
+`--bf16-bulk 1|2` similarly selects **actual BF16-input/FP32-accumulate GEMM**, not BF16 input rounding or basis storage. Mode1 is the native single product; mode2 uses high+residual BF16 operands and three products, omitting low×low. BF16 does not need the FP16 residual scaling. These modes require FP32 state and cannot be combined with FP16 bulk. In one-stage mode they change the two large backtransform GEMMs; in band mode they also change dense-to-band trailing updates. Reduction GEMV remains FP32, robust norm/dot scalars remain FP64, and `--tridiag elpa32` selects FP32 tridiagonal work. Native BF16 fails strict checks; split-BF16 passes tested rectangular and8192 checks but is not a performance winner and has larger orthogonality error. Reproduce the bounded computation-precision comparison with `sbatch --time=00:08:00 research/frontier_eigh/run.slurm low-compute` after rebuilding.
+
+`--async-alloc 1` uses stream-ordered HIP allocation/free and retains the process-local default memory pool across synchronization points. Paired measurements improve backtransform time in all tested FP64/FP32/mixed cases, with small total gains. This does not change arithmetic or introduce a new stream. The driver-managed logical-byte metric excludes cached pool capacity; actual GPU memory reservation can be larger. The selected frozen binary is `build/custom-eigh/pool-eigh`; `final-eigh` retains the earlier synchronous-allocation scaling control.
 
 The existing SOAP initializer consumes eigenvectors and discards eigenvalues; its FP32 input is currently promoted to FP64 for ELPA and cast back afterward. Thus tiny eigenvalue relative errors alone neither prove nor disprove acceptable optimizer behavior. Low precision must ultimately be judged on eigengaps/subspaces **and SOAP update or training behavior**. This loop does not claim that a solver-only residual establishes training equivalence.
 

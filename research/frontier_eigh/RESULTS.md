@@ -328,9 +328,13 @@ An actual3×3 zero input decomposes to zero eigenvalues and an orthogonal basis,
 - Revert E23 in the selected source: on main1x8, paired warm median **reduction** FP64 1.65225→1.65966s, FP32 1.32609→1.32809s gives no benefit. Total2.194→2.218 /1.711→1.737s also includes unrelated tridiagonal variation; do not attribute that entire difference to the kernel. Slower2x4/4x2 layouts improve~.04–.07s, but do not become the selected layout. Prefer computing scalars once rather than retaining redundant per-CTA scalar work without a gain on the fastest layout. Zero-matrix validation correction is retained.
 - Frozen **`final-eigh` SHAbf8730a7ae6324653a0b74dda070c17ccbe1fb1d0b16a4e9e6b345c7116bbf43** is exactly E22's solver plus the zero-matrix validation fix; source diff against1604058 confirms this. Tiny31 zero/lowrank both precisions pass. Planned `finish` suite rechecks this actual selected binary, rather than claiming the rejected variant's scaling as its own.
 
-### E25: revisit delayed updates only at the larger target (prepared)
+### E25: revisit delayed updates at the larger target and validate selection
 
-Hypothesis: the panel approach that lost at8192 may cross a bandwidth/latency break-even at16384, where trailing-matrix traffic is much larger. No new algorithm is implemented. The combined **`finish`** suite tests existing correct panel1/8/32 at16384/4x2 in both precisions, with same-nodeELPA1 controls and distributed FP64 ELPA2 references, selected GPU-vector16384 and refreshed selected1/2/4/8G8192 scaling. Combining these avoids another job and duplicate final controls. This directly tests a size-dependent alternative rather than extrapolating the smaller-case loss. Not yet submitted.
+Hypothesis: the panel approach that lost at8192 may cross a bandwidth/latency break-even at16384, where trailing-matrix traffic is much larger. No new algorithm is implemented. Combined **`finish` job5737042 COMPLETED13m40s**, frontier03637, all24cases passed. It tested panel1/8/32 at16384/4x2, selected GPU-vector16384, refreshed1/2/4/8G8192 scaling and same-nodeELPA1 controls, both precisions with distributed FP64 ELPA2 references.
+
+- 16384CPU panels1/8/32 warm medians **11.279/9.800/9.779s FP64;7.064/6.646/6.961s FP32**. Larger-size panelization helps, reversing the smaller-case result, but still loses selected GPU-vector1x8→tri8x1 **9.350/6.161s**. Keep panel controls without changing the winning configuration.
+- Selected8192 FP64 warm1/2/4/8G **6.700/4.838/3.267/2.152s**, FP32 **3.753/3.052/2.062/1.787s**. Speedup3.11/2.10x. FullELPA1 same-node8192 **1.943/1.561s**,16384 **6.188/4.440s**. Custom remains slower.
+- Selected16384 FP64 residual/orth/spectrum **3.79e-15/1.79e-12/1.65e-15**; FP32 **1.98e-6/8.98e-4/5.79e-7**. Final phases FP64 **7.192/1.421/.706s**, FP32 **4.734/.908/.441s**. Tridiagonal includes retile.356/.232s. Normwise FP32 passes, but1025lowrank minimum-eigenvalue error remains26%, so this is not universal small-spectrum accuracy.
 
 ### E26: actual BF16 computation, not basis or input rounding
 
@@ -339,3 +343,27 @@ Hypothesis: the panel approach that lost at8192 may cross a bandwidth/latency br
 Hypothesis: BF16-input/FP32-accumulate GEMM avoids FP16's exponent/subnormal limitation; splitting each operand into rounded BF16 high+BF16 residual and using three products may restore acceptable normwise accuracy. Added `--bf16-bulk 1|2`, mutually exclusive with FP16 bulk, retaining FP32 matrix state. Mode1 is a single native BF16 product; mode2 is hi×hi+hi×lo+lo×hi (no low×low). Existing FP16 semantics are unchanged; common16-bit buffers avoid duplicating the GEMM implementation. This changes actual GEMM operand computation, not storage-only or input-rounding behavior. One-stage reduction GEMV and ELPA tridiagonal work remain FP32; two-stage large updates also use these mixed GEMMs when selected.
 
 Frozen `bf16-eigh` SHAdd123a3d3d01c49fc51dbd87b6238d8d63ddcaba374ee5b2c4cfd336c079f0e5 built successfully. Tiny login n31/back13 random andlowrank: nativeBF16 fails (residual7.82e-4/.00411, orthogonality.04097/.04206); splitBF16 passes existing thresholds (residual1.30e-6/7.57e-6, orth7.90e-5/8.17e-5). FP32 controls pass at2.24e-7/2.69e-7 residual. Raw `output/custom-eigh/bf16-tiny.log`; these are correctness checks, not performance claims. `low-compute` suite prepared for rectangular n97 gates, paired8192 FP64/FP32/splitFP16/splitBF16, and banded257/2048 controls. No tolerance is loosened; failed approximate cases are recorded explicitly and never selected.
+
+- **Job5737122 COMPLETED2m46s**, frontier01083:20cases,14pass/six expected nativeBF16 failures. All six splitBF16 rectangular random/lowrank/indefinite cases pass. NativeBF16 orthogonality~.069–.071; split~.00012–.00013.
+- Same-node8192 FP64/FP32/splitFP16/splitBF16 warm totals **2.157/1.715/1.755/1.739s**, final back **.132/.096/.134/.134s**. SplitBF16 residual **1.95e-6**, orth **.001193**, eigenvalue error **3.94e-7**; passes existing normwise thresholds but loses performance and orthogonality accuracy to FP32. Retain as an explicit mixed-compute study, not a default.
+- Mixed dense-to-band also passes:257lowrank splitBF16 residual8.73e-6, spectrum2.46e-6;2048random residual4.05e-6/orth.000581/spectrum9.76e-7.2048 total.1750s versus nativeFP32.1715s. This tests lower computation in the reduction updates as well as backtransform, without establishing a large-size two-stage win.
+
+### E27: stream-ordered temporary allocation
+
+Hypothesis: synchronous hipMalloc/hipFree for repeated compact-WY and mixed-GEMM temporaries adds avoidable synchronization. Added opt-in `--async-alloc 1`: hipMallocAsync/hipFreeAsync on the same default stream; retain the process-local default memory pool across synchronization points. No arithmetic changes, no fallback, no new stream. Physical pool retention is not included in logical `managed_gpu_peak_mib`.
+
+Frozen **`pool-eigh` SHA418dae0168f10d5054f4e18ed8ba25c966f7d0220259027a966f5a42c534af64**. Tiny31 FP64/FP32/splitFP16/splitBF16 pass. **Job5737139 COMPLETED8m58s**, frontier09260,22cases allpassed; eight uneven rectangular gates followed by same-node pool0/1 pairs. Warm medians:
+
+| n/mode | Synchronous allocation(s) | Stream-ordered allocation(s) | Final back before→after(s) |
+|---|---:|---:|---:|
+|8192 FP64|2.151|2.133|.133→.114|
+|8192 FP32|1.720|1.711|.096→.084|
+|8192 splitFP16|1.728|1.709|.133→.110|
+|8192 splitBF16|1.749|1.719|.134→.111|
+|16384 FP64|9.290|9.249|.709→.631|
+|16384 FP32|6.187|6.155|.438→.404|
+|16384 splitFP16|6.390|6.264|.583→.525|
+
+Keep the allocation option: consistent backtransform gains, small end-to-end gains, unchanged numerical errors within each pair. The8192splitFP16/nativeFP32 total tie **does not establish a half-compute speedup**: mixed back remains slower, and unrelated tridiagonal timing differs. At16384splitFP16 clearly remains slower than nativeFP32. Select nativeFP64/FP32 plus the pool option for the practical custom path; retain mixed modes as bounded accuracy/performance alternatives.
+
+Last experimentation/job finished21:07EDT, inside the original21:35deadline. Reporting resumed at00:00EDT after a usage-limit pause; no further experiments were started after the budget expired. All674 parsed solves:664pass,10expected naive FP16/BF16 failures. No running/submitted jobs remain.
