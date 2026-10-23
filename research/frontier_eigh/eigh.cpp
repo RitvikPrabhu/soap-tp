@@ -322,6 +322,21 @@ template<class T> __global__ void local_statistics(const T* v, int nr, int tail,
     }
 }
 
+__global__ void reflector_scalar(const double* gathered, int pr, double* s,
+    double* d, double* e, double* tau, int k) {
+    double scale=0, sum=0, alpha=0, diagonal=0;
+    for (int r=0;r<pr;++r) scale=fmax(scale,gathered[4*r]);
+    for (int r=0;r<pr;++r) {
+        double ratio=scale!=0 ? gathered[4*r]/scale : 0;
+        sum+=gathered[4*r+1]*ratio*ratio;
+        alpha+=gathered[4*r+2]; diagonal+=gathered[4*r+3];
+    }
+    double norm=scale*sqrt(sum);
+    double beta=norm!=0 ? -copysign(hypot(alpha,norm),alpha) : alpha;
+    d[k]=diagonal; e[k]=beta; tau[k]=norm!=0 ? (beta-alpha)/beta : 0;
+    s[5]=alpha-beta;
+}
+
 template<class T> __global__ void vector_dot(const T* v, T* w, int nr, int start,
     int k, double* s, const double* tau) {
     __shared__ double partial[256];
@@ -340,34 +355,19 @@ template<class T> __global__ void vector_dot(const T* v, T* w, int nr, int start
 
 template<class T> __global__ void form_vectors(T* v, T* vc, T* w, T* column, const T* packed,
     const int* rows, const int* cols, int nr, int nc, int padded, int b, int pr,
-    int k, const double* gathered, double* d, double* e, double* tau) {
-    __shared__ double denominator, coefficient;
-    if (!threadIdx.x) {
-        double scale=0, sum=0, alpha=0, diagonal=0;
-        for (int r=0;r<pr;++r) scale=fmax(scale,gathered[4*r]);
-        for (int r=0;r<pr;++r) {
-            double ratio=scale!=0 ? gathered[4*r]/scale : 0;
-            sum+=gathered[4*r+1]*ratio*ratio;
-            alpha+=gathered[4*r+2]; diagonal+=gathered[4*r+3];
-        }
-        double norm=scale*sqrt(sum);
-        double beta=norm!=0 ? -copysign(hypot(alpha,norm),alpha) : alpha;
-        denominator=alpha-beta; coefficient=norm!=0 ? (beta-alpha)/beta : 0;
-        if (!blockIdx.x) { d[k]=diagonal; e[k]=beta; tau[k]=coefficient; }
-    }
-    __syncthreads();
+    int k, const double* s, const double* tau) {
     int i=blockIdx.x*blockDim.x+threadIdx.x;
     if (i<padded) {
         w[i]=0;
         if (i>=nr || rows[i]<=k) v[i]=0;
         else if (rows[i]==k+1) v[i]=1;
-        else if (coefficient!=0) v[i]=T(double(v[i])/denominator);
+        else if (tau[k]!=0) v[i]=T(double(v[i])/s[5]);
         if (column && i<nr) column[i]=v[i];
     }
     if (i<nc) {
         int r=cols[i];
         T value=packed[size_t((r/b)%pr)*padded+(r/b/pr)*b+r%b];
-        vc[i]=r<=k ? T(0) : r==k+1 ? T(1) : coefficient!=0 ? T(double(value)/denominator) : value;
+        vc[i]=r<=k ? T(0) : r==k+1 ? T(1) : tau[k]!=0 ? T(double(value)/s[5]) : value;
     }
 }
 
@@ -397,7 +397,7 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
     std::vector<double>& e, std::vector<double>& tau) {
     int padded=((g.n+g.b*g.pr-1)/(g.b*g.pr))*g.b;
     Device<T> v(padded), w(padded), vc(g.nc), wc(g.nc), packed(size_t(padded)*g.pr);
-    Device<double> scalars(5), statistics(4*g.pr), dd(g.n), ee(g.n), tt(g.n-1);
+    Device<double> scalars(6), statistics(4*g.pr), dd(g.n), ee(g.n), tt(g.n-1);
     HIP(hipMemsetAsync(dd.p,0,dd.n*sizeof(double)));
     HIP(hipMemsetAsync(ee.p,0,ee.n*sizeof(double)));
     auto gather=[&](Device<T>& local) {
@@ -419,8 +419,9 @@ template<class T> void reduce_device_vectors(Grid& g, rocblas_handle h, Device<T
         clock=MPI_Wtime();
         CCL(ncclAllGather(scalars.p,statistics.p,4,ncclFloat64,g.ccl_col,nullptr));
         g.comm+=MPI_Wtime()-clock;
+        reflector_scalar<<<1,1>>>(statistics.p,g.pr,scalars.p,dd.p,ee.p,tt.p,k);
         gather(v);
-        form_vectors<<<(std::max(padded,g.nc)+255)/256,256>>>(v.p,vc.p,w.p,column,packed.p,rows.p,cols.p,g.nr,g.nc,padded,g.b,g.pr,k,statistics.p,dd.p,ee.p,tt.p);
+        form_vectors<<<(std::max(padded,g.nc)+255)/256,256>>>(v.p,vc.p,w.p,column,packed.p,rows.p,cols.p,g.nr,g.nc,padded,g.b,g.pr,k,scalars.p,tt.p);
         if (r0<g.nr && c0<g.nc) gemv(h,false,g.nr-r0,g.nc-c0,g.nr,
             a.p+r0+size_t(c0)*g.nr,vc.p+c0,w.p+r0);
         g.device_sum(w,g.row);
