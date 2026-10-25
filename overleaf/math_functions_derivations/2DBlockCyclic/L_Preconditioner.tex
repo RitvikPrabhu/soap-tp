@@ -1,0 +1,799 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{enumitem}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible
+}
+
+\title{Deriving an Efficient Distributed Computation of $$GG^\top$$ from Column-Sharded Gradients}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{The problem we want to solve}
+
+Suppose we are maintaining the left preconditioner in SOAP/Shampoo. At each update, we need the exponential moving average
+
+$$
+L \leftarrow \beta L + (1-\beta)GG^\top,
+$$
+
+where
+
+$$
+G \in \mathbb{R}^{m \times n}.
+$$
+
+The hard part is that, under tensor parallelism, $$G$$ is not stored on one GPU. Instead, it is column-sharded across $$p$$ ranks:
+
+$$
+G =
+\begin{bmatrix}
+G_0 & G_1 & \cdots & G_{p-1}
+\end{bmatrix},
+$$
+
+where each rank $$r$$ owns
+
+$$
+G_r \in \mathbb{R}^{m \times n_{\text{local}}}.
+$$
+
+So the question is:
+
+\begin{quote}
+How do we compute and store $$GG^\top$$ efficiently when every rank only owns a column shard of $$G$$?
+\end{quote}
+
+\section{The key algebraic observation}
+
+Start with the matrix product:
+
+$$
+GG^\top
+=
+\begin{bmatrix}
+G_0 & G_1 & \cdots & G_{p-1}
+\end{bmatrix}
+\begin{bmatrix}
+G_0^\top \\
+G_1^\top \\
+\vdots \\
+G_{p-1}^\top
+\end{bmatrix}.
+$$
+
+Multiplying this block matrix gives
+
+$$
+GG^\top
+=
+G_0G_0^\top
++
+G_1G_1^\top
++
+\cdots
++
+G_{p-1}G_{p-1}^\top.
+$$
+
+This is the central reason the left preconditioner is the nice case.
+
+Each rank can compute its own local contribution
+
+$$
+P_r = G_rG_r^\top,
+$$
+
+and then the final matrix is just
+
+$$
+L_{\text{fresh}}
+=
+\sum_{r=0}^{p-1} P_r.
+$$
+
+So we do not need a ring exchange of gradient shards for $$GG^\top$$. Each rank can compute a partial contribution locally, and the ranks only need to sum the partials.
+
+\section{The naive implementation}
+
+The most direct implementation would be:
+
+\begin{enumerate}
+    \item Every rank computes its full local contribution:
+    $$
+    P_r = G_rG_r^\top.
+    $$
+
+    \item All ranks sum the full matrix using an all-reduce:
+    $$
+    P = \sum_r P_r.
+    $$
+
+    \item Every rank gets the full $$m \times m$$ matrix.
+\end{enumerate}
+
+This is simple, but bad.
+
+Every rank temporarily stores a full matrix:
+
+$$
+m \times m.
+$$
+
+Every rank also communicates the full matrix. This defeats the point of distributed storage.
+
+So the first improvement is:
+
+\begin{quote}
+Do not all-reduce the whole matrix to every rank. Sum the matrix and distribute it directly into the layout needed by the eigensolver.
+\end{quote}
+
+\section{The target layout: 2D block-cyclic storage}
+
+Dense eigensolvers such as ScaLAPACK/ELPA-style solvers usually expect the matrix to be distributed across a 2D process grid.
+
+Assume the $$p$$ ranks are arranged as a $$P_r \times P_c$$ grid:
+
+$$
+p = P_rP_c.
+$$
+
+A rank $$q$$ has process-grid coordinates
+
+$$
+\text{grid}_r = q \mathbin{//} P_c,
+$$
+
+$$
+\text{grid}_c = q \bmod P_c.
+$$
+
+Now split the matrix $$L$$ into square blocks of size
+
+$$
+b \times b.
+$$
+
+Let the global block coordinates be
+
+$$
+(i_b, j_b).
+$$
+
+The block-cyclic ownership rule is:
+
+$$
+\text{owner}(i_b, j_b)
+=
+(i_b \bmod P_r)P_c
++
+(j_b \bmod P_c).
+$$
+
+So rank $$q$$ owns block $$(i_b,j_b)$$ exactly when
+
+$$
+i_b \bmod P_r = \text{grid}_r,
+$$
+
+and
+
+$$
+j_b \bmod P_c = \text{grid}_c.
+$$
+
+The local block coordinates are
+
+$$
+\text{local block row} = i_b \mathbin{//} P_r,
+$$
+
+$$
+\text{local block col} = j_b \mathbin{//} P_c.
+$$
+
+This means each rank stores a dense local matrix of shape
+
+$$
+\left(\frac{n_b}{P_r}b\right)
+\times
+\left(\frac{n_b}{P_c}b\right),
+$$
+
+where
+
+$$
+n_b = \frac{m}{b}.
+$$
+
+\section{From all-reduce to reduce-scatter}
+
+Instead of all-reducing the whole matrix, we want each rank to receive only the pieces of $$L$$ that it owns.
+
+That is exactly the role of a reduce-scatter.
+
+Conceptually, every rank prepares buckets:
+
+\begin{lstlisting}
+bucket for rank 0
+bucket for rank 1
+...
+bucket for rank p-1
+\end{lstlisting}
+
+Each bucket contains that rank's local partial contribution to the blocks owned by the destination rank.
+
+Then reduce-scatter performs two operations at once:
+
+\begin{enumerate}
+    \item It sums corresponding buckets across all ranks.
+    \item It gives each rank only its own final bucket.
+\end{enumerate}
+
+So rank $$q$$ receives
+
+$$
+\sum_{r=0}^{p-1} \text{bucket}_{r \rightarrow q}.
+$$
+
+This is the final accumulated piece of $$GG^\top$$ owned by rank $$q$$.
+
+\section{The first streamed version: full horizontal bands}
+
+A better implementation avoids forming the full $$m \times m$$ matrix at once.
+
+Instead, process horizontal panels of block rows.
+
+Let a panel start at block row $$i_0$$ and contain $$c$$ block rows. In row coordinates, the panel is
+
+$$
+G[i_0b : (i_0+c)b, :].
+$$
+
+A simple streamed version computes
+
+$$
+P_{\text{panel}}
+=
+G_r[i_0b : (i_0+c)b, :]
+G_r^\top.
+$$
+
+This has shape
+
+$$
+(cb) \times m.
+$$
+
+Visually, this computes a full horizontal band:
+
+\begin{lstlisting}
+        c0 c1 c2 c3 c4 c5 c6 c7
+r0      X  X  X  X  X  X  X  X
+r1      X  X  X  X  X  X  X  X
+r2      X  X  X  X  X  X  X  X
+r3      X  X  X  X  X  X  X  X
+\end{lstlisting}
+
+This is much better than storing a full $$m \times m$$ temporary. But it still wastes work.
+
+Why?
+
+Because
+
+$$
+GG^\top
+$$
+
+is symmetric.
+
+So if the downstream eigensolver consumes only the lower triangle, then the upper triangle is redundant.
+
+\section{Using symmetry: why lower triangle matters}
+
+Since
+
+$$
+L = GG^\top,
+$$
+
+we have
+
+$$
+L^\top = L.
+$$
+
+So
+
+$$
+L_{ij} = L_{ji}.
+$$
+
+Therefore, only one triangle is needed. We choose the lower triangle:
+
+$$
+i_b \geq j_b.
+$$
+
+Visually, the useful blocks are:
+
+\begin{lstlisting}
+        c0 c1 c2 c3 c4 c5 c6 c7
+r0      X
+r1      X  X
+r2      X  X  X
+r3      X  X  X  X
+r4      X  X  X  X  X
+r5      X  X  X  X  X  X
+r6      X  X  X  X  X  X  X
+r7      X  X  X  X  X  X  X  X
+\end{lstlisting}
+
+So the full-band streamed version is still doing almost twice the necessary work and communication.
+
+The goal is now:
+
+\begin{quote}
+Compute only the lower-relevant part of each panel, pack it into 2D block-cyclic reduce-scatter order, and update only the local lower triangle.
+\end{quote}
+
+\section{The fully ragged lower-triangle idea}
+
+The most mathematically minimal approach would pack only the exact lower-triangular tiles.
+
+For example, for a panel containing block rows $$4,5,6,7$$, the exact useful region is:
+
+\begin{lstlisting}
+        c0 c1 c2 c3 c4 c5 c6 c7
+r4      X  X  X  X  X
+r5      X  X  X  X  X  X
+r6      X  X  X  X  X  X  X
+r7      X  X  X  X  X  X  X  X
+\end{lstlisting}
+
+This avoids all redundant upper-triangle blocks.
+
+But it creates an irregular packing problem. Different destination ranks may receive different numbers of tiles. The code becomes more complex, and packing may require many small strided copies.
+
+This is theoretically clean, but it may not be the fastest practical GPU implementation.
+
+\section{The chosen compromise: lower-prefix streaming}
+
+The implementation uses a lower-prefix strategy.
+
+For a panel ending at block row $$i_0+c$$, instead of computing against all rows of $$G$$, we compute only against the prefix:
+
+$$
+G_r[0 : (i_0+c)b, :].
+$$
+
+So the panel product is
+
+$$
+P_{\text{panel}}
+=
+G_r[i_0b : (i_0+c)b, :]
+\;
+G_r[0 : (i_0+c)b, :]^\top.
+$$
+
+Its shape is
+
+$$
+(cb) \times ((i_0+c)b).
+$$
+
+This avoids all future-column work.
+
+Visually, for a panel covering block rows $$4,5,6,7$$, the full-band version computes:
+
+\begin{lstlisting}
+        c0 c1 c2 c3 c4 c5 c6 c7
+r4      X  X  X  X  X  X  X  X
+r5      X  X  X  X  X  X  X  X
+r6      X  X  X  X  X  X  X  X
+r7      X  X  X  X  X  X  X  X
+\end{lstlisting}
+
+The lower-prefix version computes:
+
+\begin{lstlisting}
+        c0 c1 c2 c3 c4 c5 c6 c7
+r4      X  X  X  X  X  X  X  X
+r5      X  X  X  X  X  X  X  X
+r6      X  X  X  X  X  X  X  X
+r7      X  X  X  X  X  X  X  X
+\end{lstlisting}
+
+Here the prefix ends at $$c7$$ because the panel ends at $$r7$$. For an earlier panel, say rows $$2,3$$, it computes:
+
+\begin{lstlisting}
+        c0 c1 c2 c3 c4 c5 c6 c7
+r2      X  X  X  X  .  .  .  .
+r3      X  X  X  X  .  .  .  .
+\end{lstlisting}
+
+The true lower triangle for rows $$2,3$$ is:
+
+\begin{lstlisting}
+        c0 c1 c2 c3 c4 c5 c6 c7
+r2      X  X  X  .  .  .  .  .
+r3      X  X  X  X  .  .  .  .
+\end{lstlisting}
+
+So lower-prefix still has some intra-panel upper waste, but it removes all future-column waste.
+
+This is the key tradeoff.
+
+\begin{center}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.24\textwidth}
+                >{\raggedright\arraybackslash}p{0.31\textwidth}
+                >{\raggedright\arraybackslash}p{0.31\textwidth}}
+\toprule
+Method & Benefit & Problem \\
+\midrule
+Full-band streaming
+& Simple and regular
+& Computes and communicates too much \\
+\midrule
+Exact ragged lower-only
+& Minimum work and communication
+& Irregular packing and harder implementation \\
+\midrule
+Lower-prefix streaming
+& Most lower-triangle savings with regular packing
+& Small intra-panel upper waste \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Why the chunk must align with the process grid}
+
+Let the panel contain $$c$$ block rows.
+
+The implementation requires
+
+$$
+c \equiv 0 \pmod{\operatorname{lcm}(P_r,P_c)}.
+$$
+
+This is not arbitrary. It ensures that the prefix rectangle can be evenly split across both the process rows and process columns.
+
+The prefix block count is
+
+$$
+i_0 + c.
+$$
+
+If $$i_0$$ and $$c$$ are multiples of $$\operatorname{lcm}(P_r,P_c)$$, then the prefix is divisible by $$P_c$$, and the panel rows are divisible by $$P_r$$.
+
+This allows the panel to be viewed regularly as
+
+$$
+\left[
+\frac{c}{P_r},
+P_r,
+b,
+\frac{i_0+c}{P_c},
+P_c,
+b
+\right],
+$$
+
+then permuted into destination-rank order:
+
+$$
+\left[
+P_r,
+P_c,
+\frac{c}{P_r},
+b,
+\frac{i_0+c}{P_c},
+b
+\right].
+$$
+
+The first two dimensions, $$P_r$$ and $$P_c$$, determine the destination rank:
+
+$$
+\text{dst rank}
+=
+\text{row owner} \cdot P_c
++
+\text{column owner}.
+$$
+
+This is why the packing can be a clean rectangular copy rather than a ragged tile loop.
+
+\section{The reduce-scatter step}
+
+After packing, the send buffer is organized as:
+
+\begin{lstlisting}
+chunk for rank 0
+chunk for rank 1
+...
+chunk for rank p-1
+\end{lstlisting}
+
+Each rank has such a send buffer, containing its local partial contribution.
+
+Then reduce-scatter computes:
+
+$$
+\text{recv}_q
+=
+\sum_{r=0}^{p-1}
+\text{send}_{r,q}.
+$$
+
+So rank $$q$$ receives its own block-cyclic piece of the current prefix panel, already summed across all column shards.
+
+This is exactly the result we need for the EMA update.
+
+\section{Updating only the local lower triangle}
+
+The function stores $$L_{\text{prev}}$$ as a dense local 2D block-cyclic tensor of shape
+
+$$
+\left(\frac{n_b}{P_r}b\right)
+\times
+\left(\frac{n_b}{P_c}b\right).
+$$
+
+However, only entries corresponding to global lower-triangular blocks are valid.
+
+For each local block row in the received panel, the global block row is
+
+$$
+i_b = i_0 + \text{grid}_r + kP_r.
+$$
+
+This rank owns global column blocks
+
+$$
+j_b = \text{grid}_c,
+\text{grid}_c + P_c,
+\text{grid}_c + 2P_c,
+\ldots
+$$
+
+Only the blocks satisfying
+
+$$
+j_b \leq i_b
+$$
+
+belong to the lower triangle.
+
+The number of valid local column blocks is therefore
+
+$$
+n_{\text{cols}}
+=
+\left\lfloor
+\frac{i_b - \text{grid}_c}{P_c}
+\right\rfloor
++ 1.
+$$
+
+Multiplying by the block size gives the number of valid local columns in the dense local tensor:
+
+$$
+n_{\text{cols, entries}}
+=
+b
+\left(
+\left\lfloor
+\frac{i_b - \text{grid}_c}{P_c}
+\right\rfloor
++ 1
+\right).
+$$
+
+The EMA update is then applied only to that lower-triangular prefix:
+
+$$
+L_{\text{prev, local}}
+\leftarrow
+\beta L_{\text{prev, local}}
++
+(1-\beta)L_{\text{fresh, local}}.
+$$
+
+Upper global blocks are intentionally not updated.
+
+\section{The overlap pipeline}
+
+The function also overlaps computation and communication.
+
+For each panel $$t$$, the work is:
+
+\begin{enumerate}
+    \item Compute the lower-prefix GEMM.
+    \item Pack the result into reduce-scatter order.
+    \item Launch the reduce-scatter asynchronously.
+    \item Drain the previous panel's reduce-scatter and apply the EMA update.
+\end{enumerate}
+
+The timeline is:
+
+\begin{lstlisting}
+time ------------------------------------------------------>
+
+GEMM/pack:     panel 0      panel 1      panel 2      panel 3
+comm:              RS 0         RS 1         RS 2         RS 3
+EMA update:          upd 0        upd 1        upd 2        upd 3
+\end{lstlisting}
+
+The important design choice is:
+
+\begin{quote}
+Launch the current panel's reduce-scatter before draining the previous panel.
+\end{quote}
+
+This keeps the communication queue fed while the previous result is being unpacked and accumulated.
+
+The implementation uses two send buffers and two receive buffers, alternating by panel index. This allows one collective to use one buffer while the next panel uses the other buffer.
+
+\section{Why the workspace cache matters}
+
+A naive implementation would allocate temporary buffers every time the optimizer updates $$L$$.
+
+That is bad because this function may run repeatedly for many layers and many optimizer steps.
+
+So the production-oriented version caches:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item the panel output buffer,
+    \item the send buffers,
+    \item the receive buffers,
+    \item and optionally a contiguous fp32 copy of $$G_{\text{local}}$$.
+\end{itemize}
+
+In steady state, the function should not allocate large temporary tensors.
+
+This matters because allocator overhead and memory fragmentation can distort performance measurements and hurt training throughput.
+
+\section{The algorithm in one page}
+
+\begin{enumerate}
+    \item Interpret $$G$$ as column-sharded:
+    $$
+    G =
+    \begin{bmatrix}
+    G_0 & G_1 & \cdots & G_{p-1}
+    \end{bmatrix}.
+    $$
+
+    \item Use the identity:
+    $$
+    GG^\top = \sum_r G_rG_r^\top.
+    $$
+
+    \item Split $$L$$ into $$b \times b$$ blocks.
+
+    \item Distribute blocks using a $$P_r \times P_c$$ 2D block-cyclic layout:
+    $$
+    \text{owner}(i_b,j_b)
+    =
+    (i_b \bmod P_r)P_c
+    +
+    (j_b \bmod P_c).
+    $$
+
+    \item Stream over panels of block rows.
+
+    \item For each panel, compute only the lower-prefix product:
+    $$
+    P_{\text{panel}}
+    =
+    G_r[i_0b:(i_0+c)b,:]
+    G_r[0:(i_0+c)b,:]^\top.
+    $$
+
+    \item Pack the prefix rectangle into destination-rank order.
+
+    \item Reduce-scatter the packed buffers:
+    $$
+    \text{recv}_q
+    =
+    \sum_r
+    \text{send}_{r,q}.
+    $$
+
+    \item Update only local lower-triangular blocks:
+    $$
+    L \leftarrow \beta L + (1-\beta)\text{recv}.
+    $$
+
+    \item Reuse cached workspace buffers across calls.
+\end{enumerate}
+
+\section{What this function is not doing}
+
+It is important to be precise about what this implementation does not do.
+
+\begin{itemize}[leftmargin=1.5em]
+    \item It does not compute a full $$m \times m$$ matrix.
+    \item It does not all-reduce the full matrix to every rank.
+    \item It does not compute the entire upper triangle.
+    \item It does not store a fully valid dense local matrix; upper global blocks are intentionally stale.
+    \item It does not use a ragged exact lower-only tile packer.
+\end{itemize}
+
+Instead, it uses a practical compromise:
+
+\begin{quote}
+Lower-prefix GEMMs give most of the lower-triangle savings, while regular rectangular packing keeps the implementation GPU-friendly.
+\end{quote}
+
+\section{The core tradeoff}
+
+The full-band implementation is simpler, but wastes almost a factor of two.
+
+The exact ragged lower-only implementation is more theoretically efficient, but harder to pack efficiently on GPUs.
+
+The lower-prefix implementation is the middle ground:
+
+$$
+\text{most of the lower-triangle savings}
++
+\text{regular block-cyclic packing}
++
+\text{good overlap structure}.
+$$
+
+This is why it is a strong production-oriented candidate.
+
+\section{What must still be tested}
+
+Before trusting this inside SOAP, the minimum tests are:
+
+\begin{enumerate}
+    \item Reconstruct the distributed lower triangle and compare against dense $$GG^\top$$.
+    \item Test multiple grids:
+    $$
+    1 \times 8,\quad 2 \times 4,\quad 4 \times 2,\quad 8 \times 1.
+    $$
+    \item Test multiple chunk sizes:
+    $$
+    \operatorname{lcm}(P_r,P_c),\quad
+    2\operatorname{lcm}(P_r,P_c),\quad
+    4\operatorname{lcm}(P_r,P_c),\quad
+    8\operatorname{lcm}(P_r,P_c).
+    $$
+    \item Measure GEMM time, packing time, reduce-scatter wait time, and EMA update time separately.
+    \item Fill upper global blocks with NaN in debug mode and verify no downstream code reads them.
+\end{enumerate}
+
+\section{Summary}
+
+The function starts from a simple identity:
+
+$$
+GG^\top = \sum_r G_rG_r^\top.
+$$
+
+That identity lets each rank compute a local partial contribution from its column shard of $$G$$. Instead of all-reducing a full matrix, the function packs each streamed panel into 2D block-cyclic destination order and uses reduce-scatter to both sum the partials and deliver the right shard to each rank. Then, because $$GG^\top$$ is symmetric, the function avoids computing future-column work by using lower-prefix panels of the form
+
+$$
+G[i_0:i_1]G[:i_1]^\top.
+$$
+
+Finally, it overlaps communication with later panels and reuses cached workspace buffers so the steady-state path avoids large allocations. The result is a practical, production-oriented implementation of exact distributed $$GG^\top$$ for column-sharded gradients.
+
+\end{document}
